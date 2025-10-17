@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-dashmap = "6.1"
-rayon = "1.10"
+tilers-core = { path = "/Users/mathias/Documents/research/tilers/tilers-core" }
+dashmap = "6"
 rand = "0.9"
+crossbeam = "0.8"
+serde = { version = "1", features = ["derive"] }
+bincode >= "2.0"       # for compact packet serialization
+thiserror >= "2.0"
