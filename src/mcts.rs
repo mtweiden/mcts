@@ -209,6 +209,7 @@ impl MCTS {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use std::sync::atomic::Ordering;
 
     fn make_priors(pairs: &[(Action, f32)]) -> HashMap<Action, f32> {
         let mut m = HashMap::new();
@@ -300,7 +301,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_action_all_zero_visits_prefers_higher_prior() {
+    fn test_select_action_is_none_if_no_visits() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.8f32)]);
         let node = Node::new(priors.clone(), 0.0, 6);
@@ -325,5 +326,61 @@ mod tests {
         mcts.with_node_read(10, |n| {
             assert_eq!(n.children.get(&0), Some(&11));
         });
+    }
+
+    #[test]
+    fn test_add_and_revert_virtual_losses() {
+        let mcts = MCTS::new(0.0, 4);
+        let priors = make_priors(&[]);
+        let node = Node::new(priors, 0.0, 20);
+        mcts.insert_node(node);
+
+        // add virtual loss using helper (inserts counter if missing)
+        mcts.with_node_write(20, |n| {
+            n.add_virtual_loss(0);
+        })
+        .expect("add virtual loss");
+
+        let val = mcts
+            .with_node_read(20, |n| n.virtual_losses.get(&0).unwrap().load(Ordering::SeqCst))
+            .unwrap();
+        assert_eq!(val, 1);
+
+        // revert virtual loss using helper
+        mcts.with_node_write(20, |n| {
+            n.revert_virtual_loss(0);
+        })
+        .expect("revert virtual loss");
+
+        let val2 = mcts
+            .with_node_read(20, |n| n.virtual_losses.get(&0).unwrap().load(Ordering::SeqCst))
+            .unwrap();
+        assert_eq!(val2, 0);
+    }
+
+    #[test]
+    fn test_add_and_revert_penalties() {
+        let mcts = MCTS::new(0.0, 4);
+        let priors = make_priors(&[]);
+        let node = Node::new(priors, 0.0, 21);
+        mcts.insert_node(node);
+
+        // apply penalty (should create entry and decrease by 1.0)
+        mcts.with_node_write(21, |n| {
+            n.apply_penalty(0);
+        })
+        .expect("apply penalty");
+
+        let p = mcts.with_node_read(21, |n| *n.edge_penalties.get(&0).unwrap()).unwrap();
+        assert!((p + 1.0).abs() < 1e-6);
+
+        // revert penalty (should add back 1.0)
+        mcts.with_node_write(21, |n| {
+            n.revert_penalty(0);
+        })
+        .expect("revert penalty");
+
+        let p2 = mcts.with_node_read(21, |n| *n.edge_penalties.get(&0).unwrap()).unwrap();
+        assert!((p2 - 0.0).abs() < 1e-6);
     }
 }

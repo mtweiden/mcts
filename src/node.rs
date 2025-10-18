@@ -22,15 +22,24 @@ pub struct Node {
 
 impl Node {
     pub fn new(prior_probs: HashMap<Action, f32>, value: f32, id: NodeId) -> Self {
+        let mut edge_visits: HashMap<Action, usize> = HashMap::new();
+        let mut virtual_losses: HashMap<Action, AtomicUsize> = HashMap::new();
+        let mut edge_penalties: HashMap<Action, f32> = HashMap::new();
+
+        for &action in prior_probs.keys() {
+            edge_visits.insert(action, 0);
+            virtual_losses.insert(action, AtomicUsize::new(0));
+            edge_penalties.insert(action, 0.0);
+        }
         Self {
             id,
             prior_probs,
             value_estimate: value,
             node_visits: 0,
             children: HashMap::new(),
-            edge_visits: HashMap::new(),
-            virtual_losses: HashMap::new(),
-            edge_penalties: HashMap::new(),
+            edge_visits: edge_visits,
+            virtual_losses: virtual_losses,
+            edge_penalties: edge_penalties,
             value: value,
             terminal_state: false,
         }
@@ -83,11 +92,10 @@ impl Node {
     }
 
     pub fn select_action(&self) -> Option<Action> {
-        let visits = &self.edge_visits;
-        visits
+        self.edge_visits
             .iter()
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
-            .map(|(&action, _)| action)
+            .max_by_key(|(_, &visits)| visits)
+            .and_then(|(&action, &visits)| if visits == 0 { None } else { Some(action) })
     }
 }
 
