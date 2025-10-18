@@ -196,6 +196,12 @@ impl MCTS {
     pub fn select_action(&self, node_id: NodeId) -> Option<Action> {
         self.with_node_read(node_id, |n| n.select_action()).flatten()
     }
+
+    pub fn add_child(&self, parent_id: NodeId, action: Action, child_id: NodeId) {
+        self.with_node_write(parent_id, |parent| {
+            parent.children.insert(action, child_id);
+        });
+    }
 }
 
 
@@ -302,5 +308,22 @@ mod tests {
         let chosen = mcts.select_action(6);
         assert_eq!(chosen, None);
     }
+
+    #[test]
+    fn test_add_child_inserts_mapping() {
+        let mcts = MCTS::new(0.0, 4);
+        let parent_priors = make_priors(&[(0usize, 1.0f32)]);
+        let parent = Node::new(parent_priors, 0.0, 10);
+        let child = Node::new(make_priors(&[]), 0.0, 11);
+        mcts.insert_node(parent);
+        mcts.insert_node(child);
+
+        // add child under action 0
+        mcts.add_child(10, 0, 11);
+
+        // verify parent's children map contains the mapping action -> child_id
+        mcts.with_node_read(10, |n| {
+            assert_eq!(n.children.get(&0), Some(&11));
+        });
+    }
 }
-    
