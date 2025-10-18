@@ -9,6 +9,7 @@ use std::sync::atomic::Ordering;
 
 
 /// Core Monte Carlo Tree Search engine.
+/// TODO: Remove repr from Node for faster performance
 pub struct MCTS {
     // Arena style storage for all nodes.
     // TODO: Introduce sharding for nodes storage
@@ -37,7 +38,7 @@ impl MCTS {
     pub fn run<T: Agent>(
         &self,
         env: &Environment,
-        agent: T,
+        agent: &T,
         num_steps: usize,
     ) -> NodeId {
         // Ensure root node exists
@@ -47,7 +48,8 @@ impl MCTS {
             // TODO: Consistent observation representation
             //let obs = env.observation();
             let obs = vec![0.0];
-            let (priors, value) = agent.infer(&obs);
+            let (mut priors, value) = agent.infer(&obs);
+            priors = self.normalize_prior(priors, env.valid_actions());
             self.create_node(env, priors, value);
         }
 
@@ -66,7 +68,6 @@ impl MCTS {
 
             for _ in 0..self.batch_size {
                 let mut game = env.clone();
-                debug_assert_eq!(self.get_hash(&game), root_hash);
                 let (path, parent, action, obs, repeat) = self.select_leaf(root_hash, &mut game);
                 leaf_batch.push(obs);
                 path_batch.push(path);
@@ -109,10 +110,11 @@ impl MCTS {
         value: f32,
     ) -> NodeId {
         let node_id = self.get_hash(env);
+        let repr = env.render();
         let node = if env.done() {
-            Node::new_terminal(node_id, self.terminal_value)
+            Node::new_terminal(node_id, self.terminal_value, Some(repr))
         } else  {
-            Node::new(priors, value, node_id)
+            Node::new(priors, value, node_id, Some(repr))
         };
         self.insert_node(node);
         node_id
@@ -387,6 +389,9 @@ impl MCTS {
                 }
             });
 
+            // advance environment
+            env.step(action);
+
             // record step in path and advance
             path.push((node_hash, action));
             parent = Some(node_id);
@@ -402,9 +407,6 @@ impl MCTS {
                 // no child allocated yet -> we've reached a leaf
                 break;
             }
-
-            // advance environment
-            env.step(action);
         }
 
         // get observation (even if terminal or repeat) so return type is consistent
@@ -440,15 +442,10 @@ impl MCTS {
     ) -> NodeId {
         // compute leaf id from environment state
         let leaf_id = self.get_hash(&env);
-
         // Reuse existing node if present, otherwise create and insert a new node
         if !self.node_exists(leaf_id) {
-            let new_node = if env.done() {
-                Node::new_terminal(leaf_id, self.terminal_value)
-            } else {
-                Node::new(priors, value, leaf_id)
-            };
-            let _ = self.insert_node(new_node);
+            let normalized_priors = self.normalize_prior(priors, env.valid_actions());
+            self.create_node(&env, normalized_priors, value);
         }
 
         // Ensure parent's children map contains the mapping action -> leaf_id.
@@ -458,10 +455,11 @@ impl MCTS {
             // insert returns the previous value (if any)
             match parent.children.insert(action, leaf_id_copy) {
                 None => {
-                    // DEBUG: Check for alias
                     for (&a, &cid) in &parent.children {
                         if cid == leaf_id_copy && a != action {
                             eprintln!("[Alias detected] actions {} - {}", a, action);
+                            eprintln!("{}-{} {}-{}", a, cid, action, leaf_id_copy);
+                            eprintln!("actions {:?}", parent.children.keys().cloned().collect::<Vec<_>>());
                         }
                     }
                     // was not present -> increment visits
@@ -500,7 +498,7 @@ impl MCTS {
         // Walk the path in reverse (from leaf's parent back to root).
         for &(node_hash, action) in search_path.iter().rev() {
             if !self.node_exists(node_hash) {
-                eprint!("Node {} not found during backpropagation", node_hash);
+                eprintln!("Node {} not found during backpropagation", node_hash);
             }
             // Revert the virtual loss and increment edge visits under a write lock,
             // then recompute the cached value without holding that write lock.
@@ -551,7 +549,7 @@ mod tests {
     fn test_insert_and_get_node() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
-        let node = Node::new(priors.clone(), 0.42, 1);
+        let node = Node::new(priors.clone(), 0.42, 1, None);
         let _arc = mcts.insert_node(node);
         let arc_opt = mcts.get_node_arc(1);
         assert!(arc_opt.is_some());
@@ -563,7 +561,7 @@ mod tests {
     fn test_with_node_write_updates() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
-        let node = Node::new(priors, 0.1, 2);
+        let node = Node::new(priors, 0.1, 2, None);
         mcts.insert_node(node);
         // mutate under write helper
         mcts.with_node_write(2, |n| {
@@ -580,7 +578,7 @@ mod tests {
     fn test_recompute_value_leaf_sets_prior() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
-        let node = Node::new(priors, 0.33, 3);
+        let node = Node::new(priors, 0.33, 3, None);
         mcts.insert_node(node);
         let v = mcts.recompute_value(3);
         assert!((v - 0.33).abs() < 1e-6);
@@ -595,7 +593,7 @@ mod tests {
         let mcts = MCTS::new(0.0, 4);
         // one action with prior 1.0
         let priors = make_priors(&[(0usize, 1.0f32)]);
-        let node = Node::new(priors.clone(), 0.5, 4);
+        let node = Node::new(priors.clone(), 0.5, 4, None);
         mcts.insert_node(node);
 
         let scores = mcts.puct_scores(4, 1.0);
@@ -613,7 +611,7 @@ mod tests {
     fn test_select_action() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[(0usize, 0.5f32), (1usize, 0.5f32)]);
-        let mut node = Node::new(priors.clone(), 0.0, 5);
+        let mut node = Node::new(priors.clone(), 0.0, 5, None);
         node.edge_visits.insert(0, 10);
         node.edge_visits.insert(1, 20);
         mcts.insert_node(node);
@@ -625,7 +623,7 @@ mod tests {
     fn test_select_action_is_none_if_no_visits() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.8f32)]);
-        let node = Node::new(priors.clone(), 0.0, 6);
+        let node = Node::new(priors.clone(), 0.0, 6, None);
         mcts.insert_node(node);
         let chosen = mcts.select_action(6);
         assert_eq!(chosen, None);
@@ -635,8 +633,8 @@ mod tests {
     fn test_add_child_inserts_mapping() {
         let mcts = MCTS::new(0.0, 4);
         let parent_priors = make_priors(&[(0usize, 1.0f32)]);
-        let parent = Node::new(parent_priors, 0.0, 10);
-        let child = Node::new(make_priors(&[]), 0.0, 11);
+        let parent = Node::new(parent_priors, 0.0, 10, None);
+        let child = Node::new(make_priors(&[]), 0.0, 11, None);
         mcts.insert_node(parent);
         mcts.insert_node(child);
 
@@ -653,7 +651,7 @@ mod tests {
     fn test_add_and_revert_virtual_losses() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
-        let node = Node::new(priors, 0.0, 20);
+        let node = Node::new(priors, 0.0, 20, None);
         mcts.insert_node(node);
 
         // add virtual loss using helper (inserts counter if missing)
@@ -683,7 +681,7 @@ mod tests {
     fn test_add_and_revert_penalties() {
         let mcts = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
-        let node = Node::new(priors, 0.0, 21);
+        let node = Node::new(priors, 0.0, 21, None);
         mcts.insert_node(node);
 
         // apply penalty (should create entry and decrease by 1.0)
@@ -725,7 +723,7 @@ mod tests {
         let leaf_hash = env.hash_state() as NodeId;
 
         let mcts = MCTS::new(0.0, 4);
-        let parent = Node::new(priors.clone(), value, root_hash);
+        let parent = Node::new(priors.clone(), value, root_hash, None);
         mcts.insert_node(parent);
 
         // first expand should insert the leaf and update parent mapping and visits
@@ -755,7 +753,7 @@ mod tests {
         let priors_1 = make_priors_from_vec(valid_actions_1.clone());
         let value_1 = 1.0f32;
         let action_1 = valid_actions_1[0];
-        let node_1 = Node::new(priors_1.clone(), value_1, hash_1);
+        let node_1 = Node::new(priors_1.clone(), value_1, hash_1, None);
         mcts.insert_node(node_1);
         // Second node
         env.step(action_1);
@@ -796,5 +794,38 @@ mod tests {
         assert!((total - 1.0).abs() < 1e-6);
         assert!((normalized.get(&0).unwrap() - 0.4).abs() < 1e-6);
         assert!((normalized.get(&1).unwrap() - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn simple_mcts_run_with_dummy_agent() {
+        use crate::agent::DummyAgent;
+
+        // A tiny QASM-like program (adapt if your Environment expects a different format)
+        let qasm = "
+            OPENQASM 2.0;
+            include \"qelib1.inc\";
+            qreg q[14];
+            cx q[3],q[6];
+            t q[2];
+        ";
+
+        // Build the environment. from_qasm takes Option<usize> for height/width.
+        let env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
+
+        // Create MCTS and a trivial agent. Adjust terminal value / batch size to taste.
+        let mcts = MCTS::new(0.0_f32, 4usize);
+        let agent = DummyAgent::new(env.num_actions()); // 4 actions
+
+        // Run MCTS for a small number of steps.
+        let root_id = mcts.run(&env, &agent, 10000usize);
+
+        // Ensure the root node exists in the transposition table after running.
+        assert!(mcts.node_exists(root_id), "root node should be present");
+
+        let num_nodes = {
+            let nodes = mcts.nodes.lock().unwrap();
+            nodes.len()
+        };
+        assert!(num_nodes > 1, "should have expanded some nodes");
     }
 }
