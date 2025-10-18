@@ -1,4 +1,6 @@
-use crate::node::{Action, Node, NodeId};
+use crate::node::Node;
+use crate::enums::{Action, NodeId};
+use crate::agent::Agent;
 use tilers_core::env::Environment;
 use dashmap::DashMap;
 use std::collections::HashMap;
@@ -25,10 +27,97 @@ impl MCTS {
             batch_size,
         }
     }
+    /// ------------------------------------------------------------------------
+    /// MCTS run function
+    /// ------------------------------------------------------------------------
+    /// Run MCTS for a given number of steps from the current environment state.
+    /// Returns the NodeId of the root node after search. An action can be selected
+    /// from this node using select_action.
+    /// This function runs single-threaded MCTS but batches inference requests.
+    pub fn run<T: Agent>(
+        &self,
+        env: &Environment,
+        agent: T,
+        num_steps: usize,
+    ) -> NodeId {
+        // Ensure root node exists
+        let root_hash = self.get_hash(env);
+        if !self.node_exists(root_hash) {
+            // build observation and ask agent for priors/value to create the root
+            // TODO: Consistent observation representation
+            //let obs = env.observation();
+            let obs = vec![0.0];
+            let (priors, value) = agent.infer(&obs);
+            self.create_node(env, priors, value);
+        }
+
+        if env.done() {
+            return root_hash;
+        }
+
+        let batches = num_steps / self.batch_size.max(1);
+        for _ in 0..batches {
+            // Selection: collect a batch of leaf observations / metadata
+            let mut leaf_batch: Vec<Vec<f32>> = Vec::with_capacity(self.batch_size);
+            let mut path_batch: Vec<Vec<(NodeId, Action)>> = Vec::with_capacity(self.batch_size);
+            let mut parent_batch: Vec<(Option<NodeId>, Action, Environment)> =
+                Vec::with_capacity(self.batch_size);
+            let mut repeat_batch: Vec<bool> = Vec::with_capacity(self.batch_size);
+
+            for _ in 0..self.batch_size {
+                let mut game = env.clone();
+                debug_assert_eq!(self.get_hash(&game), root_hash);
+                let (path, parent, action, obs, repeat) = self.select_leaf(root_hash, &mut game);
+                leaf_batch.push(obs);
+                path_batch.push(path);
+                parent_batch.push((parent, action, game));
+                repeat_batch.push(repeat);
+            }
+
+            if leaf_batch.is_empty() {
+                continue;
+            }
+
+            // Batched inference via agent
+            let (prior_batch, value_batch) = agent.batch_infer(&leaf_batch);
+
+            // Expansion & Backpropagation
+            let n = prior_batch.len().min(value_batch.len()).min(parent_batch.len());
+            for i in 0..n {
+                let (parent_opt, action, game) = &parent_batch[i];
+                if let Some(parent_id) = parent_opt {
+                    let priors = prior_batch[i].clone();
+                    let value = value_batch[i];
+                    // expand and then backpropagate
+                    let _leaf = self.expand(*parent_id, *action, game.clone(), priors, value);
+                    self.backpropagate(&path_batch[i], repeat_batch[i]);
+                }
+            }
+        }
+
+        root_hash
+    }
 
     /// ------------------------------------------------------------------------
     /// Node functions
     /// ------------------------------------------------------------------------
+    /// Create a node
+    pub fn create_node(
+        &self,
+        env: &Environment,
+        priors: HashMap<Action, f32>,
+        value: f32,
+    ) -> NodeId {
+        let node_id = self.get_hash(env);
+        let node = if env.done() {
+            Node::new_terminal(node_id, self.terminal_value)
+        } else  {
+            Node::new(priors, value, node_id)
+        };
+        self.insert_node(node);
+        node_id
+    }
+
     /// Look up a node by its ID.
     pub fn get_node_arc(&self, node_id: NodeId) -> Option<Arc<RwLock<Node>>> {
         let node_arc = if let Some(entry) = self.transposition_table.get(&node_id) {
@@ -218,6 +307,30 @@ impl MCTS {
         env.hash_state() as NodeId
     }
 
+    /// Normalize the prior probabilities for a set of actions.
+    pub fn normalize_prior(&self, priors: HashMap<Action, f32>, actions: Vec<Action>) -> HashMap<Action, f32> {
+        let mut normalized = HashMap::new();
+        let mut total: f32 = 0.0;
+        for &a in &actions {
+            if let Some(&p) = priors.get(&a) {
+                total += p;
+            }
+        }
+        if total == 0.0 {
+            let uniform_prob = 1.0 / (actions.len() as f32);
+            for &a in &actions {
+                normalized.insert(a, uniform_prob);
+            }
+        } else {
+            for &a in &actions {
+                if let Some(&p) = priors.get(&a) {
+                    normalized.insert(a, p / total);
+                }
+            }
+        }
+        normalized
+    }
+
     // ------------------------------------------------------------------------
     // MCTS search functions
     // ------------------------------------------------------------------------
@@ -364,6 +477,42 @@ impl MCTS {
             }
         });
         leaf_id
+    }
+
+    /// Backpropagate a leaf value up the search path.
+    /// Takes as input:
+    ///  - search_path: Vec of (parent_node_id, action_taken) pairs from root to a node
+    ///  - repeat_detected: whether a repeat state was detected during traversal
+    pub fn backpropagate(&self, search_path: &[(NodeId, Action)], repeat_detected: bool) {
+        if search_path.is_empty() {
+            return;
+        }
+
+        // If a repeat was detected, apply a penalty to the last parent/action.
+        if repeat_detected {
+            if let Some((last_parent_hash, last_action)) = search_path.last() {
+                let _ = self.with_node_write(*last_parent_hash, |n| {
+                    n.apply_penalty(*last_action);
+                });
+            }
+        }
+
+        // Walk the path in reverse (from leaf's parent back to root).
+        for &(node_hash, action) in search_path.iter().rev() {
+            if !self.node_exists(node_hash) {
+                eprint!("Node {} not found during backpropagation", node_hash);
+            }
+            // Revert the virtual loss and increment edge visits under a write lock,
+            // then recompute the cached value without holding that write lock.
+            let _ = self.with_node_write(node_hash, |node| {
+                // Revert virtual loss
+                node.revert_virtual_loss(action);
+                // increment edge visits
+                *node.edge_visits.entry(action).or_insert(0) += 1;
+            });
+            // Recompute node value via the MCTS helper (acquires its own locks).
+            let _ = self.recompute_value(node_hash);
+        }
     }
 }
 
@@ -635,5 +784,17 @@ mod tests {
         assert_eq!(hash_2_ret, hash_2);
         assert_eq!(action_2_ret, action_2);
         assert_eq!(hash_3_ret, hash_3);
+    }
+
+    #[test]
+    fn test_normalize_prior() {
+        let mcts = MCTS::new(0.0, 4);
+        let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.3f32), (2usize, 0.5f32)]);
+        let actions = vec![0, 1];
+        let normalized = mcts.normalize_prior(priors, actions.clone());
+        let total: f32 = normalized.values().sum();
+        assert!((total - 1.0).abs() < 1e-6);
+        assert!((normalized.get(&0).unwrap() - 0.4).abs() < 1e-6);
+        assert!((normalized.get(&1).unwrap() - 0.6).abs() < 1e-6);
     }
 }
