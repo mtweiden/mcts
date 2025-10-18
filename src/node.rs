@@ -17,10 +17,16 @@ pub struct Node {
     pub edge_penalties: HashMap<Action, f32>,
     pub value: f32,
     pub terminal_state: bool,
+    pub repr: Option<String>,
 }
 
 impl Node {
-    pub fn new(prior_probs: HashMap<Action, f32>, value: f32, id: NodeId) -> Self {
+    pub fn new(
+        prior_probs: HashMap<Action, f32>,
+        value: f32,
+        id: NodeId,
+        repr: Option<String>
+    ) -> Self {
         let mut edge_visits: HashMap<Action, usize> = HashMap::new();
         let mut virtual_losses: HashMap<Action, AtomicUsize> = HashMap::new();
         let mut edge_penalties: HashMap<Action, f32> = HashMap::new();
@@ -41,10 +47,11 @@ impl Node {
             edge_penalties: edge_penalties,
             value: value,
             terminal_state: false,
+            repr: repr,
         }
     }
 
-    pub fn new_terminal(id: NodeId, value: f32) -> Self {
+    pub fn new_terminal(id: NodeId, value: f32, repr: Option<String>) -> Self {
         Self {
             id,
             prior_probs: HashMap::new(),
@@ -56,6 +63,7 @@ impl Node {
             edge_penalties: HashMap::new(),
             value,
             terminal_state: true,
+            repr: repr,
         }
     }
 
@@ -120,7 +128,7 @@ mod tests {
         let mut priors = HashMap::new();
         priors.insert(0, 0.5);
         priors.insert(1, 0.5);
-        let node = Node::new(priors.clone(), 0.0, 1);
+        let node = Node::new(priors.clone(), 0.0, 1, None);
         assert_eq!(node.id, 1);
         assert_eq!(node.prior_probs, priors);
         assert_eq!(node.value_estimate, 0.0);
