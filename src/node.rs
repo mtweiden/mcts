@@ -1,10 +1,9 @@
-// src/node.rs
+use crate::enums::Action;
+use crate::enums::NodeId;
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-pub type Action = usize;
-pub type NodeId = u64;
 
 /// A single node in the MCTS graph.
 pub struct Node {
@@ -127,9 +126,9 @@ mod tests {
         assert_eq!(node.value_estimate, 0.0);
         assert_eq!(node.node_visits, 0);
         assert!(node.children.is_empty());
-        assert!(node.edge_visits.is_empty());
-        assert!(node.virtual_losses.is_empty());
-        assert!(node.edge_penalties.is_empty());
+        assert_eq!(node.edge_visits, HashMap::from([(0, 0), (1, 0)]));
+        assert_eq!(node.virtual_loss_copy(), HashMap::from([(0, 0), (1, 0)]));
+        assert_eq!(node.edge_penalties, HashMap::from([(0, 0.0), (1, 0.0)]));
         assert_eq!(node.value, 0.0);
         assert!(!node.terminal_state);
     }
