@@ -122,14 +122,16 @@ impl MCTS {
 
     /// Look up a node by its ID.
     pub fn get_node_arc(&self, node_id: NodeId) -> Option<Arc<RwLock<Node>>> {
-        let node_arc = if let Some(entry) = self.transposition_table.get(&node_id) {
-            let nodes = self.nodes.lock().unwrap();
+        // Acquire nodes mutex first, then consult the transposition table.
+        // This keeps a consistent lock order (nodes Mutex -> DashMap) and avoids
+        // deadlocks with insert_node which locks nodes then inserts into DashMap.
+        let nodes = self.nodes.lock().unwrap();
+        if let Some(entry) = self.transposition_table.get(&node_id) {
             let index = *entry.value();
             nodes.get(index).cloned()
         } else {
             None
-        };
-        node_arc
+        }
     }
 
     /// Insert a new node into the transposition table and node arena.
@@ -360,6 +362,7 @@ impl MCTS {
         let mut repeat_detected = false;
 
         while !env.done() && !repeat_detected {
+            //println!("[mcts::select_leaf] at node {}", node_id);
             // ensure node still exists
             if self.get_node_arc(node_id).is_none() {
                 break;
@@ -407,6 +410,7 @@ impl MCTS {
                 // no child allocated yet -> we've reached a leaf
                 break;
             }
+            //println!("[mcts::select_leaf] finished selection with leaf: {}", node_id);
         }
 
         // get observation (even if terminal or repeat) so return type is consistent
@@ -440,41 +444,46 @@ impl MCTS {
         priors: HashMap<Action, f32>,
         value: f32,
     ) -> NodeId {
-        // compute leaf id from environment state
-        let leaf_id = self.get_hash(&env);
-        // Reuse existing node if present, otherwise create and insert a new node
-        if !self.node_exists(leaf_id) {
-            let normalized_priors = self.normalize_prior(priors, env.valid_actions());
-            self.create_node(&env, normalized_priors, value);
-        }
-
-        // Ensure parent's children map contains the mapping action -> leaf_id.
-        // Also increment the parent's edge visit counter for this action.
-        let leaf_id_copy = leaf_id;
-        let _ = self.with_node_write(parent_id, |parent| {
-            // insert returns the previous value (if any)
-            match parent.children.insert(action, leaf_id_copy) {
-                None => {
-                    for (&a, &cid) in &parent.children {
-                        if cid == leaf_id_copy && a != action {
-                            eprintln!("[Alias detected] actions {} - {}", a, action);
-                            eprintln!("{}-{} {}-{}", a, cid, action, leaf_id_copy);
-                            eprintln!("actions {:?}", parent.children.keys().cloned().collect::<Vec<_>>());
-                        }
-                    }
-                    // was not present -> increment visits
-                    *parent.edge_visits.entry(action).or_insert(0) += 1;
-                }
-                Some(existing_id) => {
-                    // DEBUG: Check for action mapping to different node
-                    if existing_id != leaf_id_copy {
-                        eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id_copy);
-                    }
-                    // else: same mapping already present — no-op
-                }
+        // println!("[mcts::expand] enter parent={} action={}", parent_id, action);
+        let leaf = { 
+            // compute leaf id from environment state
+            let leaf_id = self.get_hash(&env);
+            // Reuse existing node if present, otherwise create and insert a new node
+            if !self.node_exists(leaf_id) {
+                let normalized_priors = self.normalize_prior(priors, env.valid_actions());
+                self.create_node(&env, normalized_priors, value);
             }
-        });
-        leaf_id
+
+            // Ensure parent's children map contains the mapping action -> leaf_id.
+            // Also increment the parent's edge visit counter for this action.
+            let leaf_id_copy = leaf_id;
+            let _ = self.with_node_write(parent_id, |parent| {
+                // insert returns the previous value (if any)
+                match parent.children.insert(action, leaf_id_copy) {
+                    None => {
+                        for (&a, &cid) in &parent.children {
+                            if cid == leaf_id_copy && a != action {
+                                eprintln!("[Alias detected] actions {} - {}", a, action);
+                                eprintln!("{}-{} {}-{}", a, cid, action, leaf_id_copy);
+                                eprintln!("actions {:?}", parent.children.keys().cloned().collect::<Vec<_>>());
+                            }
+                        }
+                        // was not present -> increment visits
+                        *parent.edge_visits.entry(action).or_insert(0) += 1;
+                    }
+                    Some(existing_id) => {
+                        // DEBUG: Check for action mapping to different node
+                        if existing_id != leaf_id_copy {
+                            eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id_copy);
+                        }
+                        // else: same mapping already present — no-op
+                    }
+                }
+            });
+            leaf_id
+        };
+        // println!("[mcts::expand] exit parent={} action={} -> leaf={}", parent_id, action, leaf);
+        leaf
     }
 
     /// Backpropagate a leaf value up the search path.
@@ -482,6 +491,7 @@ impl MCTS {
     ///  - search_path: Vec of (parent_node_id, action_taken) pairs from root to a node
     ///  - repeat_detected: whether a repeat state was detected during traversal
     pub fn backpropagate(&self, search_path: &[(NodeId, Action)], repeat_detected: bool) {
+        //println!("[mcts::backpropagate] enter path_len={} repeat={}", search_path.len(), repeat_detected);
         if search_path.is_empty() {
             return;
         }
@@ -511,6 +521,7 @@ impl MCTS {
             // Recompute node value via the MCTS helper (acquires its own locks).
             let _ = self.recompute_value(node_hash);
         }
+        //println!("[mcts::backpropagate] exit");
     }
 }
 
