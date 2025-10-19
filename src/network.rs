@@ -3,7 +3,7 @@ use std::collections::HashMap;
 
 #[derive(Serialize)]
 pub struct InferenceRequest {
-    pub observations: Vec<Vec<f32>>,
+    pub observation_batch: Vec<Vec<f32>>,
 }
 
 #[derive(Deserialize)]

@@ -12,7 +12,7 @@ fn main() {
     "#;
 
     let mut env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
-    let mut mcts = MCTS::new(0.0_f32, 4usize);
+    let mut mcts = MCTS::new(0.0_f32, 4usize, None);
     let agent = DummyAgent::new(env.num_actions());
 
     println!("{}", env.render());
