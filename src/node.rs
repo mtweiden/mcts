@@ -1,156 +1,136 @@
+use crate::enums::Action;
+use crate::enums::NodeId;
 use std::collections::HashMap;
-use rand::seq::IteratorRandom;
-use rand::rng;
+use std::fmt;
 
-/// Represents a search node in MCTS.
+
+/// A single node in the MCTS graph.
 #[derive(Clone)]
 pub struct Node {
-    // priors are stored per-edge now
+    pub id: NodeId,
+    pub prior_probs: HashMap<Action, f32>,
     pub value_estimate: f32,
-    pub node_visits: u32,
-    // compact per-node edge vector
-    pub edges: Vec<Edge>,
+    pub node_visits: usize,
+    pub children: HashMap<Action, NodeId>,
+    pub edge_visits: HashMap<Action, usize>,
+    pub virtual_losses: HashMap<Action, usize>,
+    pub edge_penalties: HashMap<Action, f32>,
     pub value: f32,
     pub terminal_state: bool,
-}
-
-#[derive(Clone)]
-pub struct Edge {
-    pub action: i32,
-    pub child: Option<usize>,
-    pub visits: u32,
-    pub virtual_losses: u32,
-    pub penalty: f32,
-    pub prior: f32,
+    pub repr: Option<String>,
 }
 
 impl Node {
-    pub fn new(edges: Vec<Edge>, value: f32) -> Self {
+    pub fn new(
+        prior_probs: HashMap<Action, f32>,
+        value: f32,
+        id: NodeId,
+        repr: Option<String>
+    ) -> Self {
+        let mut edge_visits: HashMap<Action, usize> = HashMap::new();
+        let mut virtual_losses: HashMap<Action, usize> = HashMap::new();
+        let mut edge_penalties: HashMap<Action, f32> = HashMap::new();
+
+        for &action in prior_probs.keys() {
+            edge_visits.insert(action, 0);
+            virtual_losses.insert(action, 0);
+            edge_penalties.insert(action, 0.0);
+        }
         Self {
+            id,
+            prior_probs,
             value_estimate: value,
             node_visits: 0,
-            edges,
-            value,
+            children: HashMap::new(),
+            edge_visits: edge_visits,
+            virtual_losses: virtual_losses,
+            edge_penalties: edge_penalties,
+            value: value,
             terminal_state: false,
+            repr: repr,
         }
     }
 
-    // Recompute value using the arena to access child node values.
-    pub fn recompute_value(&mut self, arena: &mut Vec<Node>) -> f32 {
-        let total_edge_visits = self.edges.iter().map(|e| e.visits + e.virtual_losses).sum::<u32>();
-        self.node_visits = 1 + total_edge_visits;
-
-        if self.edges.is_empty() || total_edge_visits == 0 {
-            self.value = self.value_estimate;
-            return self.value;
+    pub fn new_terminal(id: NodeId, value: f32, repr: Option<String>) -> Self {
+        Self {
+            id,
+            prior_probs: HashMap::new(),
+            value_estimate: value,
+            node_visits: 0,
+            children: HashMap::new(),
+            edge_visits: HashMap::new(),
+            virtual_losses: HashMap::new(),
+            edge_penalties: HashMap::new(),
+            value,
+            terminal_state: true,
+            repr: repr,
         }
-
-        let mut acc = 0.0;
-        for edge in &self.edges {
-            let n = edge.visits;
-            if n > 0 {
-                if let Some(child_idx) = edge.child {
-                    acc += (n as f32) * arena[child_idx].value;
-                }
-            }
-        }
-
-        self.value = (self.value_estimate + acc) / (self.node_visits as f32);
-        self.value
     }
 
-    /// Compute the recomputed value and node_visits without mutating self.
-    /// Returns (value, node_visits).
-    pub fn compute_recomputed_value(&self, arena: &Vec<Node>) -> (f32, u32) {
-        let total_edge_visits = self.edges.iter().map(|e| e.visits + e.virtual_losses).sum::<u32>();
-        let node_visits = 1 + total_edge_visits;
-
-        if self.edges.is_empty() || total_edge_visits == 0 {
-            return (self.value_estimate, node_visits);
+    pub fn add_virtual_loss(&mut self, action: Action) {
+        if let Some(count) = self.virtual_losses.get_mut(&action) {
+            *count += 1;
+        } else {
+            self.virtual_losses.insert(action, 1);
         }
-
-        let mut acc = 0.0;
-        for edge in &self.edges {
-            let n = edge.visits;
-            if n > 0 {
-                if let Some(child_idx) = edge.child {
-                    acc += (n as f32) * arena[child_idx].value;
-                }
-            }
-        }
-
-        ((self.value_estimate + acc) / (node_visits as f32), node_visits)
     }
 
-    pub fn puct_scores(&self, c_puct: f32, arena: &Vec<Node>) -> HashMap<i32, f32> {
-        let total_visits = (self.edges.iter().map(|e| e.visits + e.virtual_losses).sum::<u32>()) as f32;
-        let sqrt_total = (total_visits + 1e-8).sqrt();
-
-        let mut scores = HashMap::new();
-        // iterate edges vector (matches priors)
-        for edge in &self.edges {
-            let action = edge.action;
-            let prior = edge.prior;
-            let n_edge = edge.visits as f32;
-            let n_eff = n_edge + edge.virtual_losses as f32;
-            let child_value = edge.child.map(|idx| arena[idx].value).unwrap_or(self.value);
-            let penalty = edge.penalty;
-            let q = child_value + penalty;
-            let u = c_puct * prior * (sqrt_total / (1.0 + n_eff));
-            scores.insert(action, q + u);
+    pub fn revert_virtual_loss(&mut self, action: Action) {
+        if let Some(count) = self.virtual_losses.get_mut(&action) {
+            *count = (*count).saturating_sub(1);
         }
-        scores
     }
 
-    pub fn select_action_puct(&self, arena: &Vec<Node>) -> i32 {
-        let scores = self.puct_scores(1.1, arena);
-        let max_score = scores.values().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let best: Vec<i32> = scores
+    pub fn apply_penalty(&mut self, action: Action) {
+        *self.edge_penalties.entry(action).or_insert(0.0) -= 1.0;
+    }
+
+    pub fn revert_penalty(&mut self, action: Action) {
+        if let Some(penalty) = self.edge_penalties.get_mut(&action) {
+            *penalty = (*penalty + 1.0).min(0.0);
+        }
+    }
+
+    pub fn select_action(&self) -> Option<Action> {
+        self.edge_visits
             .iter()
-            .filter(|(_, &s)| (s - max_score).abs() < 1e-8)
-            .map(|(&a, _)| a)
-            .collect();
-        *best.iter().choose(&mut rng()).unwrap()
+            .max_by_key(|(_, &visits)| visits)
+            .and_then(|(&action, &visits)| if visits == 0 { None } else { Some(action) })
     }
+}
 
-    pub fn select_action(&self) -> i32 {
-        if self.edges.is_empty() {
-            panic!("Cannot select action from unexpanded node.");
-        }
-        let max_visits = self.edges.iter().map(|e| e.visits).max().unwrap_or(0);
-        let best: Vec<i32> = self
-            .edges
-            .iter()
-            .filter(|e| e.visits == max_visits)
-            .map(|e| e.action)
-            .collect();
-        *best.iter().choose(&mut rng()).unwrap()
+impl fmt::Debug for Node {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Node {{ id: {}, value: {:.3}, edges: {} }}",
+            self.id,
+            self.value,
+            self.children.len()
+        )
     }
+}
 
-    pub fn add_virtual_loss(&mut self, action: i32, loss: u32) {
-        if let Some(e) = self.edges.iter_mut().find(|e| e.action == action) {
-            e.virtual_losses = e.virtual_losses.saturating_add(loss);
-        }
-    }
 
-    pub fn revert_virtual_loss(&mut self, action: i32, loss: u32) {
-        if let Some(e) = self.edges.iter_mut().find(|e| e.action == action) {
-            e.virtual_losses = e.virtual_losses.saturating_sub(loss);
-        }
-    }
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-    pub fn apply_penalty(&mut self, action: i32, penalty: f32) {
-        if let Some(e) = self.edges.iter_mut().find(|e| e.action == action) {
-            e.penalty += penalty;
-        }
-    }
-
-    pub fn revert_penalty(&mut self, action: i32, penalty: f32) {
-        if let Some(e) = self.edges.iter_mut().find(|e| e.action == action) {
-            e.penalty -= penalty;
-            if e.penalty.abs() < 1e-12 {
-                e.penalty = 0.0;
-            }
-        }
+    #[test]
+    fn test_node_creation() {
+        let mut priors = HashMap::new();
+        priors.insert(0, 0.5);
+        priors.insert(1, 0.5);
+        let node = Node::new(priors.clone(), 0.0, 1, None);
+        assert_eq!(node.id, 1);
+        assert_eq!(node.prior_probs, priors);
+        assert_eq!(node.value_estimate, 0.0);
+        assert_eq!(node.node_visits, 0);
+        assert!(node.children.is_empty());
+        assert_eq!(node.edge_visits, HashMap::from([(0, 0), (1, 0)]));
+        assert_eq!(node.virtual_losses, HashMap::from([(0, 0), (1, 0)]));
+        assert_eq!(node.edge_penalties, HashMap::from([(0, 0.0), (1, 0.0)]));
+        assert_eq!(node.value, 0.0);
+        assert!(!node.terminal_state);
     }
 }
