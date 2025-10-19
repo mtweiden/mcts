@@ -1,6 +1,8 @@
 use crate::node::Node;
 use crate::enums::{Action, NodeId};
 use crate::agent::Agent;
+use crate::network::InferenceRequest;
+use crate::network::InferenceResponse;
 use tilers_core::env::Environment;
 use std::collections::HashMap;
 
@@ -14,15 +16,26 @@ pub struct MCTS {
     pub nodes: Vec<Node>,
     pub terminal_value: f32,
     pub batch_size: usize,
+    pub server_url: Option<String>,
+    pub client: Option<reqwest::blocking::Client>,
 }
 
 impl MCTS {
-    pub fn new(terminal_value: f32, batch_size: usize) -> Self {
+    pub fn new(
+        terminal_value: f32,
+        batch_size: usize,
+        server_url: Option<String>,
+    ) -> Self {
+        let client = server_url
+            .as_ref()
+            .map(|_| reqwest::blocking::Client::new());
         Self {
             transposition_table: HashMap::new(),
             nodes: Vec::new(),
             terminal_value,
             batch_size,
+            server_url,
+            client,
         }
     }
     /// ------------------------------------------------------------------------
@@ -76,8 +89,14 @@ impl MCTS {
                 continue;
             }
 
-            // Batched inference via agent
-            let (prior_batch, value_batch) = agent.batch_infer(&leaf_batch);
+            // --- Batched Inference ---
+            let (prior_batch, value_batch) = if let Some(_) = self.server_url {
+                // Remote inference
+                self.remote_infer(&leaf_batch).unwrap()
+            } else {
+                // Local inference
+                agent.batch_infer(&leaf_batch)
+            };
 
             // Expansion & Backpropagation
             let n = prior_batch.len().min(value_batch.len()).min(parent_batch.len());
@@ -155,7 +174,7 @@ impl MCTS {
             let ch = parent.children.clone();
             (vl, ev, ch, parent.value_estimate)
         };
-        let edge_visit_count: usize = edge_visits.values().copied().sum();
+        let edge_visit_count: usize = edge_visits.values().copied().sum::<usize>();
         let total_edge_visits = edge_visit_count + virtual_loss_counts;
         if total_edge_visits == 0 {
             if let Some(node) = self.get_node_mut(node_id) {
@@ -433,6 +452,36 @@ impl MCTS {
         }
         //println!("[mcts::backpropagate] exit");
     }
+
+    // ------------------------------------------------------------------------
+    // Remote inference
+    // ------------------------------------------------------------------------
+    pub fn remote_infer(
+        &self,
+        obs_batch: &[Vec<f32>],
+    ) -> anyhow::Result<(Vec<HashMap<Action, f32>>, Vec<f32>)> {
+        let client = self.client.as_ref().expect("HTTP client not initialized");
+        let server_url = self.server_url.as_ref().unwrap();
+        let req = InferenceRequest { observation_batch: obs_batch.to_vec() };
+        let resp = client
+            .post(format!("{}/infer", server_url))
+            .json(&req)
+            .send()?
+            .error_for_status()?
+            .json::<InferenceResponse>()?;
+
+        let prior_batch = resp
+            .prior_batch
+            .into_iter()
+            .map(|m| {
+                m.into_iter()
+                    .filter_map(|(k, v)| k.parse::<Action>().ok().map(|a| (a, v)))
+                    .collect::<HashMap<Action, f32>>()
+            })
+            .collect::<Vec<_>>();
+
+        Ok((prior_batch, resp.value_batch))
+    }
 }
 
 
@@ -460,14 +509,14 @@ mod tests {
 
     #[test]
     fn test_mcts_creation() {
-        let mcts = MCTS::new(1.0, 16);
+        let mcts = MCTS::new(1.0, 16, None);
         assert_eq!(mcts.terminal_value, 1.0);
         assert_eq!(mcts.batch_size, 16);
     }
 
     #[test]
     fn test_insert_and_get_node() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors.clone(), 0.42, 1, None);
         mcts.insert_node(1, node);
@@ -479,7 +528,7 @@ mod tests {
 
     #[test]
     fn test_with_node_write_updates() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.1, 2, None);
         mcts.insert_node(2, node);
@@ -494,7 +543,7 @@ mod tests {
 
     #[test]
     fn test_recompute_value_leaf_sets_prior() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.33, 3, None);
         mcts.insert_node(3, node);
@@ -506,7 +555,7 @@ mod tests {
 
     #[test]
     fn test_puct_scores_and_select_puct() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         // one action with prior 1.0
         let priors = make_priors(&[(0usize, 1.0f32)]);
         let node = Node::new(priors.clone(), 0.5, 4, None);
@@ -525,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_select_action() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[(0usize, 0.5f32), (1usize, 0.5f32)]);
         let mut node = Node::new(priors.clone(), 0.0, 5, None);
         node.edge_visits.insert(0, 10);
@@ -537,7 +586,7 @@ mod tests {
 
     #[test]
     fn test_select_action_is_none_if_no_visits() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.8f32)]);
         let node = Node::new(priors.clone(), 0.0, 6, None);
         mcts.insert_node(6, node);
@@ -547,7 +596,7 @@ mod tests {
 
     #[test]
     fn test_add_child_inserts_mapping() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let parent_priors = make_priors(&[(0usize, 1.0f32)]);
         let parent = Node::new(parent_priors, 0.0, 10, None);
         let child = Node::new(make_priors(&[]), 0.0, 11, None);
@@ -566,7 +615,7 @@ mod tests {
 
     #[test]
     fn test_add_and_revert_virtual_losses() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.0, 20, None);
         mcts.insert_node(20, node);
@@ -586,7 +635,7 @@ mod tests {
 
     #[test]
     fn test_add_and_revert_penalties() {
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.0, 21, None);
         mcts.insert_node(21, node);
@@ -606,7 +655,7 @@ mod tests {
 
     #[test]
     fn test_check_state_repeat() {
-        let mcts = MCTS::new(0.0, 4);
+        let mcts = MCTS::new(0.0, 4, None);
         let path = vec![(1, 0), (2, 1), (3, 0)];
         assert!(mcts.check_state_repeat(2, &path));
         assert!(!mcts.check_state_repeat(4, &path));
@@ -623,7 +672,7 @@ mod tests {
         env.step(action);
         let leaf_hash = env.hash_state() as NodeId;
 
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let parent = Node::new(priors.clone(), value, root_hash, None);
         mcts.insert_node(root_hash, parent);
 
@@ -644,7 +693,7 @@ mod tests {
             h q[0];
             cx q[0],q[1];";
         // Build a high value path
-        let mut mcts = MCTS::new(0.0, 4);
+        let mut mcts = MCTS::new(0.0, 4, None);
         let mut env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
         let mut env_clone = env.clone();
         // First node
@@ -686,7 +735,7 @@ mod tests {
 
     #[test]
     fn test_normalize_prior() {
-        let mcts = MCTS::new(0.0, 4);
+        let mcts = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.3f32), (2usize, 0.5f32)]);
         let actions = vec![0, 1];
         let normalized = mcts.normalize_prior(priors, actions.clone());
@@ -713,7 +762,7 @@ mod tests {
         let env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
 
         // Create MCTS and a trivial agent. Adjust terminal value / batch size to taste.
-        let mut mcts = MCTS::new(0.0_f32, 4usize);
+        let mut mcts = MCTS::new(0.0_f32, 4usize, None);
         let agent = DummyAgent::new(env.num_actions()); // 4 actions
 
         // Run MCTS for a small number of steps.
