@@ -1,7 +1,8 @@
 pub mod node;
 pub mod mcts;
-pub mod parallel_node;
-pub mod parallel_mcts;
+pub mod agent;
+pub mod enums;
 
-pub use node::Node;
-pub use mcts::{MCTS, Environment, Agent};
+pub use crate::mcts::MCTS;
+pub use crate::node::Node;
+pub use crate::agent::Agent;
