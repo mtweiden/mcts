@@ -12,8 +12,8 @@ fn run_trial() {
     println!("{}", env.render());
 
     for _ in 0..100 {
-        let root_id = mcts.run(&env, &agent, 10000usize);
-        let best_action = mcts.select_action(root_id);
+        let root = mcts.run(&env, &agent, 10000usize);
+        let best_action = mcts.select_action(root);
         env.step(best_action.unwrap());
         if env.done() {
             break;

@@ -45,7 +45,7 @@ impl<E: EnvTrait> MCTS<E> {
 
     /// Run MCTS for a given number of steps from the current environment state.
     /// `env` is borrowed immutably; select_leaf clones it internally as needed.
-    pub fn run<T: Agent>(&mut self, env: &E, agent: &T, num_steps: usize) -> NodeId {
+    pub fn run<T: Agent>(&mut self, env: &E, agent: &T, num_steps: usize) -> Node {
         // Ensure root node exists
         let root_hash = self.get_hash(env);
         if !self.node_exists(root_hash) {
@@ -56,7 +56,7 @@ impl<E: EnvTrait> MCTS<E> {
         }
 
         if env.done() {
-            return root_hash;
+            return self.get_node_mut(root_hash).unwrap().clone();
         }
 
         let batches = num_steps / self.batch_size.max(1);
@@ -104,8 +104,7 @@ impl<E: EnvTrait> MCTS<E> {
                 }
             }
         }
-
-        root_hash
+        self.get_node_mut(root_hash).unwrap().clone()
     }
 
     /// ------------------------------------------------------------------------
@@ -234,8 +233,7 @@ impl<E: EnvTrait> MCTS<E> {
         scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(action, _)| action)
     }
 
-    pub fn select_action(&self, node_id: NodeId) -> Option<Action> {
-        let node = self.get_node_immut(node_id)?;
+    pub fn select_action(&self, node: Node) -> Option<Action> {
         node.select_action()
     }
 
@@ -525,7 +523,8 @@ mod tests {
         node.edge_visits.insert(0, 10);
         node.edge_visits.insert(1, 20);
         mcts.insert_node(5, node);
-        let chosen = mcts.select_action(5).unwrap();
+        let node = mcts.get_node_mut(5).unwrap().clone();
+        let chosen = mcts.select_action(node).unwrap();
         assert_eq!(chosen, 1); // action 1 has more visits, prefer higher prior
     }
 
@@ -535,7 +534,8 @@ mod tests {
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.8f32)]);
         let node = Node::new(priors.clone(), 0.0, 6, None);
         mcts.insert_node(6, node);
-        let chosen = mcts.select_action(6);
+        let node = mcts.get_node_mut(6).unwrap().clone();
+        let chosen = mcts.select_action(node);
         assert_eq!(chosen, None);
     }
 
@@ -711,10 +711,10 @@ mod tests {
         let agent = DummyAgent::new(env.num_actions()); // 4 actions
 
         // Run MCTS for a small number of steps.
-        let root_id = mcts.run(&env, &agent, 10000usize);
+        let root_node = mcts.run(&env, &agent, 10000usize);
 
         // Ensure the root node exists in the transposition table after running.
-        assert!(mcts.node_exists(root_id), "root node should be present");
+        assert!(mcts.node_exists(root_node.id), "root node should be present");
 
         let num_nodes = mcts.nodes.len();
         assert!(num_nodes > 1, "should have expanded some nodes");
