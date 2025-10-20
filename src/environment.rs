@@ -1,4 +1,5 @@
 use crate::enums::Action;
+use crate::enums::Observation;
 
 /// Abstract Environment trait used by MCTS (single-threaded).
 /// Implement this trait for any concrete environment you want to run MCTS on.
@@ -10,7 +11,7 @@ pub trait Environment: Clone {
     fn done(&self) -> bool;
 
     /// Return the observation vector for the current state.
-    fn observation(&self) -> Vec<f32>;
+    fn observation(&self) -> Observation;
 
     /// Return the list of valid actions in the current state.
     fn valid_actions(&self) -> Vec<Action>;
@@ -32,9 +33,9 @@ impl Environment for tilers_core::env::Environment {
         tilers_core::env::Environment::done(self)
     }
 
-    fn observation(&self) -> Vec<f32> {
+    fn observation(&self) -> Observation {
         // tilers_core::env::Environment::observation(self)
-        vec![0.0]
+        vec![0]
     }
 
     fn valid_actions(&self) -> Vec<Action> {

@@ -1,18 +1,20 @@
-use crate::enums::Action;
 use std::collections::HashMap;
+use crate::enums::Observation;
+use crate::enums::Prior;
+use crate::enums::Value;
 
 /// Agent trait: provides single and batched inference APIs.
 pub trait Agent: Send + Sync {
     /// Infer priors and value for a single observation.
     /// Returns (priors_map, value).
-    fn infer(&self, obs: &[f32]) -> (HashMap<Action, f32>, f32);
+    fn infer(&self, obs: &Observation) -> (Prior, Value);
 
     /// Batched inference: takes a slice of observations and returns
     /// a vector of priors maps and a vector of values (same length).
     fn batch_infer(
         &self,
-        batch: &[Vec<f32>],
-    ) -> (Vec<HashMap<Action, f32>>, Vec<f32>) {
+        batch: &[Observation],
+    ) -> (Vec<Prior>, Vec<Value>) {
         // Default implementation forwards to single infer for each item.
         let mut priors = Vec::with_capacity(batch.len());
         let mut values = Vec::with_capacity(batch.len());
@@ -39,7 +41,7 @@ impl DummyAgent {
 }
 
 impl Agent for DummyAgent {
-    fn infer(&self, _obs: &[f32]) -> (HashMap<Action, f32>, f32) {
+    fn infer(&self, _obs: &Observation) -> (Prior, Value) {
         let mut priors = HashMap::new();
         if self.action_count > 0 {
             let p = 1.0f32 / (self.action_count as f32);

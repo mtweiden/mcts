@@ -1,13 +1,15 @@
 use serde::{Serialize, Deserialize};
-use std::collections::HashMap;
+use crate::enums::Observation;
+use crate::enums::Prior;
+use crate::enums::Value;
 
 #[derive(Serialize)]
 pub struct InferenceRequest {
-    pub observation_batch: Vec<Vec<f32>>,
+    pub observation_batch: Vec<Observation>,
 }
 
 #[derive(Deserialize)]
 pub struct InferenceResponse {
-    pub prior_batch: Vec<HashMap<String, f32>>,
-    pub value_batch: Vec<f32>,
+    pub prior_batch: Vec<Prior>,
+    pub value_batch: Vec<Value>,
 }

@@ -1,5 +1,5 @@
 use crate::node::Node;
-use crate::enums::{Action, NodeId};
+use crate::enums::{Action, NodeId, Observation, Prior, Value};
 use crate::agent::Agent;
 use crate::network::InferenceRequest;
 use crate::network::InferenceResponse;
@@ -14,7 +14,7 @@ pub struct MCTS<E: EnvTrait> {
     // Arena style storage for all nodes.
     pub transposition_table: HashMap<NodeId, usize>,
     pub nodes: Vec<Node>,
-    pub terminal_value: f32,
+    pub terminal_value: Value,
     pub batch_size: usize,
     pub server_url: Option<String>,
     pub client: Option<reqwest::blocking::Client>,
@@ -25,7 +25,7 @@ pub struct MCTS<E: EnvTrait> {
 
 impl<E: EnvTrait> MCTS<E> {
     pub fn new(
-        terminal_value: f32,
+        terminal_value: Value,
         batch_size: usize,
         server_url: Option<String>,
     ) -> Self {
@@ -62,7 +62,7 @@ impl<E: EnvTrait> MCTS<E> {
         let batches = num_steps / self.batch_size.max(1);
         for _ in 0..batches {
             // Selection: collect a batch of leaf observations / metadata
-            let mut leaf_batch: Vec<Vec<f32>> = Vec::with_capacity(self.batch_size);
+            let mut leaf_batch: Vec<Observation> = Vec::with_capacity(self.batch_size);
             let mut path_batch: Vec<Vec<(NodeId, Action)>> = Vec::with_capacity(self.batch_size);
             let mut parent_batch: Vec<(Option<NodeId>, Action, E)> =
                 Vec::with_capacity(self.batch_size);
@@ -115,8 +115,8 @@ impl<E: EnvTrait> MCTS<E> {
     pub fn create_node(
         &mut self,
         env: &E,
-        priors: HashMap<Action, f32>,
-        value: f32,
+        priors: Prior,
+        value: Value,
     ) -> NodeId {
         let node_id = self.get_hash(env);
         let repr = env.render();
@@ -254,7 +254,7 @@ impl<E: EnvTrait> MCTS<E> {
         env.hash_state() as NodeId
     }
 
-    pub fn normalize_prior(&self, priors: HashMap<Action, f32>, actions: Vec<Action>) -> HashMap<Action, f32> {
+    pub fn normalize_prior(&self, priors: Prior, actions: Vec<Action>) -> Prior {
         let mut normalized = HashMap::new();
         let mut total: f32 = 0.0;
         for &a in &actions {
@@ -354,8 +354,8 @@ impl<E: EnvTrait> MCTS<E> {
         parent_id: NodeId,
         action: Action,
         env: E,
-        priors: HashMap<Action, f32>,
-        value: f32,
+        priors: Prior,
+        value: Value,
     ) -> NodeId {
         let leaf_id = self.get_hash(&env);
         if !self.node_exists(leaf_id) {
@@ -407,8 +407,8 @@ impl<E: EnvTrait> MCTS<E> {
 
     pub fn remote_infer(
         &self,
-        obs_batch: &[Vec<f32>],
-    ) -> anyhow::Result<(Vec<HashMap<Action, f32>>, Vec<f32>)> {
+        obs_batch: &[Observation],
+    ) -> anyhow::Result<(Vec<Prior>, Vec<Value>)> {
         let client = self.client.as_ref().expect("HTTP client not initialized");
         let server_url = self.server_url.as_ref().unwrap();
         let req = InferenceRequest { observation_batch: obs_batch.to_vec() };
@@ -419,16 +419,9 @@ impl<E: EnvTrait> MCTS<E> {
             .error_for_status()?
             .json::<InferenceResponse>()?;
 
-        let prior_batch = resp
-            .prior_batch
-            .into_iter()
-            .map(|m| {
-                m.into_iter()
-                    .filter_map(|(k, v)| k.parse::<Action>().ok().map(|a| (a, v)))
-                    .collect::<HashMap<Action, f32>>()
-            })
-            .collect::<Vec<_>>();
-
+        // response.prior_batch already contains Priors keyed by Action (usize),
+        // so we can use it directly.
+        let prior_batch: Vec<Prior> = resp.prior_batch;
         Ok((prior_batch, resp.value_batch))
     }
 }
@@ -442,7 +435,7 @@ mod tests {
     use std::collections::HashMap;
     use tilers_core::env::Environment;
 
-    fn make_priors(pairs: &[(Action, f32)]) -> HashMap<Action, f32> {
+    fn make_priors(pairs: &[(Action, f32)]) -> Prior {
         let mut m = HashMap::new();
         for &(a, p) in pairs {
             m.insert(a, p);
@@ -450,7 +443,7 @@ mod tests {
         m
     }
 
-    fn make_priors_from_vec(actions: Vec<Action>) -> HashMap<Action, f32> {
+    fn make_priors_from_vec(actions: Vec<Action>) -> Prior {
         let mut m = HashMap::new();
         let prob = 1.0 / (actions.len() as f32);
         for &a in &actions {
