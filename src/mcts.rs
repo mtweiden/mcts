@@ -3,24 +3,28 @@ use crate::enums::{Action, NodeId};
 use crate::agent::Agent;
 use crate::network::InferenceRequest;
 use crate::network::InferenceResponse;
-use tilers_core::env::Environment;
+use crate::environment::Environment as EnvTrait;
 use std::collections::HashMap;
+use std::marker::PhantomData;
+use tilers_core::env::Environment; // for tests / implementations
 
 
-/// Core Monte Carlo Tree Search engine.
-/// TODO: Remove repr from Node for faster performance
-pub struct MCTS {
+/// Core Monte Carlo Tree Search engine, now generic over an Environment type `E`
+/// that implements the `EnvTrait` trait.
+pub struct MCTS<E: EnvTrait> {
     // Arena style storage for all nodes.
-    // TODO: Introduce sharding for nodes storage
     pub transposition_table: HashMap<NodeId, usize>,
     pub nodes: Vec<Node>,
     pub terminal_value: f32,
     pub batch_size: usize,
     pub server_url: Option<String>,
     pub client: Option<reqwest::blocking::Client>,
+
+    // Keep the generic type around (no runtime data).
+    _env_marker: PhantomData<E>,
 }
 
-impl MCTS {
+impl<E: EnvTrait> MCTS<E> {
     pub fn new(
         terminal_value: f32,
         batch_size: usize,
@@ -36,28 +40,17 @@ impl MCTS {
             batch_size,
             server_url,
             client,
+            _env_marker: PhantomData,
         }
     }
-    /// ------------------------------------------------------------------------
-    /// MCTS run function
-    /// ------------------------------------------------------------------------
+
     /// Run MCTS for a given number of steps from the current environment state.
-    /// Returns the NodeId of the root node after search. An action can be selected
-    /// from this node using select_action.
-    /// This function runs single-threaded MCTS but batches inference requests.
-    pub fn run<T: Agent>(
-        &mut self,
-        env: &Environment,
-        agent: &T,
-        num_steps: usize,
-    ) -> NodeId {
+    /// `env` is borrowed immutably; select_leaf clones it internally as needed.
+    pub fn run<T: Agent>(&mut self, env: &E, agent: &T, num_steps: usize) -> NodeId {
         // Ensure root node exists
         let root_hash = self.get_hash(env);
         if !self.node_exists(root_hash) {
-            // build observation and ask agent for priors/value to create the root
-            // TODO: Consistent observation representation
-            //let obs = env.observation();
-            let obs = vec![0.0];
+            let obs = env.observation();
             let (mut priors, value) = agent.infer(&obs);
             priors = self.normalize_prior(priors, env.valid_actions());
             self.create_node(env, priors, value);
@@ -72,16 +65,17 @@ impl MCTS {
             // Selection: collect a batch of leaf observations / metadata
             let mut leaf_batch: Vec<Vec<f32>> = Vec::with_capacity(self.batch_size);
             let mut path_batch: Vec<Vec<(NodeId, Action)>> = Vec::with_capacity(self.batch_size);
-            let mut parent_batch: Vec<(Option<NodeId>, Action, Environment)> =
+            let mut parent_batch: Vec<(Option<NodeId>, Action, E)> =
                 Vec::with_capacity(self.batch_size);
             let mut repeat_batch: Vec<bool> = Vec::with_capacity(self.batch_size);
 
             for _ in 0..self.batch_size {
-                let mut game = env.clone();
-                let (path, parent, action, obs, repeat) = self.select_leaf(root_hash, &mut game);
+                // select_leaf clones the environment internally and returns the reached env
+                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env);
+                let obs = final_env.observation();
                 leaf_batch.push(obs);
                 path_batch.push(path);
-                parent_batch.push((parent, action, game));
+                parent_batch.push((parent, action, final_env));
                 repeat_batch.push(repeat);
             }
 
@@ -118,10 +112,10 @@ impl MCTS {
     /// ------------------------------------------------------------------------
     /// Node functions
     /// ------------------------------------------------------------------------
-    /// Create a node
+    /// Create a node from a reference to an Environment `E`.
     pub fn create_node(
         &mut self,
-        env: &Environment,
+        env: &E,
         priors: HashMap<Action, f32>,
         value: f32,
     ) -> NodeId {
@@ -129,7 +123,7 @@ impl MCTS {
         let repr = env.render();
         let node = if env.done() {
             Node::new_terminal(node_id, self.terminal_value, Some(repr))
-        } else  {
+        } else {
             Node::new(priors, value, node_id, Some(repr))
         };
         self.insert_node(node_id, node);
@@ -162,8 +156,7 @@ impl MCTS {
 
     /// Recompute the cached value of a node based on its children's values.
     pub fn recompute_value(&mut self, node_id: NodeId) {
-        // Snapshot parent data under an immutable borrow so we don't hold a mutable borrow
-        // while reading children (avoids double mutable-borrow of `self`).
+        // Snapshot parent data immutably to avoid overlapping mutable borrows.
         let (virtual_loss_counts, edge_visits, children, node_value_estimate) = {
             let parent = match self.get_node_immut(node_id) {
                 Some(p) => p,
@@ -188,11 +181,11 @@ impl MCTS {
         let mut acc: f32 = 0.0;
         for (a, child_id) in children {
             if let Some(child) = self.get_node_immut(child_id) {
-                let edge_visit_count = edge_visits.get(&a).copied().unwrap_or(0);
-                if edge_visit_count == 0 {
+                let ev = edge_visits.get(&a).copied().unwrap_or(0);
+                if ev == 0 {
                     continue;
                 }
-                acc += (edge_visit_count as f32) * child.value;
+                acc += (ev as f32) * child.value;
             }
         }
 
@@ -205,12 +198,10 @@ impl MCTS {
 
     /// Compute PUCT scores for all actions from this node.
     pub fn puct_scores(&self, node_id: NodeId, c_puct: f32) -> HashMap<Action, f32> {
-
-        let node = self.get_node_immut(node_id);
-        if node.is_none() {
-            return HashMap::new();
-        }
-        let node = node.unwrap();
+        let node = match self.get_node_immut(node_id) {
+            Some(n) => n,
+            None => return HashMap::new(),
+        };
 
         let total_visits: usize = node.edge_visits.values().copied().sum::<usize>();
         let sqrt_total = (total_visits as f32).sqrt() + 1e-8;
@@ -245,36 +236,25 @@ impl MCTS {
     }
 
     pub fn select_action(&self, node_id: NodeId) -> Option<Action> {
-        let node = self.get_node_immut(node_id);
-        if node.is_none() {
-            return None;
-        }
-        let node = node.unwrap();
+        let node = self.get_node_immut(node_id)?;
         node.select_action()
     }
 
     pub fn add_child(&mut self, parent_id: NodeId, action: Action, child_id: NodeId) {
-        let parent = match self.get_node_mut(parent_id) {
-            Some(p) => p,
-            None => return,
-        };
-        parent.children.insert(action, child_id);
+        if let Some(parent) = self.get_node_mut(parent_id) {
+            parent.children.insert(action, child_id);
+        }
     }
 
     pub fn node_exists(&self, node_id: NodeId) -> bool {
         self.transposition_table.contains_key(&node_id)
     }
 
-    // ------------------------------------------------------------------------
-    // Environment interaction functions
-    // ------------------------------------------------------------------------
     /// Get a hash of the current environment state.
-    pub fn get_hash(&self, env: &Environment) -> NodeId {
-        // For simplicity, we assume the environment provides a method to get a unique hash.
+    pub fn get_hash(&self, env: &E) -> NodeId {
         env.hash_state() as NodeId
     }
 
-    /// Normalize the prior probabilities for a set of actions.
     pub fn normalize_prior(&self, priors: HashMap<Action, f32>, actions: Vec<Action>) -> HashMap<Action, f32> {
         let mut normalized = HashMap::new();
         let mut total: f32 = 0.0;
@@ -298,24 +278,18 @@ impl MCTS {
         normalized
     }
 
-    // ------------------------------------------------------------------------
-    // MCTS search functions
-    // ------------------------------------------------------------------------
-    /// Traverse from root to a leaf. Returns the following:
-    ///   - path: Vec of (parent, action_to_child) pairs taken during traversal
-    ///   - parent: Option<NodeId> of the leaf's parent (None if root is leaf)
-    ///   - action_taken: Action taken to reach the leaf from its parent
-    ///   - observation: observation vector at the leaf
-    ///   - repeat_detected: whether a repeat state was detected during traversal
+    /// Traverse from root to a leaf. Returns:
+    /// (path, parent, action_taken, final_env, repeat_detected)
+    /// `final_env` is the environment state after taking actions along the path.
     pub fn select_leaf(
         &mut self,
         root_id: NodeId,
-        env: &mut Environment,
+        env: &E,
     ) -> (
         Vec<(NodeId, Action)>,
         Option<NodeId>,
         Action,
-        Vec<f32>,
+        E,
         bool,
     ) {
         let mut path: Vec<(NodeId, Action)> = Vec::new();
@@ -324,13 +298,16 @@ impl MCTS {
         let mut action: Action = usize::MAX;
         let mut repeat_detected = false;
 
-        while !env.done() && !repeat_detected {
+        // work on a cloned environment so caller's env is not mutated
+        let mut game = env.clone();
+
+        while !game.done() && !repeat_detected {
             if !self.node_exists(node_id) {
                 break;
             }
 
             // detect repeats based on path
-            repeat_detected = self.check_state_repeat(node_id, &path);
+            repeat_detected = self.check_state_repeat(game.hash_state() as NodeId, &path);
             if repeat_detected {
                 break;
             }
@@ -342,120 +319,93 @@ impl MCTS {
             };
             action = chosen;
 
-            // mark virtual loss quickly using atomic counter if present (no write lock needed)
-            let node = self.get_node_mut(node_id).unwrap();
-            node.add_virtual_loss(action);
+            // mark virtual loss quickly (single-threaded counter)
+            if let Some(node) = self.get_node_mut(node_id) {
+                node.add_virtual_loss(action);
+            }
 
             // advance environment
-            env.step(action);
+            game.step(action);
 
             // record step in path and advance
             path.push((node_id, action));
             parent = Some(node_id);
 
-            // lookup child id (snapshot under read lock)
-            if let Some(cid) = node.children.get(&action).copied() {
-                node_id = cid;
+            // lookup child id from the parent snapshot
+            if let Some(parent_node) = self.get_node_immut(node_id) {
+                if let Some(cid) = parent_node.children.get(&action).copied() {
+                    node_id = cid;
+                } else {
+                    break;
+                }
             } else {
-                // no child allocated yet -> we've reached a leaf
                 break;
             }
         }
 
-        // get observation (even if terminal or repeat) so return type is consistent
-        // TODO: Need consistent representation of observations
-        // let obs = env.observation();
-        let obs = vec![0.0];
-
-        (path, parent, action, obs, repeat_detected)
+        (path, parent, action, game, repeat_detected)
     }
 
-    /// Check if the given state hash has already been encountered in the path.
     pub fn check_state_repeat(&self, state_hash: NodeId, path: &[(NodeId, Action)]) -> bool {
         path.iter().any(|(h, _)| *h == state_hash)
     }
 
-    // ------------------------------------------------------------------------
-    // MCTS Expansion and Backpropagation
-    // ------------------------------------------------------------------------
-    /// Expand the tree by adding a new node for the given environment state. This function
-    /// requires:
-    ///   - parent_id: the node id of the parent from which we are expanding
-    ///   - action: the action taken from the parent to reach this state
-    ///   - env: the environment in the new state
-    ///   - priors: prior probabilities for actions of the new node
-    ///   - value: the value estimate for the new node
     pub fn expand(
         &mut self,
         parent_id: NodeId,
         action: Action,
-        env: Environment,
+        env: E,
         priors: HashMap<Action, f32>,
         value: f32,
     ) -> NodeId {
-        // compute leaf id from environment state
         let leaf_id = self.get_hash(&env);
-        // Reuse existing node if present, otherwise create and insert a new node
         if !self.node_exists(leaf_id) {
             let normalized_priors = self.normalize_prior(priors, env.valid_actions());
             self.create_node(&env, normalized_priors, value);
         }
 
-        // Ensure parent's children map contains the mapping action -> leaf_id.
-        // Also increment the parent's edge visit counter for this action.
-        let parent = self.get_node_mut(parent_id).unwrap();
-
-        // Use the mutable `parent` we already obtained above.
-        if parent.children.contains_key(&action) {
-            let existing_id = parent.children.get(&action).copied().unwrap();
-            if existing_id != leaf_id {
-                eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id);
-            }
-        } else {
-            parent.children.insert(action, leaf_id);
-            *parent.edge_visits.entry(action).or_insert(0) += 1;
-            for (&a, &cid) in &parent.children {
-                if cid == leaf_id && a != action {
-                    eprintln!("[Alias detected] actions {} - {}", a, action);
+        if let Some(parent) = self.get_node_mut(parent_id) {
+            if parent.children.contains_key(&action) {
+                let existing_id = parent.children.get(&action).copied().unwrap();
+                if existing_id != leaf_id {
+                    eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id);
+                }
+            } else {
+                parent.children.insert(action, leaf_id);
+                *parent.edge_visits.entry(action).or_insert(0) += 1;
+                for (&a, &cid) in &parent.children {
+                    if cid == leaf_id && a != action {
+                        eprintln!("[Alias detected] actions {} - {}", a, action);
+                    }
                 }
             }
         }
+
         leaf_id
     }
 
-    /// Backpropagate a leaf value up the search path.
-    /// Takes as input:
-    ///  - search_path: Vec of (parent_node_id, action_taken) pairs from root to a node
-    ///  - repeat_detected: whether a repeat state was detected during traversal
     pub fn backpropagate(&mut self, search_path: &[(NodeId, Action)], repeat_detected: bool) {
-        //println!("[mcts::backpropagate] enter path_len={} repeat={}", search_path.len(), repeat_detected);
         if search_path.is_empty() {
             return;
         }
 
-        // If a repeat was detected, apply a penalty to the last parent/action.
         if repeat_detected {
-            let (last_parent_id, last_action) = search_path.last().unwrap();
-            let last_parent = self.get_node_mut(*last_parent_id).unwrap();
-            last_parent.apply_penalty(*last_action);
+            if let Some((last_parent_hash, last_action)) = search_path.last() {
+                if let Some(last_parent) = self.get_node_mut(*last_parent_hash) {
+                    last_parent.apply_penalty(*last_action);
+                }
+            }
         }
 
-        // Walk the path in reverse (from leaf's parent back to root).
         for &(node_hash, action) in search_path.iter().rev() {
-            let node = self.get_node_mut(node_hash).unwrap();
-            // Revert the virtual loss and increment edge visits under a write lock,
-            // then recompute the cached value without holding that write lock.
-            node.revert_virtual_loss(action);
-            *node.edge_visits.entry(action).or_insert(0) += 1;
-            // Recompute node value via the MCTS helper (acquires its own locks).
+            if let Some(node) = self.get_node_mut(node_hash) {
+                node.revert_virtual_loss(action);
+                *node.edge_visits.entry(action).or_insert(0) += 1;
+            }
             self.recompute_value(node_hash);
         }
-        //println!("[mcts::backpropagate] exit");
     }
 
-    // ------------------------------------------------------------------------
-    // Remote inference
-    // ------------------------------------------------------------------------
     pub fn remote_infer(
         &self,
         obs_batch: &[Vec<f32>],
@@ -484,6 +434,8 @@ impl MCTS {
     }
 }
 
+// Note: tests must now construct the MCTS with the concrete environment type:
+// let mut mcts: MCTS<Environment> = MCTS::<tilers_core::env::Environment>::new(0.0, 4, None);
 
 #[cfg(test)]
 mod tests {
@@ -509,14 +461,14 @@ mod tests {
 
     #[test]
     fn test_mcts_creation() {
-        let mcts = MCTS::new(1.0, 16, None);
+        let mcts: MCTS<Environment> = MCTS::new(1.0, 16, None);
         assert_eq!(mcts.terminal_value, 1.0);
         assert_eq!(mcts.batch_size, 16);
     }
 
     #[test]
     fn test_insert_and_get_node() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors.clone(), 0.42, 1, None);
         mcts.insert_node(1, node);
@@ -528,7 +480,7 @@ mod tests {
 
     #[test]
     fn test_with_node_write_updates() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.1, 2, None);
         mcts.insert_node(2, node);
@@ -543,7 +495,7 @@ mod tests {
 
     #[test]
     fn test_recompute_value_leaf_sets_prior() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.33, 3, None);
         mcts.insert_node(3, node);
@@ -555,7 +507,7 @@ mod tests {
 
     #[test]
     fn test_puct_scores_and_select_puct() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         // one action with prior 1.0
         let priors = make_priors(&[(0usize, 1.0f32)]);
         let node = Node::new(priors.clone(), 0.5, 4, None);
@@ -574,7 +526,7 @@ mod tests {
 
     #[test]
     fn test_select_action() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[(0usize, 0.5f32), (1usize, 0.5f32)]);
         let mut node = Node::new(priors.clone(), 0.0, 5, None);
         node.edge_visits.insert(0, 10);
@@ -586,7 +538,7 @@ mod tests {
 
     #[test]
     fn test_select_action_is_none_if_no_visits() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.8f32)]);
         let node = Node::new(priors.clone(), 0.0, 6, None);
         mcts.insert_node(6, node);
@@ -596,7 +548,7 @@ mod tests {
 
     #[test]
     fn test_add_child_inserts_mapping() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let parent_priors = make_priors(&[(0usize, 1.0f32)]);
         let parent = Node::new(parent_priors, 0.0, 10, None);
         let child = Node::new(make_priors(&[]), 0.0, 11, None);
@@ -615,7 +567,7 @@ mod tests {
 
     #[test]
     fn test_add_and_revert_virtual_losses() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.0, 20, None);
         mcts.insert_node(20, node);
@@ -635,7 +587,7 @@ mod tests {
 
     #[test]
     fn test_add_and_revert_penalties() {
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.0, 21, None);
         mcts.insert_node(21, node);
@@ -655,7 +607,7 @@ mod tests {
 
     #[test]
     fn test_check_state_repeat() {
-        let mcts = MCTS::new(0.0, 4, None);
+        let mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let path = vec![(1, 0), (2, 1), (3, 0)];
         assert!(mcts.check_state_repeat(2, &path));
         assert!(!mcts.check_state_repeat(4, &path));
@@ -672,7 +624,7 @@ mod tests {
         env.step(action);
         let leaf_hash = env.hash_state() as NodeId;
 
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let parent = Node::new(priors.clone(), value, root_hash, None);
         mcts.insert_node(root_hash, parent);
 
@@ -693,7 +645,7 @@ mod tests {
             h q[0];
             cx q[0],q[1];";
         // Build a high value path
-        let mut mcts = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let mut env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
         let mut env_clone = env.clone();
         // First node
@@ -735,7 +687,7 @@ mod tests {
 
     #[test]
     fn test_normalize_prior() {
-        let mcts = MCTS::new(0.0, 4, None);
+        let mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
         let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.3f32), (2usize, 0.5f32)]);
         let actions = vec![0, 1];
         let normalized = mcts.normalize_prior(priors, actions.clone());
@@ -762,7 +714,7 @@ mod tests {
         let env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
 
         // Create MCTS and a trivial agent. Adjust terminal value / batch size to taste.
-        let mut mcts = MCTS::new(0.0_f32, 4usize, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0_f32, 4usize, None);
         let agent = DummyAgent::new(env.num_actions()); // 4 actions
 
         // Run MCTS for a small number of steps.
