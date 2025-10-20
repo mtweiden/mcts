@@ -6,7 +6,6 @@ use crate::network::InferenceResponse;
 use crate::environment::Environment as EnvTrait;
 use std::collections::HashMap;
 use std::marker::PhantomData;
-use tilers_core::env::Environment; // for tests / implementations
 
 
 /// Core Monte Carlo Tree Search engine, now generic over an Environment type `E`
@@ -441,6 +440,7 @@ impl<E: EnvTrait> MCTS<E> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use tilers_core::env::Environment;
 
     fn make_priors(pairs: &[(Action, f32)]) -> HashMap<Action, f32> {
         let mut m = HashMap::new();
