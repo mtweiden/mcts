@@ -1,4 +1,5 @@
 import asyncio
+import time
 from asyncio import Future
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -113,8 +114,11 @@ app = FastAPI(lifespan=lifespan)
 
 @app.post("/infer", response_model=InferenceResponse)
 async def infer(req: InferenceRequest, request: Request) -> InferenceResponse:
+    t0 = time.time()
     batcher = request.app.state.batcher
     prior_batch, value_batch = await batcher.enqueue(req.observation_batch)
+    dt = (time.time() - t0) * 1000.0
+    print(f"Processed batch of len {len(req.observation_batch)} in {dt:.2f} ms")
     return InferenceResponse(prior_batch=prior_batch, value_batch=value_batch)
 
 # ------------------------------------------------------------------------------
