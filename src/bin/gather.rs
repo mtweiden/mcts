@@ -1,3 +1,4 @@
+use std::env;
 use std::collections::HashMap;
 use std::io::Write;
 use json::JsonValue;
@@ -175,17 +176,30 @@ impl Gatherer {
     }
 }
 
+
 fn main() {
-    // Initialize a Gatherer to ensure the binary has an entry point.
-    // To actually run simulations, construct a concrete Environment and call gatherer.run(env).
+    // Default URL if not provided
+    let mut server_url = String::from("http://localhost:8000");
+
+    // Parse command-line arguments
+    let args: Vec<String> = env::args().collect();
+    for i in 0..args.len() {
+        if args[i] == "--server" && i + 1 < args.len() {
+            server_url = args[i + 1].clone();
+        }
+    }
+
+    println!("Using inference server at: {}", server_url);
+
     let gatherer = Gatherer::new(
         32,
         10000,
         100,
-        String::from("http://localhost:8000"),
+        server_url,
         String::from("output.json"),
         0.25,
     );
+
     let mut env = Environment::new(4, 4, 2);
     env.random_start(2, false);
     gatherer.run(&env);
