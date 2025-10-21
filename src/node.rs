@@ -1,7 +1,6 @@
 use crate::enums::Action;
 use crate::enums::NodeId;
 use std::collections::HashMap;
-use std::fmt;
 
 
 /// A single node in the MCTS graph.
@@ -98,20 +97,7 @@ impl Node {
             .and_then(|(&action, &visits)| if visits == 0 { None } else { Some(action) })
     }
 }
-
-impl fmt::Debug for Node {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "Node {{ id: {}, value: {:.3}, edges: {} }}",
-            self.id,
-            self.value,
-            self.children.len()
-        )
-    }
-}
-
-
+    
 #[cfg(test)]
 mod tests {
     use super::*;
