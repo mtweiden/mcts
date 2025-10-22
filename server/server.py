@@ -1,12 +1,15 @@
 import asyncio
 import time
 import logging
+import msgpack
 from asyncio import Future
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi import Request
+from fastapi import Response
 from pydantic import BaseModel
 from uvicorn import run
+
 # ------------------------------------------------------------------------------
 # Some type definitions and constants
 # ------------------------------------------------------------------------------
@@ -14,7 +17,7 @@ ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
 BATCH_TIMEOUT = 0.01
-MAX_BATCH_SIZE = 256
+MAX_BATCH_SIZE = 1024
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -144,11 +147,22 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(lifespan=lifespan)
 
-@app.post("/infer", response_model=InferenceResponse)
-async def infer(req: InferenceRequest, request: Request) -> InferenceResponse:
+@app.post("/infer")
+async def infer(request: Request) -> Response:
+    raw = await request.body()
+    data = msgpack.unpackb(raw, raw=False)
+    obs_batch = data["observation_batch"]
+
     batcher = request.app.state.batcher
     prior_batch, value_batch = await batcher.enqueue(req.observation_batch)
-    return InferenceResponse(prior_batch=prior_batch, value_batch=value_batch)
+
+    response_payload = {
+        "prior_batch": prior_batch,
+        "value_batch": value_batch,
+    }
+    packed = msgpack.packb(response_payload, use_bin_type=True)
+
+    return Response(content=packed, media_type="application/msgpack")
 
 # ------------------------------------------------------------------------------
 # Entry point
