@@ -12,6 +12,7 @@ use rmp_serde::to_vec_named;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::{sleep, Duration};
 use tokio::net::TcpListener;
@@ -84,9 +85,18 @@ impl InferenceBatcher {
                     .collect();
 
                 // Run inference
+                let infer_start = Instant::now();
                 let (priors_all, values_all) = agent.batch_infer(&obs_all);
+                let infer_duration = infer_start.elapsed();
+                println!(
+                    "[Batcher] Inferred batch of {} in {:.2?}",
+                    obs_all.len(),
+                    infer_duration
+                );
 
                 // Send results back
+                let num_reqs = counts.len();
+                let send_start = Instant::now();
                 let mut start = 0;
                 for ((_, tx), count) in buffer.drain(..).zip(counts) {
                     let end = start + count;
@@ -97,6 +107,13 @@ impl InferenceBatcher {
                     let _ = tx.send(resp);
                     start = end;
                 }
+                let send_duration = send_start.elapsed();
+                println!(
+                    "[Batcher] Sent responses for {} requests ({} observations) in {:.2?}",
+                    num_reqs,
+                    obs_all.len(),
+                    send_duration,
+                );
             }
         });
 
