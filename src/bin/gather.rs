@@ -192,15 +192,20 @@ fn main() {
     println!("Using inference server at: {}", server_url);
 
     let gatherer = Gatherer::new(
-        32,
+        128,
         10000,
         100,
         server_url,
-        String::from("output.json"),
+        String::from("/pscratch/sd/m/mtweiden/tile/data/output.json"),
         0.25,
     );
 
-    let mut env = Environment::new(4, 4, 2);
-    env.random_start(2, false);
-    gatherer.run(&env);
+    let mut count = 0;
+    loop {
+        let mut env = Environment::new(4, 4, 2);
+        env.random_start(2, false);
+        gatherer.run(&env);
+        println!("Finished gather {}", count + 1);
+        count += 1;
+    }
 }
