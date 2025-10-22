@@ -1,15 +1,33 @@
 use crate::node::Node;
 use crate::enums::{Action, NodeId, Observation, Prior, Value};
 use crate::agent::Agent;
-use crate::network::InferenceRequest;
-use crate::network::InferenceResponse;
+// use crate::network::InferenceRequest;
+// use crate::network::InferenceResponse;
 use crate::environment::Environment as EnvTrait;
 use std::collections::HashMap;
 use std::marker::PhantomData;
+use rmp_serde::{to_vec_named, from_slice};
+use serde::{Serialize, Deserialize};
+
+/// ----------------------------------------------------------------------------
+/// Communication data formats
+/// ----------------------------------------------------------------------------
+#[derive(Serialize)]
+pub struct InferenceRequest {
+    pub observation_batch: Vec<Vec<usize>>,
+}
+
+#[derive(Deserialize)]
+pub struct InferenceResponse {
+    pub prior_batch: Vec<HashMap<usize, f32>>,
+    pub value_batch: Vec<f32>,
+}
 
 
-/// Core Monte Carlo Tree Search engine, now generic over an Environment type `E`
-/// that implements the `EnvTrait` trait.
+/// ----------------------------------------------------------------------------
+/// Monte Carlo Tree Search
+/// ----------------------------------------------------------------------------
+/// Generic over an Environment type `E` that implements the `EnvTrait` trait.
 pub struct MCTS<E: EnvTrait> {
     // Arena style storage for all nodes.
     pub transposition_table: HashMap<NodeId, usize>,
@@ -417,21 +435,27 @@ impl<E: EnvTrait> MCTS<E> {
     ) -> anyhow::Result<(Vec<Prior>, Vec<Value>)> {
         let client = self.client.as_ref().expect("HTTP client not initialized");
         let server_url = self.server_url.as_ref().unwrap();
+
         let req = InferenceRequest { observation_batch: obs_batch.to_vec() };
+        let body = to_vec_named(&req)?;
+
         let t0 = std::time::Instant::now();
         let resp = client
             .post(format!("{}/infer", server_url))
-            .json(&req)
+            .header("Content-Type", "application/msgpack")
+            .header("Accept", "application/msgpack")
+            .body(body)
             .send()
             .await?
-            .error_for_status()?
-            .json::<InferenceResponse>()
-            .await?;
+            .error_for_status()?;
+        let bytes = resp.bytes().await?;
+        let parsed: InferenceResponse = from_slice(&bytes)?;
+
         let dt = t0.elapsed().as_micros() as f64 / 1000.0;
         println!("remote_infer: {:.3}ms (batch={})", dt, obs_batch.len());
         // response.prior_batch already contains Priors keyed by Action (usize),
         // so we can use it directly.
-        Ok((resp.prior_batch, resp.value_batch))
+        Ok((parsed.prior_batch, parsed.value_batch))
     }
 }
 

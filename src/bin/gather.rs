@@ -192,7 +192,8 @@ async fn main() {
     println!("Using inference server at: {}", server_url);
 
     // How many concurrent gatherers to run
-    let num_gatherers = num_cpus::get(); // or manually set to e.g. 8
+    // let num_gatherers = num_cpus::get(); // or manually set to e.g. 8
+    let num_gatherers = 1024;
     println!("Launching {num_gatherers} gatherers...");
 
     // Spawn all gatherers as independent tasks

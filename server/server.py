@@ -154,7 +154,7 @@ async def infer(request: Request) -> Response:
     obs_batch = data["observation_batch"]
 
     batcher = request.app.state.batcher
-    prior_batch, value_batch = await batcher.enqueue(req.observation_batch)
+    prior_batch, value_batch = await batcher.enqueue(obs_batch)
 
     response_payload = {
         "prior_batch": prior_batch,
