@@ -410,17 +410,18 @@ impl<E: EnvTrait> MCTS<E> {
         let client = self.client.as_ref().expect("HTTP client not initialized");
         let server_url = self.server_url.as_ref().unwrap();
         let req = InferenceRequest { observation_batch: obs_batch.to_vec() };
+        let t0 = std::time::Instant::now();
         let resp = client
             .post(format!("{}/infer", server_url))
             .json(&req)
             .send()?
             .error_for_status()?
             .json::<InferenceResponse>()?;
-
+        let dt = t0.elapsed().as_micros() as f64 / 1000.0;
+        println!("remote_infer: {:.3}ms (batch={})", dt, obs_batch.len());
         // response.prior_batch already contains Priors keyed by Action (usize),
         // so we can use it directly.
-        let prior_batch: Vec<Prior> = resp.prior_batch;
-        Ok((prior_batch, resp.value_batch))
+        Ok((resp.prior_batch, resp.value_batch))
     }
 }
 
