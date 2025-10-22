@@ -1,6 +1,7 @@
 use std::env;
 use std::collections::HashMap;
 use std::io::Write;
+use std::sync::Arc;
 use json::JsonValue;
 use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
@@ -110,9 +111,14 @@ impl Gatherer {
         valid_actions[dist.sample(&mut rng)]
     }
 
-    pub async fn run(&self, env: &Environment) {
+    pub async fn run(&self, env: &Environment, client: Arc<reqwest::Client>) {
         // Set up MCTS and Agent and copy the Environment
-        let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.inference_batch_size, Some(self.url.clone()));
+        let mut mcts: MCTS<Environment> = MCTS::new(
+            self.terminal_value,
+            self.inference_batch_size,
+            Some(self.url.clone()),
+            Some(client),
+        );
         let agent = DummyAgent::new(env.num_actions());
 
         // Only consider the first two layers of gates
@@ -193,13 +199,20 @@ async fn main() {
 
     // How many concurrent gatherers to run
     // let num_gatherers = num_cpus::get(); // or manually set to e.g. 8
-    let num_gatherers = 1024;
+    let num_gatherers = 200;
     println!("Launching {num_gatherers} gatherers...");
+
+    let shared_client = Arc::new(reqwest::Client::builder()
+        .pool_max_idle_per_host(128)
+        .build()
+        .unwrap()
+    );
 
     // Spawn all gatherers as independent tasks
     let mut handles = Vec::new();
     for i in 0..num_gatherers {
         let url = server_url.clone();
+        let client = Arc::clone(&shared_client);
         let output_path = format!("output-{}.json", i);
         let handle = task::spawn(async move {
             let gatherer = Gatherer::new(
@@ -214,7 +227,7 @@ async fn main() {
             loop {
                 let mut env = Environment::new(4, 4, 2);
                 env.random_start(2, false);
-                gatherer.run(&env).await;
+                gatherer.run(&env, Arc::clone(&client)).await;
             }
         });
         handles.push(handle);
