@@ -108,7 +108,7 @@ impl Gatherer {
         valid_actions[dist.sample(&mut rng)]
     }
 
-    pub fn run(&self, env: &Environment) {
+    pub async fn run(&self, env: &Environment) {
         // Set up MCTS and Agent and copy the Environment
         let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.inference_batch_size, Some(self.url.clone()));
         let agent = DummyAgent::new(env.num_actions());
@@ -124,7 +124,7 @@ impl Gatherer {
 
         for _ in 0..self.max_actions {
             // Run MCTS
-            let root = mcts.run(&game , &agent, self.mcts_steps);
+            let root = mcts.run(&game , &agent, self.mcts_steps).await;
 
             // Store the data
             let tokens = game.get_tokens();
@@ -177,7 +177,8 @@ impl Gatherer {
 }
 
 
-fn main() {
+#[tokio::main]
+async fn main() {
     // Default URL if not provided
     let mut server_url = String::from("http://localhost:8000");
 
@@ -204,7 +205,7 @@ fn main() {
     loop {
         let mut env = Environment::new(4, 4, 2);
         env.random_start(2, false);
-        gatherer.run(&env);
+        gatherer.run(&env).await;
         println!("Finished gather {}", count + 1);
         count += 1;
     }
