@@ -1,4 +1,6 @@
 import asyncio
+import time
+import logging
 from asyncio import Future
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
@@ -12,18 +14,27 @@ ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
 BATCH_TIMEOUT = 0.01
-MAX_BATCH_SIZE = 64
+MAX_BATCH_SIZE = 256
+
+# ------------------------------------------------------------------------------
+# Logging setup
+# ------------------------------------------------------------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[%(asctime)s] %(message)s",
+    datefmt="%H:%M:%S",
+)
 
 # ------------------------------------------------------------------------------
 # Data schemas
 # ------------------------------------------------------------------------------
 class InferenceRequest(BaseModel):
-    # List of observations
+    # list of observations
     observation_batch: list[ObsType]
 
 
 class InferenceResponse(BaseModel):
-    # List of prior probability dicts and list of values
+    # list of prior probability dicts and list of values
     prior_batch: list[PriorType]
     value_batch: list[ValueType]
 
@@ -55,57 +66,79 @@ MODEL = DummyModel(num_actions=11)
 # Inference endpoint
 # ------------------------------------------------------------------------------
 class InferenceBatcher:
-    def __init__(self) -> None:
-        self.queue: list[tuple[list[ObsType], Future]] = []
-        self.lock = asyncio.Lock()
-    
+    """
+    Lock-free batcher using an asyncio.Queue to aggregate concurrent requests.
+
+    Each /infer call enqueues its observations and awaits a Future.
+    A background worker periodically drains the queue and performs batched inference.
+    """
+
+    def __init__(self, model):
+        self.queue: asyncio.Queue[tuple[list[ObsType], Future]] = asyncio.Queue()
+        self.model = model
+
     async def enqueue(self, obs: list[ObsType]) -> tuple[list[PriorType], list[ValueType]]:
-        # Get currently running loop
         loop = asyncio.get_running_loop()
-        fut: Future = loop.create_future()  # type: ignore
-        async with self.lock:
-            self.queue.append((obs, fut))
+        fut: Future = loop.create_future()
+        await self.queue.put((obs, fut))
         return await fut
-    
-    async def _batch_worker(self) -> None:
+
+    async def _batch_worker(self):
         while True:
-            await asyncio.sleep(BATCH_TIMEOUT)
-            async with self.lock:
-                if not self.queue:
+            obs_all, futs = [], []
+            try:
+                first_item = await self.queue.get()
+                obs_all.append(first_item[0])
+                futs.append(first_item[1])
+            except asyncio.CancelledError:
+                break
+
+            start_time = time.perf_counter()
+            start_loop_time = asyncio.get_running_loop().time()
+
+            # Gather more until batch full or timeout
+            while (
+                len(obs_all) < MAX_BATCH_SIZE
+                and (asyncio.get_running_loop().time() - start_loop_time) < BATCH_TIMEOUT
+            ):
+                try:
+                    item = self.queue.get_nowait()
+                    obs_all.append(item[0])
+                    futs.append(item[1])
+                except asyncio.QueueEmpty:
+                    await asyncio.sleep(0)
                     continue
-                batch = self.queue[:MAX_BATCH_SIZE]
-                self.queue = self.queue[MAX_BATCH_SIZE:]
 
-            # Combine all observations into a single tensor
-            obs_all, futs = zip(*batch)
-            obs_flat = [obs for obs_batch in obs_all for obs in obs_batch]
-            counts = [len(obs_batch) for obs_batch in obs_all]
+            obs_flat = [obs for batch in obs_all for obs in batch]
+            counts = [len(batch) for batch in obs_all]
 
-            priors_all, values_all = self._run_batch(obs_flat)
+            # Run inference
+            priors_all, values_all = self.model.batch_infer(obs_flat)
 
-            # Split results per original request
-            start = 0
+            # Finish futures
+            start_idx = 0
             for count, fut in zip(counts, futs):
-                end = start + count
-                priors_slice = priors_all[start:end]
-                values_slice = values_all[start:end]
-                start = end
+                end_idx = start_idx + count
+                priors_slice = priors_all[start_idx:end_idx]
+                values_slice = values_all[start_idx:end_idx]
+                start_idx = end_idx
                 if not fut.done():
                     fut.set_result((priors_slice, values_slice))
-    
-    def _run_batch(
-        self,
-        observations: list[ObsType],
-    ) -> tuple[list[PriorType], list[ValueType]]:
-        return MODEL.batch_infer(observations)
 
+            end_time = time.perf_counter()
+            latency_ms = (end_time - start_time) * 1000.0
+            queue_depth = self.queue.qsize()
+            batch_size = len(obs_flat)
+
+            m = f"[Batcher] size={batch_size:3d} latency={latency_ms:6.2f}ms queue_depth={queue_depth}"
+            logging.info(m)
 
 # ------------------------------------------------------------------------------
 # Start up and Inference Endpoint
 # ------------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    app.state.batcher = InferenceBatcher()
+    app.state.batcher = InferenceBatcher(MODEL)
     asyncio.create_task(app.state.batcher._batch_worker())
     yield
 
