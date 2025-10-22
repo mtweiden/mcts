@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 tilers-core = { path = "/Users/mathias/Documents/research/tilers/tilers-core" }
 rand = "0.9"
-serde = "1.0.228"
-reqwest = { version = "0.12.24", features = ["json", "blocking"]}
+serde = { version = "1.0.228", features = ["derive"] }
+reqwest = { version = "0.12.24", features = ["json", "gzip", "brotli", "deflate", "stream"]}
 anyhow = "1.0.100"
 json = "0.12.4"
 rand_distr = "0.5.1"
+tokio = { version = "1.48.0", features = ["full"] }
