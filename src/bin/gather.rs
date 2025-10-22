@@ -4,6 +4,8 @@ use std::io::Write;
 use json::JsonValue;
 use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
+use futures::future::join_all;
+use tokio::task;
 
 use mcts::enums::Action;
 use mcts::MCTS;
@@ -179,34 +181,45 @@ impl Gatherer {
 
 #[tokio::main]
 async fn main() {
-    // Default URL if not provided
+    // Parse the --server argument
     let mut server_url = String::from("http://localhost:8000");
-
-    // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
         if args[i] == "--server" && i + 1 < args.len() {
             server_url = args[i + 1].clone();
         }
     }
-
     println!("Using inference server at: {}", server_url);
 
-    let gatherer = Gatherer::new(
-        128,
-        10000,
-        100,
-        server_url,
-        String::from("/pscratch/sd/m/mtweiden/tile/data/output.json"),
-        0.25,
-    );
+    // How many concurrent gatherers to run
+    let num_gatherers = num_cpus::get(); // or manually set to e.g. 8
+    println!("Launching {num_gatherers} gatherers...");
 
-    let mut count = 0;
-    loop {
-        let mut env = Environment::new(4, 4, 2);
-        env.random_start(2, false);
-        gatherer.run(&env).await;
-        println!("Finished gather {}", count + 1);
-        count += 1;
+    // Spawn all gatherers as independent tasks
+    let mut handles = Vec::new();
+    for i in 0..num_gatherers {
+        let url = server_url.clone();
+        let output_path = format!("output-{}.json", i);
+        let handle = task::spawn(async move {
+            let gatherer = Gatherer::new(
+                32,        // inference batch size
+                10_000,    // MCTS steps
+                100,       // max actions
+                url,
+                output_path,
+                0.25,      // noise strength
+            );
+
+            loop {
+                let mut env = Environment::new(4, 4, 2);
+                env.random_start(2, false);
+                gatherer.run(&env).await;
+            }
+        });
+        handles.push(handle);
     }
+
+    // Wait for all gatherers to finish
+    join_all(handles).await;
+    println!("All gatherers completed.");
 }
