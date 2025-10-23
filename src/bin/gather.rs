@@ -120,16 +120,16 @@ impl Gatherer {
 
         // Set up data storage
         // Format: (tokens, visit_counts)
-        let mut temp_data: Vec<(Vec<usize>, HashMap<Action, usize>)> = Vec::new();
+        let mut temp_data: Vec<(Vec<usize>, Vec<usize>, HashMap<Action, usize>)> = Vec::new();
 
         for _ in 0..self.max_actions {
             // Run MCTS
             let root = mcts.run(&game , &agent, self.mcts_steps);
 
             // Store the data
-            let tokens = game.get_tokens();
+            let (placement, objective) = game.get_tokens();
             let edge_visits = root.edge_visits.clone();
-            temp_data.push((tokens, edge_visits));
+            temp_data.push((placement, objective, edge_visits));
 
             // Select action and step the environment
             let action = self.select_action(&root, &game);
@@ -153,11 +153,16 @@ impl Gatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        for (tokens, edge_visits) in temp_data {
+        for (placement, objective, edge_visits) in temp_data {
             // Build JSON using `json` crate (avoids serde_json)
-            let mut tokens_json = JsonValue::new_array();
-            for t in tokens {
-                tokens_json.push(t).expect("failed to push token");
+            let mut placement_json = JsonValue::new_array();
+            for t in placement {
+                placement_json.push(t).expect("failed to push token");
+            }
+
+            let mut objective_json = JsonValue::new_array();
+            for t in objective {
+                objective_json.push(t).expect("failed to push token");
             }
 
             let mut visits_json = JsonValue::new_object();
@@ -166,7 +171,10 @@ impl Gatherer {
             }
 
             let mut record = JsonValue::new_object();
-            record["tokens"] = tokens_json;
+            record["height"] = game.height.into();
+            record["width"] = game.width.into();
+            record["placement"] = placement_json;
+            record["objective"] = objective_json;
             record["edge_visits"] = visits_json;
             record["reward"] = reward.into();
 
