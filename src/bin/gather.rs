@@ -211,7 +211,7 @@ async fn main() {
     println!("Launching {num_gatherers} gatherers...");
 
     let shared_client = Arc::new(reqwest::Client::builder()
-        .pool_max_idle_per_host(128)
+        .pool_max_idle_per_host(num_gatherers)
         .build()
         .unwrap()
     );
