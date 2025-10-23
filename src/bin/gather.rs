@@ -128,7 +128,7 @@ impl Gatherer {
 
         // Set up data storage
         // Format: (tokens, visit_counts)
-        let mut temp_data: Vec<(Vec<usize>, HashMap<Action, usize>)> = Vec::new();
+        let mut temp_data: Vec<((Vec<usize>, Vec<usize>), HashMap<Action, usize>)> = Vec::new();
 
         for _ in 0..self.max_actions {
             // Run MCTS
@@ -161,11 +161,16 @@ impl Gatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        for (tokens, edge_visits) in temp_data {
+        for ((placement_tokens, objective_tokens), edge_visits) in temp_data {
             // Build JSON using `json` crate (avoids serde_json)
-            let mut tokens_json = JsonValue::new_array();
-            for t in tokens {
-                tokens_json.push(t).expect("failed to push token");
+            let mut placement_tokens_json = JsonValue::new_array();
+            for t in placement_tokens {
+                placement_tokens_json.push(t).expect("failed to push token");
+            }
+
+            let mut objective_tokens_json = JsonValue::new_array();
+            for t in objective_tokens {
+                objective_tokens_json.push(t).expect("failed to push token");
             }
 
             let mut visits_json = JsonValue::new_object();
@@ -174,7 +179,10 @@ impl Gatherer {
             }
 
             let mut record = JsonValue::new_object();
-            record["tokens"] = tokens_json;
+            record["height"] = game.height.into();
+            record["width"] = game.width.into();
+            record["placement"] = placement_tokens_json;
+            record["objectives"] = objective_tokens_json;
             record["edge_visits"] = visits_json;
             record["reward"] = reward.into();
 
