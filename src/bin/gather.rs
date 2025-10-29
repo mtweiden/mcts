@@ -127,17 +127,19 @@ impl Gatherer {
         let reference_depth = self.solve_with_heuristic(&mut game);
 
         // Set up data storage
-        // Format: (tokens, visit_counts)
-        let mut temp_data: Vec<(Vec<usize>, HashMap<Action, usize>)> = Vec::new();
+        // Format: ((placement, objectives_0, objectives_1), valid_actions, visit_counts)
+        let mut temp_data: Vec<((Vec<usize>, Vec<usize>, Vec<usize>), Vec<usize>, HashMap<Action, usize>)> = Vec::new();
 
         for _ in 0..self.max_actions {
             // Run MCTS
             let root = mcts.run(&game , &agent, self.mcts_steps).await;
 
             // Store the data
-            let tokens = game.get_tokens();
+            let (placement, objectives_0) = game.get_tokens();
+            let objectives_1 = game.get_objective_tokens(1);
             let edge_visits = root.edge_visits.clone();
-            temp_data.push((tokens, edge_visits));
+            let valid_actions = game.valid_actions();
+            temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
 
             // Select action and step the environment
             let action = self.select_action(&root, &game);
@@ -161,11 +163,26 @@ impl Gatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        for (tokens, edge_visits) in temp_data {
+        for ((placement, objectives_0, objectives_1), valid_actions, edge_visits) in temp_data {
             // Build JSON using `json` crate (avoids serde_json)
-            let mut tokens_json = JsonValue::new_array();
-            for t in tokens {
-                tokens_json.push(t).expect("failed to push token");
+            let mut placement_tokens_json = JsonValue::new_array();
+            for t in placement {
+                placement_tokens_json.push(t).expect("failed to push token");
+            }
+
+            let mut valid_actions_json = JsonValue::new_array();
+            for ac in valid_actions {
+                valid_actions_json.push(ac).expect("failed to push token");
+            }
+
+            let mut objectives_0_tokens_json = JsonValue::new_array();
+            for t in objectives_0 {
+                objectives_0_tokens_json.push(t).expect("failed to push token");
+            }
+
+            let mut objectives_1_tokens_json = JsonValue::new_array();
+            for t in objectives_1 {
+                objectives_1_tokens_json.push(t).expect("failed to push token");
             }
 
             let mut visits_json = JsonValue::new_object();
@@ -174,7 +191,12 @@ impl Gatherer {
             }
 
             let mut record = JsonValue::new_object();
-            record["tokens"] = tokens_json;
+            record["height"] = game.height.into();
+            record["width"] = game.width.into();
+            record["placement"] = placement_tokens_json;
+            record["objectives_0"] = objectives_0_tokens_json;
+            record["objectives_1"] = objectives_1_tokens_json;
+            record["valid_actions"] = valid_actions_json;
             record["edge_visits"] = visits_json;
             record["reward"] = reward.into();
 
@@ -203,7 +225,7 @@ async fn main() {
     println!("Launching {num_gatherers} gatherers...");
 
     let shared_client = Arc::new(reqwest::Client::builder()
-        .pool_max_idle_per_host(128)
+        .pool_max_idle_per_host(num_gatherers)
         .build()
         .unwrap()
     );
