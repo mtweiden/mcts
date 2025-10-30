@@ -170,44 +170,48 @@ class InferenceBatcher:
                 for chunk_start in range(0, total_obs, MAX_INFERENCE_BATCH_SIZE):
                     chunk_end = min(chunk_start + MAX_INFERENCE_BATCH_SIZE, total_obs)
 
+                    placements_chunk = placements[chunk_start:chunk_end]
+                    objectives_0_chunk = objectives_0[chunk_start:chunk_end]
+                    objectives_1_chunk = objectives_1[chunk_start:chunk_end]
+                    action_masks_chunk = action_masks[chunk_start:chunk_end]
+
                     # Pad tensors to max length in batch
-                    max_p_len = max(len(p) for p in placements[chunk_start:chunk_end])
-                    max_o0_len = max(len(o0) for o0 in objectives_0[chunk_start:chunk_end])
-                    max_o1_len = max(len(o1) for o1 in objectives_1[chunk_start:chunk_end])
-                    max_am_len = max(len(am) for am in action_masks[chunk_start:chunk_end])
-                    for i in range(chunk_start, chunk_end):
-                        p = placements[i]
-                        o0 = objectives_0[i]
-                        o1 = objectives_1[i]
-                        am = action_masks[i]
+                    max_p_len = max(len(p) for p in placements_chunk)
+                    max_o0_len = max(len(o0) for o0 in objectives_0_chunk)
+                    max_o1_len = max(len(o1) for o1 in objectives_1_chunk)
+                    max_am_len = max(len(am) for am in action_masks_chunk)
+                    for i in range(len(placements_chunk)):
+                        p = placements_chunk[i]
+                        o0 = objectives_0_chunk[i]
+                        o1 = objectives_1_chunk[i]
+                        am = action_masks_chunk[i]
 
                         if len(p) < max_p_len:
                             pad_size = max_p_len - len(p)
                             p = F.pad(p, (0, pad_size), "constant", 0)
-                            placements[i] = p
+                            placements_chunk[i] = p
                         if len(o0) < max_o0_len:
                             pad_size = max_o0_len - len(o0)
                             o0 = F.pad(o0, (0, pad_size), "constant", 0)
-                            objectives_0[i] = o0
+                            objectives_0_chunk[i] = o0
                         if len(o1) < max_o1_len:
                             pad_size = max_o1_len - len(o1)
                             o1 = F.pad(o1, (0, pad_size), "constant", 0)
-                            objectives_1[i] = o1
+                            objectives_1_chunk[i] = o1
                         if len(am) < max_am_len:
                             pad_size = max_am_len - len(am)
                             am = F.pad(am, (0, pad_size), "constant", False)
-                            action_masks[i] = am
+                            action_masks_chunk[i] = am
 
                     counts = [len(batch) for batch in obs_all]
 
-
                     # Chunk the inference requests
-                    placements_chunk = stack(placements[chunk_start:chunk_end])
-                    objectives_0_chunk = stack(objectives_0[chunk_start:chunk_end])
-                    objectives_1_chunk = stack(objectives_1[chunk_start:chunk_end])
+                    placements_chunk = stack(placements_chunk)
+                    objectives_0_chunk = stack(objectives_0_chunk)
+                    objectives_1_chunk = stack(objectives_1_chunk)
+                    action_masks_chunk = stack(action_masks_chunk)
                     heights_chunk = tensor(heights[chunk_start:chunk_end])
                     widths_chunk = tensor(widths[chunk_start:chunk_end])
-                    action_masks_chunk = stack(action_masks[chunk_start:chunk_end])
 
                     # Do inference
                     priors_chunk, values_chunk = self.model(
@@ -219,8 +223,13 @@ class InferenceBatcher:
                         action_mask=action_masks_chunk,
                     )
 
-                    priors_all.extend(priors_chunk.detach().cpu().tolist())
-                    values_all.extend(values_chunk.detach().cpu().tolist())
+                    priors_chunk = [
+                        {int(action): float(prob) for action, prob in enumerate(prior) if prob > 1e-6}
+                        for prior in priors_chunk.detach().cpu().tolist()
+                    ]
+                    values_chunk = values_chunk.detach().cpu().tolist()
+                    priors_all.extend(priors_chunk)
+                    values_all.extend(values_chunk)
 
             infer_elapsed = time.perf_counter() - infer_start
             logging.info(f"[batcher] inference completed: {total_obs} observations in {infer_elapsed*1000:.2f}ms")
