@@ -25,8 +25,9 @@ import torch.nn.functional as F
 ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
-BATCH_TIMEOUT = 0.001
+BATCH_TIMEOUT = 0.005
 MAX_BATCH_SIZE = 1024
+MAX_INFERENCE_BATCH_SIZE = 100
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -196,20 +197,40 @@ class InferenceBatcher:
 
             counts = [len(batch) for batch in obs_all]
 
-            # Run inference
-            priors_all, values_all = self.model(
-                placements=stack(placements),
-                objectives=stack(objectives_0),
-                objectives_1=stack(objectives_1),
-                heights=tensor(heights),
-                widths=tensor(widths),
-                action_masks=stack(action_masks),
-            )
+            # Run inference in chunks of MAX_INFERENCE_BATCH_SIZE (timed)
+            infer_start = time.perf_counter()
+            priors_all = []
+            values_all = []
+            total_obs = len(placements)
+            if total_obs > 0:
+                for chunk_start in range(0, total_obs, MAX_INFERENCE_BATCH_SIZE):
+                    chunk_end = min(chunk_start + MAX_INFERENCE_BATCH_SIZE, total_obs)
 
-            priors_all = priors_all.detach().cpu().tolist()
-            values_all = values_all.detach().cpu().tolist()
+                    # Chunk the inference requests
+                    placements_chunk = stack(placements[chunk_start:chunk_end])
+                    objectives_0_chunk = stack(objectives_0[chunk_start:chunk_end])
+                    objectives_1_chunk = stack(objectives_1[chunk_start:chunk_end])
+                    heights_chunk = tensor(heights[chunk_start:chunk_end])
+                    widths_chunk = tensor(widths[chunk_start:chunk_end])
+                    action_masks_chunk = stack(action_masks[chunk_start:chunk_end])
 
-            # Finish futures
+                    # Do inference
+                    priors_chunk, values_chunk = self.model(
+                        placements=placements_chunk,
+                        objectives=objectives_0_chunk,
+                        objectives_1=objectives_1_chunk,
+                        heights=heights_chunk,
+                        widths=widths_chunk,
+                        action_masks=action_masks_chunk,
+                    )
+
+                    priors_all.extend(priors_chunk.detach().cpu().tolist())
+                    values_all.extend(values_chunk.detach().cpu().tolist())
+
+            infer_elapsed = time.perf_counter() - infer_start
+            logging.info(f"[batcher] inference completed: {total_obs} observations in {infer_elapsed*1000:.2f}ms")
+
+            # Send results back to request futures
             start_idx = 0
             for count, fut in zip(counts, futs):
                 end_idx = start_idx + count
