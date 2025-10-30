@@ -12,6 +12,12 @@ from pydantic import BaseModel
 from uvicorn import run
 from tile import Agent
 
+from torch import bool
+from torch import int32
+from torch import tensor
+from torch import zeros
+import torch.nn.functional as F
+
 # ------------------------------------------------------------------------------
 # Some type definitions and constants
 # ------------------------------------------------------------------------------
@@ -65,7 +71,7 @@ class DummyModel:
 
 def latest_checkpoint() -> str | None:
     ckpt_path = "/pscratch/sd/m/mtweiden/tile_mcts/checkpoints"
-    files = sorted([_ for _ in Path(ckpt_path).glob("*")])
+    files = sorted([str(x) for x in Path(ckpt_path).glob("*")])
     if len(files) == 0:
         return None
     return files[-1]
@@ -122,11 +128,82 @@ class InferenceBatcher:
                     await asyncio.sleep(0)
                     continue
 
-            obs_flat = [obs for batch in obs_all for obs in batch]
+            # Unpack Observation packets
+            # Do collation and convert to tensors
+            # 0: placement (list[int])
+            # 1: objectives_0 (list[int])
+            # 2: objectives_1 (list[int])
+            # 3: height (int)
+            # 4: width (int)
+            # 5: valid_actions (list[int])
+            placements = []
+            objectives_0 = []
+            objectives_1 = []
+            heights = []
+            widths = []
+            valid_actions = []
+            max_p_len, max_o0_len, max_o1_len, max_am_len = 0, 0, 0, 0
+            for p, o0, o1, h, w, va in [obs for batch in obs_all for obs in batch]:
+                p = tensor(p, dtype=int32)
+                o0 = tensor(o0, dtype=int32)
+                o1 = tensor(o1, dtype=int32)
+                if valid_actions:
+                    action_mask = zeros((max(valid_actions) + 1,), dtype=bool)
+                    action_mask[valid_actions] = True
+                else:
+                    action_mask = zeros((1,), dtype=bool)
+                
+                if len(p) > max_p_len:
+                    max_p_len = len(p)
+                if len(o0) > max_o0_len:
+                    max_o0_len = len(o0)
+                if len(o1) > max_o1_len:
+                    max_o1_len = len(o1)
+                if len(action_mask) > max_am_len:
+                    max_am_len = len(va)
+
+                placements.append(p)
+                objectives_0.append(o0)
+                objectives_1.append(o1)
+                heights.append(h)
+                widths.append(w)
+                valid_actions.append(va)
+            
+            # Pad tensors to max length in batch
+            for i in range(len(placements)):
+                p = placements[i]
+                o0 = objectives_0[i]
+                o1 = objectives_1[i]
+                va = valid_actions[i]
+
+                if len(p) < max_p_len:
+                    pad_size = max_p_len - len(p)
+                    p = F.pad(p, (0, pad_size), "constant", 0)
+                    placements[i] = p
+                if len(o0) < max_o0_len:
+                    pad_size = max_o0_len - len(o0)
+                    o0 = F.pad(o0, (0, pad_size), "constant", 0)
+                    objectives_0[i] = o0
+                if len(o1) < max_o1_len:
+                    pad_size = max_o1_len - len(o1)
+                    o1 = F.pad(o1, (0, pad_size), "constant", 0)
+                    objectives_1[i] = o1
+                if len(va) < max_am_len:
+                    pad_size = max_am_len - len(va)
+                    va = F.pad(va, (0, pad_size), "constant", False)
+                    valid_actions[i] = va
+
             counts = [len(batch) for batch in obs_all]
 
             # Run inference
-            priors_all, values_all = self.model(obs_flat)
+            priors_all, values_all = self.model(
+                tensor(placements),
+                tensor(objectives_0),
+                tensor(objectives_1),
+                tensor(heights),
+                tensor(widths),
+                tensor(valid_actions),
+            )
 
             # Finish futures
             start_idx = 0
@@ -141,7 +218,7 @@ class InferenceBatcher:
             end_time = time.perf_counter()
             latency_ms = (end_time - start_time) * 1000.0
             queue_depth = self.queue.qsize()
-            batch_size = len(obs_flat)
+            batch_size = len(placements)
 
             m = f"[Batcher] size={batch_size:3d} latency={latency_ms:6.2f}ms queue_depth={queue_depth}"
             logging.info(m)
