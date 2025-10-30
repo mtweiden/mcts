@@ -206,6 +206,9 @@ class InferenceBatcher:
                 action_mask=stack(action_masks),
             )
 
+            priors_all = priors_all.detach().cpu().tolist()
+            values_all = values_all.detach().cpu().tolist()
+
             # Finish futures
             start_idx = 0
             for count, fut in zip(counts, futs):
