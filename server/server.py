@@ -223,8 +223,13 @@ class InferenceBatcher:
                         action_mask=action_masks_chunk,
                     )
 
-                    priors_all.extend(priors_chunk.detach().cpu().tolist())
-                    values_all.extend(values_chunk.detach().cpu().tolist())
+                    priors_chunk = [
+                        {int(action): float(prob) for action, prob in enumerate(prior) if prob > 1e-6}
+                        for prior in priors_chunk.detach().cpu().tolist()
+                    ]
+                    values_chunk = values_chunk.detach().cpu().tolist()
+                    priors_all.extend(priors_chunk)
+                    values_all.extend(values_chunk)
 
             infer_elapsed = time.perf_counter() - infer_start
             logging.info(f"[batcher] inference completed: {total_obs} observations in {infer_elapsed*1000:.2f}ms")
