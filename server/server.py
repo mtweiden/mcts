@@ -144,7 +144,6 @@ class InferenceBatcher:
             heights = []
             widths = []
             action_masks = []
-            max_p_len, max_o0_len, max_o1_len, max_am_len = 0, 0, 0, 0
             for p, o0, o1, h, w, va in [obs for batch in obs_all for obs in batch]:
                 p = tensor(p, dtype=int32)
                 o0 = tensor(o0, dtype=int32)
@@ -154,15 +153,6 @@ class InferenceBatcher:
                     action_mask[va] = True
                 else:
                     action_mask = zeros((1,), dtype=bool)
-                
-                if len(p) > max_p_len:
-                    max_p_len = len(p)
-                if len(o0) > max_o0_len:
-                    max_o0_len = len(o0)
-                if len(o1) > max_o1_len:
-                    max_o1_len = len(o1)
-                if len(action_mask) > max_am_len:
-                    max_am_len = len(action_mask)
 
                 placements.append(p)
                 objectives_0.append(o0)
@@ -171,32 +161,6 @@ class InferenceBatcher:
                 widths.append(w)
                 action_masks.append(action_mask)
             
-            # Pad tensors to max length in batch
-            for i in range(len(placements)):
-                p = placements[i]
-                o0 = objectives_0[i]
-                o1 = objectives_1[i]
-                am = action_masks[i]
-
-                if len(p) < max_p_len:
-                    pad_size = max_p_len - len(p)
-                    p = F.pad(p, (0, pad_size), "constant", 0)
-                    placements[i] = p
-                if len(o0) < max_o0_len:
-                    pad_size = max_o0_len - len(o0)
-                    o0 = F.pad(o0, (0, pad_size), "constant", 0)
-                    objectives_0[i] = o0
-                if len(o1) < max_o1_len:
-                    pad_size = max_o1_len - len(o1)
-                    o1 = F.pad(o1, (0, pad_size), "constant", 0)
-                    objectives_1[i] = o1
-                if len(am) < max_am_len:
-                    pad_size = max_am_len - len(am)
-                    am = F.pad(am, (0, pad_size), "constant", False)
-                    action_masks[i] = am
-
-            counts = [len(batch) for batch in obs_all]
-
             # Run inference in chunks of MAX_INFERENCE_BATCH_SIZE (timed)
             infer_start = time.perf_counter()
             priors_all = []
@@ -205,6 +169,37 @@ class InferenceBatcher:
             if total_obs > 0:
                 for chunk_start in range(0, total_obs, MAX_INFERENCE_BATCH_SIZE):
                     chunk_end = min(chunk_start + MAX_INFERENCE_BATCH_SIZE, total_obs)
+
+                    # Pad tensors to max length in batch
+                    max_p_len = max(len(p) for p in placements[chunk_start:chunk_end])
+                    max_o0_len = max(len(o0) for o0 in objectives_0[chunk_start:chunk_end])
+                    max_o1_len = max(len(o1) for o1 in objectives_1[chunk_start:chunk_end])
+                    max_am_len = max(len(am) for am in action_masks[chunk_start:chunk_end])
+                    for i in range(chunk_start, chunk_end):
+                        p = placements[i]
+                        o0 = objectives_0[i]
+                        o1 = objectives_1[i]
+                        am = action_masks[i]
+
+                        if len(p) < max_p_len:
+                            pad_size = max_p_len - len(p)
+                            p = F.pad(p, (0, pad_size), "constant", 0)
+                            placements[i] = p
+                        if len(o0) < max_o0_len:
+                            pad_size = max_o0_len - len(o0)
+                            o0 = F.pad(o0, (0, pad_size), "constant", 0)
+                            objectives_0[i] = o0
+                        if len(o1) < max_o1_len:
+                            pad_size = max_o1_len - len(o1)
+                            o1 = F.pad(o1, (0, pad_size), "constant", 0)
+                            objectives_1[i] = o1
+                        if len(am) < max_am_len:
+                            pad_size = max_am_len - len(am)
+                            am = F.pad(am, (0, pad_size), "constant", False)
+                            action_masks[i] = am
+
+                    counts = [len(batch) for batch in obs_all]
+
 
                     # Chunk the inference requests
                     placements_chunk = stack(placements[chunk_start:chunk_end])
