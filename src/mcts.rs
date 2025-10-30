@@ -13,7 +13,7 @@ use std::sync::Arc;
 /// ----------------------------------------------------------------------------
 #[derive(Serialize)]
 pub struct InferenceRequest {
-    pub observation_batch: Vec<Vec<usize>>,
+    pub observation_batch: Vec<Observation>,
 }
 
 #[derive(Deserialize)]
@@ -47,10 +47,6 @@ impl<E: EnvTrait> MCTS<E> {
         server_url: Option<String>,
         client: Option<Arc<reqwest::Client>>,
     ) -> Self {
-        // let client = server_url
-        //     .as_ref()
-        //     // .map(|_| reqwest::blocking::Client::new());
-        //     .map(|_| reqwest::Client::new());
         Self {
             transposition_table: HashMap::new(),
             nodes: Vec::new(),
