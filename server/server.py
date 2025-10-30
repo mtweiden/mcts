@@ -3,12 +3,14 @@ import time
 import logging
 import msgpack
 from asyncio import Future
+from pathlib import Path
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi import Request
 from fastapi import Response
 from pydantic import BaseModel
 from uvicorn import run
+from tile import Agent
 
 # ------------------------------------------------------------------------------
 # Some type definitions and constants
@@ -16,7 +18,7 @@ from uvicorn import run
 ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
-BATCH_TIMEOUT = 0.01
+BATCH_TIMEOUT = 0.001
 MAX_BATCH_SIZE = 1024
 
 # ------------------------------------------------------------------------------
@@ -61,9 +63,17 @@ class DummyModel:
             value_batch.append(value)
         return prior_batch, value_batch
 
+def latest_checkpoint() -> str | None:
+    ckpt_path = "/pscratch/sd/m/mtweiden/tile_mcts/checkpoints"
+    files = sorted([_ for _ in Path(ckpt_path).glob("*")])
+    if len(files) == 0:
+        return None
+    return files[-1]
 
-# Default dummy model for 2 ancilla case
-MODEL = DummyModel(num_actions=11)
+MODEL = Agent()
+ckpt = latest_checkpoint()
+if ckpt is not None:
+    MODEL.load_state(ckpt)
 
 # ------------------------------------------------------------------------------
 # Inference endpoint
