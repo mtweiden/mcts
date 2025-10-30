@@ -92,7 +92,7 @@ class InferenceBatcher:
     A background worker periodically drains the queue and performs batched inference.
     """
 
-    def __init__(self, model):
+    def __init__(self, model: Agent) -> None:
         self.queue: asyncio.Queue[tuple[list[ObsType], Future]] = asyncio.Queue()
         self.model = model
 
@@ -135,21 +135,21 @@ class InferenceBatcher:
             # 2: objectives_1 (list[int])
             # 3: height (int)
             # 4: width (int)
-            # 5: valid_actions (list[int])
+            # 5: action_masks (list[int])
             placements = []
             objectives_0 = []
             objectives_1 = []
             heights = []
             widths = []
-            valid_actions = []
+            action_masks = []
             max_p_len, max_o0_len, max_o1_len, max_am_len = 0, 0, 0, 0
             for p, o0, o1, h, w, va in [obs for batch in obs_all for obs in batch]:
                 p = tensor(p, dtype=int32)
                 o0 = tensor(o0, dtype=int32)
                 o1 = tensor(o1, dtype=int32)
-                if valid_actions:
-                    action_mask = zeros((max(valid_actions) + 1,), dtype=bool)
-                    action_mask[valid_actions] = True
+                if va:
+                    action_mask = zeros((max(va) + 1,), dtype=bool)
+                    action_mask[va] = True
                 else:
                     action_mask = zeros((1,), dtype=bool)
                 
@@ -160,21 +160,21 @@ class InferenceBatcher:
                 if len(o1) > max_o1_len:
                     max_o1_len = len(o1)
                 if len(action_mask) > max_am_len:
-                    max_am_len = len(va)
+                    max_am_len = len(action_mask)
 
                 placements.append(p)
                 objectives_0.append(o0)
                 objectives_1.append(o1)
                 heights.append(h)
                 widths.append(w)
-                valid_actions.append(va)
+                action_masks.append(action_mask)
             
             # Pad tensors to max length in batch
             for i in range(len(placements)):
                 p = placements[i]
                 o0 = objectives_0[i]
                 o1 = objectives_1[i]
-                va = valid_actions[i]
+                am = action_masks[i]
 
                 if len(p) < max_p_len:
                     pad_size = max_p_len - len(p)
@@ -188,21 +188,21 @@ class InferenceBatcher:
                     pad_size = max_o1_len - len(o1)
                     o1 = F.pad(o1, (0, pad_size), "constant", 0)
                     objectives_1[i] = o1
-                if len(va) < max_am_len:
-                    pad_size = max_am_len - len(va)
-                    va = F.pad(va, (0, pad_size), "constant", False)
-                    valid_actions[i] = va
+                if len(am) < max_am_len:
+                    pad_size = max_am_len - len(am)
+                    am = F.pad(am, (0, pad_size), "constant", False)
+                    action_masks[i] = am
 
             counts = [len(batch) for batch in obs_all]
 
             # Run inference
             priors_all, values_all = self.model(
-                tensor(placements),
-                tensor(objectives_0),
-                tensor(objectives_1),
-                tensor(heights),
-                tensor(widths),
-                tensor(valid_actions),
+                placements=tensor(placements),
+                objectives=tensor(objectives_0),
+                objectives_1=tensor(objectives_1),
+                heights=tensor(heights),
+                widths=tensor(widths),
+                action_masks=tensor(action_masks),
             )
 
             # Finish futures
