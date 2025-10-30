@@ -196,6 +196,8 @@ class InferenceBatcher:
 
             counts = [len(batch) for batch in obs_all]
 
+            print(f"batch size: {sum(counts)}")
+
             # Run inference
             priors_all, values_all = self.model(
                 placement=stack(placements),
