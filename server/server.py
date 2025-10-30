@@ -213,10 +213,10 @@ class InferenceBatcher:
                     priors_chunk, values_chunk = self.model(
                         placements=placements_chunk,
                         objectives=objectives_0_chunk,
-                        objectives_1=objectives_1_chunk,
+                        lookahead_objectives=objectives_1_chunk,
                         heights=heights_chunk,
                         widths=widths_chunk,
-                        action_masks=action_masks_chunk,
+                        action_mask=action_masks_chunk,
                     )
 
                     priors_all.extend(priors_chunk.detach().cpu().tolist())
