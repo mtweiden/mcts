@@ -14,6 +14,7 @@ from tile import Agent
 
 from torch import bool
 from torch import int32
+from torch import stack
 from torch import tensor
 from torch import zeros
 import torch.nn.functional as F
@@ -197,12 +198,12 @@ class InferenceBatcher:
 
             # Run inference
             priors_all, values_all = self.model(
-                placements=tensor(placements),
-                objectives=tensor(objectives_0),
-                objectives_1=tensor(objectives_1),
+                placements=stack(placements),
+                objectives=stack(objectives_0),
+                objectives_1=stack(objectives_1),
                 heights=tensor(heights),
                 widths=tensor(widths),
-                action_masks=tensor(action_masks),
+                action_masks=stack(action_masks),
             )
 
             # Finish futures
