@@ -34,8 +34,10 @@ impl Environment for tilers_core::env::Environment {
     }
 
     fn observation(&self) -> Observation {
-        // tilers_core::env::Environment::observation(self)
-        vec![0]
+        let (placement, obj_0) = tilers_core::env::Environment::get_tokens(self);
+        let obj_1 = tilers_core::env::Environment::get_objective_tokens(self, 1);
+        let valid_actions = tilers_core::env::Environment::valid_actions(self);
+        (placement, obj_0, obj_1, self.height, self.width, valid_actions)
     }
 
     fn valid_actions(&self) -> Vec<Action> {

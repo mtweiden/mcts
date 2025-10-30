@@ -126,7 +126,7 @@ class InferenceBatcher:
             counts = [len(batch) for batch in obs_all]
 
             # Run inference
-            priors_all, values_all = self.model.batch_infer(obs_flat)
+            priors_all, values_all = self.model(obs_flat)
 
             # Finish futures
             start_idx = 0
