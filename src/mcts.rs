@@ -11,12 +11,12 @@ use std::sync::Arc;
 /// ----------------------------------------------------------------------------
 /// Communication data formats
 /// ----------------------------------------------------------------------------
-#[derive(Serialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct InferenceRequest {
     pub observation_batch: Vec<Observation>,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize, Deserialize, Debug)]
 pub struct InferenceResponse {
     pub prior_batch: Vec<HashMap<usize, f32>>,
     pub value_batch: Vec<f32>,
