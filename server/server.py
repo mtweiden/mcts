@@ -198,12 +198,12 @@ class InferenceBatcher:
 
             # Run inference
             priors_all, values_all = self.model(
-                placements=stack(placements),
+                placement=stack(placements),
                 objectives=stack(objectives_0),
-                objectives_1=stack(objectives_1),
+                lookahead_objectives=stack(objectives_1),
                 heights=tensor(heights),
                 widths=tensor(widths),
-                action_masks=stack(action_masks),
+                action_mask=stack(action_masks),
             )
 
             # Finish futures
