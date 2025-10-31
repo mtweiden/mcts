@@ -227,7 +227,7 @@ class InferenceBatcher:
                         {int(action): float(prob) for action, prob in enumerate(prior) if prob > 1e-6}
                         for prior in priors_chunk.detach().cpu().tolist()
                     ]
-                    values_chunk = values_chunk.detach().cpu().tolist()
+                    values_chunk = values_chunk.squeeze(-1).detach().cpu().tolist()
                     priors_all.extend(priors_chunk)
                     values_all.extend(values_chunk)
 
