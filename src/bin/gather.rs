@@ -239,7 +239,7 @@ async fn main() {
         let handle = task::spawn(async move {
             let gatherer = Gatherer::new(
                 32,        // inference batch size
-                10_000,    // MCTS steps
+                1_000,    // MCTS steps
                 100,       // max actions
                 url,
                 output_path,
