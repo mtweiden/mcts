@@ -14,9 +14,11 @@ from tile import Agent
 
 from torch import bool
 from torch import int32
+from torch import no_grad
 from torch import stack
 from torch import tensor
 from torch import zeros
+from torch.cuda import is_available
 import torch.nn.functional as F
 
 # ------------------------------------------------------------------------------
@@ -28,6 +30,7 @@ ValueType = float
 BATCH_TIMEOUT = 0.005
 MAX_BATCH_SIZE = 1024
 MAX_INFERENCE_BATCH_SIZE = 100
+DEVICE = "cuda" if is_available() else "cpu"
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -82,6 +85,7 @@ MODEL = Agent()
 ckpt = latest_checkpoint()
 if ckpt is not None:
     MODEL.load_state(ckpt)
+MODEL.to(DEVICE)
 
 # ------------------------------------------------------------------------------
 # Inference endpoint
@@ -145,14 +149,15 @@ class InferenceBatcher:
             widths = []
             action_masks = []
             for p, o0, o1, h, w, va in [obs for batch in obs_all for obs in batch]:
-                p = tensor(p, dtype=int32)
-                o0 = tensor(o0, dtype=int32)
-                o1 = tensor(o1, dtype=int32)
+                # create tensors directly on the target device
+                p = tensor(p, dtype=int32, device=DEVICE)
+                o0 = tensor(o0, dtype=int32, device=DEVICE)
+                o1 = tensor(o1, dtype=int32, device=DEVICE)
                 if va:
-                    action_mask = zeros((max(va) + 1,), dtype=bool)
+                    action_mask = zeros((max(va) + 1,), dtype=bool, device=DEVICE)
                     action_mask[va] = True
                 else:
-                    action_mask = zeros((1,), dtype=bool)
+                    action_mask = zeros((1,), dtype=bool, device=DEVICE)
 
                 placements.append(p)
                 objectives_0.append(o0)
@@ -206,23 +211,24 @@ class InferenceBatcher:
                     counts = [len(batch) for batch in obs_all]
 
                     # Chunk the inference requests
-                    placements_chunk = stack(placements_chunk)
-                    objectives_0_chunk = stack(objectives_0_chunk)
-                    objectives_1_chunk = stack(objectives_1_chunk)
-                    action_masks_chunk = stack(action_masks_chunk)
-                    heights_chunk = tensor(heights[chunk_start:chunk_end])
-                    widths_chunk = tensor(widths[chunk_start:chunk_end])
-
-                    # Do inference
-                    priors_chunk, values_chunk = self.model(
-                        placement=placements_chunk,
-                        objectives=objectives_0_chunk,
-                        lookahead_objectives=objectives_1_chunk,
-                        heights=heights_chunk,
-                        widths=widths_chunk,
-                        action_mask=action_masks_chunk,
-                    )
-
+                    placements_chunk = stack(placements_chunk).to(DEVICE)
+                    objectives_0_chunk = stack(objectives_0_chunk).to(DEVICE)
+                    objectives_1_chunk = stack(objectives_1_chunk).to(DEVICE)
+                    action_masks_chunk = stack(action_masks_chunk).to(DEVICE)
+                    heights_chunk = tensor(heights[chunk_start:chunk_end], device=DEVICE, dtype=int32)
+                    widths_chunk = tensor(widths[chunk_start:chunk_end], device=DEVICE, dtype=int32)
+ 
+                    # Do inference on device; use autocast if CUDA available
+                    with no_grad():
+                        priors_chunk, values_chunk = self.model(
+                            placement=placements_chunk,
+                            objectives=objectives_0_chunk,
+                            lookahead_objectives=objectives_1_chunk,
+                            heights=heights_chunk,
+                            widths=widths_chunk,
+                            action_mask=action_masks_chunk,
+                        )
+                    # Move results to CPU and convert to lists
                     priors_chunk = [
                         {int(action): float(prob) for action, prob in enumerate(prior) if prob > 1e-6}
                         for prior in priors_chunk.detach().cpu().tolist()
