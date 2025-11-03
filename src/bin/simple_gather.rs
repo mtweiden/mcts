@@ -15,7 +15,7 @@ use mcts::agent::DummyAgent;
 use tilers_core::env::Environment;
 
 /// ----------------------------------------------------------------------------
-/// Gatherer
+/// SimpleGatherer
 /// ----------------------------------------------------------------------------
 /// A struct to gather data from MCTS simulations.
 /// Args:
@@ -23,26 +23,23 @@ use tilers_core::env::Environment;
 ///   agent: An instance of an Agent.
 ///   mcts_steps: Number of MCTS simulations per move.
 ///   max_actions: Maximum number of actions to consider.
-///   url: The URL of the remote inference server.
 ///   output_path: Path to save the gathered data.
 /// ----------------------------------------------------------------------------
-struct Gatherer {
+struct SimpleGatherer {
     inference_batch_size: usize,
     mcts_steps: usize,
     max_actions: usize,
-    url: String,
     output_path: String,
     terminal_value: f32,
     noise_strength: f64,
 }
 
 
-impl Gatherer {
+impl SimpleGatherer {
     pub fn new(
         inference_batch_size: usize,
         mcts_steps: usize,
         max_actions: usize,
-        url: String,
         output_path: String,
         noise_strength: f64,
     ) -> Self {
@@ -51,7 +48,6 @@ impl Gatherer {
             inference_batch_size,
             mcts_steps,
             max_actions,
-            url,
             output_path,
             terminal_value,
             noise_strength,
@@ -116,7 +112,7 @@ impl Gatherer {
         let mut mcts: MCTS<Environment> = MCTS::new(
             self.terminal_value,
             self.inference_batch_size,
-            Some(self.url.clone()),
+            None,
             Some(client),
         );
         let agent = DummyAgent::new(env.num_actions());
@@ -209,17 +205,12 @@ impl Gatherer {
 
 #[tokio::main]
 async fn main() {
-    // Parse the --server argument
-    let mut server_url = String::from("http://localhost:8000");
     let mut height = 4;
     let mut width = 4;
     let mut num_objectives = 2;
     let mut num_blanks = 2;
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
-        if args[i] == "--server" && i + 1 < args.len() {
-            server_url = args[i + 1].clone();
-        }
         if args[i] == "--height" && i + 1 < args.len() {
             height = args[i + 1].parse().unwrap_or(4);
         }
@@ -233,11 +224,10 @@ async fn main() {
             num_blanks = args[i + 1].parse().unwrap_or(2);
         }
     }
-    println!("Using inference server at: {}", server_url);
 
     // How many concurrent gatherers to run
-    // let num_gatherers = num_cpus::get(); // or manually set to e.g. 8
-    let num_gatherers = 256;
+    let num_gatherers = num_cpus::get();
+    // let num_gatherers = 256;
     println!("Launching {num_gatherers} gatherers...");
 
     let shared_client = Arc::new(reqwest::Client::builder()
@@ -249,15 +239,13 @@ async fn main() {
     // Spawn all gatherers as independent tasks
     let mut handles = Vec::new();
     for i in 0..num_gatherers {
-        let url = server_url.clone();
         let client = Arc::clone(&shared_client);
-        let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", i);
+        let output_path = format!("/pscratch/sd/m/mtweiden/tile/data/output-{}.json", i);
         let handle = task::spawn(async move {
-            let gatherer = Gatherer::new(
+            let gatherer = SimpleGatherer::new(
                 32,        // inference batch size
-                1_000,    // MCTS steps
+                10_000,    // MCTS steps
                 100,       // max actions
-                url,
                 output_path,
                 0.25,      // noise strength
             );
