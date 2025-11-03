@@ -211,10 +211,26 @@ impl Gatherer {
 async fn main() {
     // Parse the --server argument
     let mut server_url = String::from("http://localhost:8000");
+    let mut height = 4;
+    let mut width = 4;
+    let mut num_objectives = 2;
+    let mut num_blanks = 2;
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
         if args[i] == "--server" && i + 1 < args.len() {
             server_url = args[i + 1].clone();
+        }
+        if args[i] == "--height" && i + 1 < args.len() {
+            height = args[i + 1].parse().unwrap_or(4);
+        }
+        if args[i] == "--width" && i + 1 < args.len() {
+            width = args[i + 1].parse().unwrap_or(4);
+        }
+        if args[i] == "--num_objectives" && i + 1 < args.len() {
+            num_objectives = args[i + 1].parse().unwrap_or(2);
+        }
+        if args[i] == "--num_blanks" && i + 1 < args.len() {
+            num_blanks = args[i + 1].parse().unwrap_or(2);
         }
     }
     println!("Using inference server at: {}", server_url);
@@ -247,8 +263,8 @@ async fn main() {
             );
 
             loop {
-                let mut env = Environment::new(4, 4, 2);
-                env.random_start(2, false);
+                let mut env = Environment::new(height, width, num_blanks);
+                env.random_start(num_objectives, false);
                 gatherer.run(&env, Arc::clone(&client)).await;
             }
         });
