@@ -111,7 +111,7 @@ impl Gatherer {
         valid_actions[dist.sample(&mut rng)]
     }
 
-    pub async fn run(&self, env: &Environment, client: Arc<reqwest::Client>) {
+    pub async fn run(&self, env: &Environment, client: Arc<reqwest::Client>) -> (f32, f32) {
         // Set up MCTS and Agent and copy the Environment
         let mut mcts: MCTS<Environment> = MCTS::new(
             self.terminal_value,
@@ -203,6 +203,7 @@ impl Gatherer {
             let line = record.dump(); // compact JSON string
             writeln!(file, "{}", line).expect("Failed to write record");
          }
+         (solution_depth as f32, reference_depth as f32)
     }
 }
 
@@ -265,7 +266,8 @@ async fn main() {
             loop {
                 let mut env = Environment::new(height, width, num_blanks);
                 env.random_start(num_objectives, false);
-                gatherer.run(&env, Arc::clone(&client)).await;
+                let (sol_depth, ref_depth) = gatherer.run(&env, Arc::clone(&client)).await;
+                println!("Gatherer {} completed an episode: solution depth = {}, reference depth = {}", i, sol_depth, ref_depth);
             }
         });
         handles.push(handle);
