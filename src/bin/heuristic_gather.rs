@@ -39,6 +39,27 @@ impl HeuristicGatherer {
         (actions, depth)
     }
 
+    /// For each legal action, apply it and solve the resulting state with the heuristic solver.
+    /// Return a vector of action indices ranked by the depth of the solution.
+    pub fn ranked_actions(&self, env: &mut Environment) -> HashMap<usize, usize> {
+        let base_line_depth = self.solve_with_heuristic(env).1;
+        let legal_actions = env.valid_actions();
+        let mut rankings = HashMap::new();
+        for ac in legal_actions.iter() {
+            let mut game = env.clone();
+            game.step(*ac);
+            let (_, depth) = self.solve_with_heuristic(&mut game);
+            if depth < base_line_depth {
+                rankings.insert(*ac as usize, 4);
+            } else if depth == base_line_depth {
+                rankings.insert(*ac as usize, 2);
+            } else {
+                rankings.insert(*ac as usize, 1);
+            }
+        }
+        rankings
+    }
+
     /// Directly sampling from Dirichlet distribution requires num_actions to be known at
     /// compile time, so we sample using Gamma distributions instead.
     fn _dirichlet_noise(&self, num_actions: usize) -> Vec<f64> {
@@ -76,24 +97,15 @@ impl HeuristicGatherer {
 
         // Set up data storage
         // Format: ((placement, objectives_0, objectives_1), valid_actions, visit_counts)
-        let mut temp_data: Vec<((Vec<usize>, Vec<usize>, Vec<usize>), Vec<usize>, HashMap<Action, usize>)> = Vec::new();
+        let mut temp_data: Vec<(Vec<usize>, Vec<usize>, Vec<usize>, Vec<usize>, HashMap<Action, usize>)> = Vec::new();
 
         for ac in actions {
             // Run MCTS
             let (placement, objectives_0) = game.get_tokens();
             let objectives_1 = game.get_objective_tokens(1);
             let valid_actions = game.valid_actions();
-
-            let mut action_weights: HashMap<Action, usize> = HashMap::new();
-            let base_weight: usize = 1;
-            let favored_weight: usize = 3;
-
-            for va in valid_actions.iter().cloned() {
-                let weight = if va == ac { favored_weight } else { base_weight };
-                action_weights.insert(va, weight);
-            }
-            temp_data.push(((placement, objectives_0, objectives_1), valid_actions, action_weights));
-
+            let action_weights = self.ranked_actions(&mut game);
+            temp_data.push((placement, objectives_0, objectives_1, valid_actions, action_weights));
             // Select action and step the environment
             game.step(ac);
         }
@@ -107,7 +119,7 @@ impl HeuristicGatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        for ((placement, objectives_0, objectives_1), valid_actions, edge_visits) in temp_data {
+        for (placement, objectives_0, objectives_1, valid_actions, edge_visits) in temp_data {
             // Build JSON using `json` crate (avoids serde_json)
             let mut placement_tokens_json = JsonValue::new_array();
             for t in placement {
