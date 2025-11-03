@@ -50,9 +50,9 @@ impl HeuristicGatherer {
             game.step(*ac);
             let (_, depth) = self.solve_with_heuristic(&mut game);
             if depth < base_line_depth {
-                rankings.insert(*ac as usize, 4);
+                rankings.insert(*ac as usize, 10);
             } else if depth == base_line_depth {
-                rankings.insert(*ac as usize, 2);
+                rankings.insert(*ac as usize, 5);
             } else {
                 rankings.insert(*ac as usize, 1);
             }
