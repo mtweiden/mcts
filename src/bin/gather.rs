@@ -235,7 +235,7 @@ async fn main() {
     for i in 0..num_gatherers {
         let url = server_url.clone();
         let client = Arc::clone(&shared_client);
-        let output_path = format!("/pscratch/sd/m/mtweiden/tile/data/output-{}.json", i);
+        let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", i);
         let handle = task::spawn(async move {
             let gatherer = Gatherer::new(
                 32,        // inference batch size
@@ -247,8 +247,8 @@ async fn main() {
             );
 
             loop {
-                let mut env = Environment::new(4, 4, 2);
-                env.random_start(2, false);
+                let mut env = Environment::new(5, 5, 3);
+                env.random_start(4, false);
                 gatherer.run(&env, Arc::clone(&client)).await;
             }
         });
