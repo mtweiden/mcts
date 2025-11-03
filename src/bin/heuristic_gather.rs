@@ -41,13 +41,15 @@ impl HeuristicGatherer {
 
     /// For each legal action, apply it and solve the resulting state with the heuristic solver.
     /// Return a vector of action indices ranked by the depth of the solution.
-    pub fn ranked_actions(&self, env: &mut Environment) -> HashMap<usize, usize> {
-        let base_line_depth = self.solve_with_heuristic(env).1;
+    pub fn ranked_actions(&self, env: &Environment) -> HashMap<usize, usize> {
+        if env.done() {
+            return HashMap::new();
+        }
+        let base_line_depth = self.solve_with_heuristic(&mut env.clone()).1;
         let legal_actions = env.valid_actions();
         let mut rankings = HashMap::new();
         for ac in legal_actions.iter() {
             let mut game = env.clone();
-            game.step(*ac);
             let (_, depth) = self.solve_with_heuristic(&mut game);
             if depth < base_line_depth {
                 rankings.insert(*ac as usize, 10);
@@ -56,37 +58,10 @@ impl HeuristicGatherer {
             } else {
                 rankings.insert(*ac as usize, 1);
             }
+            game.step(*ac);
+            game.cultivator.finish_cultivating();
         }
         rankings
-    }
-
-    /// Directly sampling from Dirichlet distribution requires num_actions to be known at
-    /// compile time, so we sample using Gamma distributions instead.
-    fn _dirichlet_noise(&self, num_actions: usize) -> Vec<f64> {
-        let alpha = 10f64 / (num_actions as f64);  // Rule of thumb for Dirichlet noise
-        let mut rng = rand::rng();
-        let alphas = vec![alpha; num_actions];
-        let mut xs: Vec<f64> = alphas.iter()
-            .map(|&a| {
-                let gamma = Gamma::new(a, 1.0).unwrap();
-                gamma.sample(&mut rng)
-            })
-            .collect();
-        let sum_xs: f64 = xs.iter().sum();
-        for x in xs.iter_mut() {
-            *x /= sum_xs;
-        }
-        xs
-    }
-
-    fn _action_probabilities(&self, visit_counts: &Vec<usize>) -> Vec<f64> {
-        let total_visits: usize = visit_counts.iter().sum();
-        if total_visits == 0 {
-            return vec![1.0 / (visit_counts.len() as f64); visit_counts.len()];
-        }
-        visit_counts.iter()
-            .map(|&count| count as f64 / total_visits as f64)
-            .collect()
     }
 
     pub async fn run(&self, env: &Environment) {
@@ -104,10 +79,11 @@ impl HeuristicGatherer {
             let (placement, objectives_0) = game.get_tokens();
             let objectives_1 = game.get_objective_tokens(1);
             let valid_actions = game.valid_actions();
-            let action_weights = self.ranked_actions(&mut game);
+            let action_weights = self.ranked_actions(&game);
             temp_data.push((placement, objectives_0, objectives_1, valid_actions, action_weights));
             // Select action and step the environment
             game.step(ac);
+            game.cultivator.finish_cultivating();
         }
 
         // Loss condition
@@ -186,8 +162,8 @@ async fn main() {
     }
 
     // How many concurrent gatherers to run
-    let num_gatherers = num_cpus::get();
-    // let num_gatherers = 256;
+    // let num_gatherers = num_cpus::get();
+    let num_gatherers = 256;
     println!("Launching {num_gatherers} gatherers...");
 
     // Spawn all gatherers as independent tasks
