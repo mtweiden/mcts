@@ -240,11 +240,11 @@ async fn main() {
     let mut handles = Vec::new();
     for i in 0..num_gatherers {
         let client = Arc::clone(&shared_client);
-        let output_path = format!("/pscratch/sd/m/mtweiden/tile/data/output-{}.json", i);
+        let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", i);
         let handle = task::spawn(async move {
             let gatherer = SimpleGatherer::new(
                 32,        // inference batch size
-                10_000,    // MCTS steps
+                100_000,    // MCTS steps
                 100,       // max actions
                 output_path,
                 0.25,      // noise strength
