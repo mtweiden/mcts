@@ -57,7 +57,7 @@ impl SimpleGatherer {
     /// Solve the environment using a heuristic solver and return the depth of the solution.
     pub fn solve_with_heuristic(&self, env: &mut Environment) -> usize {
         let mut solved_env = env.clone();
-        solved_env.solve_and_take_actions();
+        solved_env.solve(true);
         solved_env.depth(true)
     }
 

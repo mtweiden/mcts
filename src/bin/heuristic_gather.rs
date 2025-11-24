@@ -2,7 +2,6 @@ use std::env;
 use std::collections::HashMap;
 use std::io::Write;
 use json::JsonValue;
-use rand_distr::{Gamma, Distribution};
 use futures::future::join_all;
 use tokio::task;
 
@@ -34,7 +33,7 @@ impl HeuristicGatherer {
     /// Solve the environment using a heuristic solver and return the depth of the solution.
     pub fn solve_with_heuristic(&self, env: &mut Environment) -> (Vec<usize>, usize) {
         let mut solved_env = env.clone();
-        let actions = solved_env.solve_and_take_actions();
+        let actions = solved_env.solve(true);
         let depth = solved_env.depth(true);
         (actions, depth)
     }
@@ -59,7 +58,7 @@ impl HeuristicGatherer {
                 rankings.insert(*ac as usize, 1);
             }
             game.step(*ac);
-            game.cultivator.finish_cultivating();
+            game.cultivator.finish_cultivating(&mut game.placement);
         }
         rankings
     }
@@ -83,7 +82,7 @@ impl HeuristicGatherer {
             temp_data.push((placement, objectives_0, objectives_1, valid_actions, action_weights));
             // Select action and step the environment
             game.step(ac);
-            game.cultivator.finish_cultivating();
+            game.cultivator.finish_cultivating(&mut game.placement);
         }
 
         // Loss condition
