@@ -41,6 +41,7 @@ pub struct MCTS<E: EnvTrait> {
 }
 
 impl<E: EnvTrait> MCTS<E> {
+
     pub fn new(
         terminal_value: Value,
         batch_size: usize,
@@ -57,6 +58,8 @@ impl<E: EnvTrait> MCTS<E> {
             _env_marker: PhantomData,
         }
     }
+
+    pub fn default() -> Self { Self::new(1.0, 32, None, None) }
 
     /// Run MCTS for a given number of steps from the current environment state.
     /// `env` is borrowed immutably; select_leaf clones it internally as needed.
@@ -93,9 +96,7 @@ impl<E: EnvTrait> MCTS<E> {
                 repeat_batch.push(repeat);
             }
 
-            if leaf_batch.is_empty() {
-                continue;
-            }
+            if leaf_batch.is_empty() { continue; }
 
             // --- Batched Inference ---
             let (prior_batch, value_batch) = if let Some(_) = self.server_url {
