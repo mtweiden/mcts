@@ -1,3 +1,4 @@
+use mcts::enums::{Observation, Prior, Value};
 use axum::body::Bytes;
 use axum::{
     serve,
@@ -10,7 +11,6 @@ use mcts::Agent;
 use mcts::agent::DummyAgent;
 use rmp_serde::to_vec_named;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use tokio::sync::{mpsc, oneshot};
@@ -28,13 +28,13 @@ const BATCH_TIMEOUT: Duration = Duration::from_millis(10);
 /// ---------------------------------------------------------------------------
 #[derive(Deserialize, Debug)]
 struct InferenceRequest {
-    observation_batch: Vec<Vec<usize>>,
+    observation_batch: Vec<Observation>,
 }
 
 #[derive(Serialize, Debug)]
 struct InferenceResponse {
-    prior_batch: Vec<HashMap<usize, f32>>,
-    value_batch: Vec<f32>,
+    prior_batch: Vec<Prior>,
+    value_batch: Vec<Value>,
 }
 
 /// ---------------------------------------------------------------------------
@@ -70,12 +70,10 @@ impl InferenceBatcher {
                     }
                 }
 
-                if buffer.is_empty() {
-                    continue;
-                }
+                if buffer.is_empty() { continue; }
 
                 // Flatten all observations
-                let obs_all: Vec<Vec<usize>> = buffer
+                let obs_all: Vec<Observation>  = buffer
                     .iter()
                     .flat_map(|(req, _)| req.observation_batch.clone())
                     .collect();
