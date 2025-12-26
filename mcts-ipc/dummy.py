@@ -8,7 +8,7 @@ while True:
 
     # Input information
     action_mask = np.asarray(sv.action_mask())  # shape (b, NUM_ACTIONS)
-    done = np.sum(np.asarray(sv.obj0())) == 0  # shape (b, MAX_OBJ0)
+    done = np.sum(np.asarray(sv.obj0())) == 0   # shape (b, MAX_OBJ0)
 
     # Output information
     priors = np.asarray(sv.priors())            # shape (b, NUM_ACTIONS)
@@ -27,4 +27,4 @@ while True:
         else:
             values[i] = -1.0
 
-    sv.mark_done()  # or arena.mark_done(sv.slot)
+    sv.mark_done()
