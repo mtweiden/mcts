@@ -1,17 +1,13 @@
 use std::env;
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 use json::JsonValue;
 use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
-use futures::future::join_all;
-use tokio::task;
 
-use mcts::enums::Action;
-use mcts::MCTS;
-use mcts::node::Node;
-use mcts::agent::DummyAgent;
+use mcts_core::enums::Action;
+use mcts_core::{Arena, InferenceClient, IpcClient, MCTS};
+use mcts_core::node::Node;
 use tilers_core::env::Environment;
 
 /// ----------------------------------------------------------------------------
@@ -27,10 +23,9 @@ use tilers_core::env::Environment;
 ///   output_path: Path to save the gathered data.
 /// ----------------------------------------------------------------------------
 struct Gatherer {
-    inference_batch_size: usize,
+    batch_size: usize,
     mcts_steps: usize,
     max_actions: usize,
-    url: String,
     output_path: String,
     terminal_value: f32,
     noise_strength: f64,
@@ -39,19 +34,17 @@ struct Gatherer {
 
 impl Gatherer {
     pub fn new(
-        inference_batch_size: usize,
+        batch_size: usize,
         mcts_steps: usize,
         max_actions: usize,
-        url: String,
         output_path: String,
         noise_strength: f64,
     ) -> Self {
         let terminal_value: f32 = 1.0;
         Self {
-            inference_batch_size,
+            batch_size,
             mcts_steps,
             max_actions,
-            url,
             output_path,
             terminal_value,
             noise_strength,
@@ -59,7 +52,7 @@ impl Gatherer {
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
-    pub fn solve_with_heuristic(&self, env: &mut Environment) -> usize {
+    pub fn solve_with_heuristic(&self, env: &mut Environment) -> f32 {
         let mut solved_env = env.clone();
         solved_env.solve(true);
         solved_env.depth(true)
@@ -100,7 +93,8 @@ impl Gatherer {
         if num_actions == 0 { panic!("No valid actions available"); }
         let noise = self._dirichlet_noise(num_actions);
         let probs = self._action_probabilities(
-            &valid_actions.iter().map(|&a| *node.edge_visits.get(&a).unwrap_or(&0)).collect()
+            &valid_actions.iter()
+                .map(|&a| *node.edge_visits.get(&(a as Action)).unwrap_or(&0)).collect()
         );
         let mixed_probs: Vec<f64> = probs.iter().zip(noise.iter())
             .map(|(&p, &n)| (1.0 - self.noise_strength) * p + self.noise_strength * n)
@@ -108,18 +102,12 @@ impl Gatherer {
             .collect();
         let mut rng = rand::rng();
         let dist = WeightedIndex::new(&mixed_probs).unwrap();
-        valid_actions[dist.sample(&mut rng)]
+        valid_actions[dist.sample(&mut rng)] as Action
     }
 
-    pub async fn run(&self, env: &Environment, client: Arc<reqwest::Client>) -> (f32, f32) {
+    pub fn gather(&self, env: &Environment, client: &dyn InferenceClient) -> (f32, f32) {
         // Set up MCTS and Agent and copy the Environment
-        let mut mcts: MCTS<Environment> = MCTS::new(
-            self.terminal_value,
-            self.inference_batch_size,
-            Some(self.url.clone()),
-            Some(client),
-        );
-        let agent = DummyAgent::new(env.num_actions());
+        let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.batch_size);
 
         // Only consider the first two layers of gates
         let mut game = env.clone();
@@ -132,7 +120,7 @@ impl Gatherer {
 
         for _ in 0..self.max_actions {
             // Run MCTS
-            let root = mcts.run(&game , &agent, self.mcts_steps).await;
+            let root = mcts.run(&game , client, self.mcts_steps);
 
             // Store the data
             let (placement, objectives_0) = game.get_tokens();
@@ -143,7 +131,7 @@ impl Gatherer {
 
             // Select action and step the environment
             let action = self.select_action(&root, &game);
-            game.step(action);
+            game.step(action as usize);
             if game.done() { break; }
         }
 
@@ -208,19 +196,18 @@ impl Gatherer {
 }
 
 
-#[tokio::main]
-async fn main() {
-    // Parse the --server argument
-    let mut server_url = String::from("http://localhost:8000");
+fn main() {
+    // Environment parameters
     let mut height = 4;
     let mut width = 4;
     let mut num_objectives = 2;
     let mut num_blanks = 2;
+    // IPC parameters
+    let mut worker_id = 0;
+    let mut num_handlers = 1;
+    // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
-        if args[i] == "--server" && i + 1 < args.len() {
-            server_url = args[i + 1].clone();
-        }
         if args[i] == "--height" && i + 1 < args.len() {
             height = args[i + 1].parse().unwrap_or(4);
         }
@@ -233,47 +220,35 @@ async fn main() {
         if args[i] == "--num_blanks" && i + 1 < args.len() {
             num_blanks = args[i + 1].parse().unwrap_or(2);
         }
+        if args[i] == "--worker_id" && i + 1 < args.len() {
+            worker_id = args[i + 1].parse().unwrap_or(0);
+        }
+        if args[i] == "--num_handlers" && i + 1 < args.len() {
+            num_handlers = args[i + 1].parse().unwrap_or(1);
+        }
     }
-    println!("Using inference server at: {}", server_url);
 
-    // How many concurrent gatherers to run
-    // let num_gatherers = num_cpus::get(); // or manually set to e.g. 8
-    let num_gatherers = 256;
-    println!("Launching {num_gatherers} gatherers...");
-
-    let shared_client = Arc::new(reqwest::Client::builder()
-        .pool_max_idle_per_host(num_gatherers)
-        .build()
-        .unwrap()
+    let arena_name = "mcts_gather";
+    let num_slots = 2048;
+    let arena = Arena::create_or_open(arena_name, num_slots, num_handlers).unwrap();
+    let client = IpcClient::new(arena, worker_id);
+    // Spawn all gatherers as independent tasks
+    let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", worker_id);
+    let gatherer = Gatherer::new(
+        8,         // inference batch size
+        10_000,    // MCTS steps
+        80,       // max actions
+        output_path,
+        0.25,  // noise strength
     );
 
-    // Spawn all gatherers as independent tasks
-    let mut handles = Vec::new();
-    for i in 0..num_gatherers {
-        let url = server_url.clone();
-        let client = Arc::clone(&shared_client);
-        let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", i);
-        let handle = task::spawn(async move {
-            let gatherer = Gatherer::new(
-                32,        // inference batch size
-                1_000,    // MCTS steps
-                100,       // max actions
-                url,
-                output_path,
-                0.25,      // noise strength
-            );
-
-            loop {
-                let mut env = Environment::new(height, width, num_blanks);
-                env.random_start(num_objectives, false);
-                let (sol_depth, ref_depth) = gatherer.run(&env, Arc::clone(&client)).await;
-                println!("Gatherer {} completed an episode: solution depth = {}, reference depth = {}", i, sol_depth, ref_depth);
-            }
-        });
-        handles.push(handle);
+    loop {
+        let mut env = Environment::new(height, width, num_blanks);
+        env.random_start(num_objectives, false);
+        let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
+        println!(
+            "Gatherer {} completed an episode: solution depth = {}, reference depth = {}",
+            worker_id, sol_depth, ref_depth
+        );
     }
-
-    // Wait for all gatherers to finish
-    join_all(handles).await;
-    println!("All gatherers completed.");
 }

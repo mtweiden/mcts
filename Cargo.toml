@@ -1,19 +1,11 @@
-[package]
-name = "mcts"
-version = "0.1.0"
-edition = "2021"
+[workspace]
+members = [
+  "mcts-core",
+  "mcts-ipc",
+]
 
-[dependencies]
-tilers-core = { path = "/Users/mathias/Documents/research/tilers/tilers-core" }
-rand = "0.9"
-serde = { version = "1.0.228", features = ["derive"] }
-reqwest = { version = "0.12.24", features = ["json", "stream", "rustls-tls"]}
-rmp-serde = "1.1"
-anyhow = "1.0.100"
-json = "0.12.4"
-rand_distr = "0.5.1"
-tokio = { version = "1.48.0", features = ["full", "macros", "rt-multi-thread"] }
-futures = "0.3.31"
-num_cpus = "1.17.0"
-axum = "0.8"
-hyper = "1"
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
