@@ -27,7 +27,7 @@ pub const SLOT_DONE: u32 = 3;
 #[repr(C)]
 pub struct Slot {
     // Header information
-    pub state: std::sync::atomic::AtomicU32,
+    pub state: AtomicU32,
     pub b: u32,
     pub owner_id: u32,
     pub req_id: u64,

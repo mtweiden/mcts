@@ -1,3 +1,4 @@
+use std::slice::from_raw_parts;
 use numpy::{Element, PyArray1, PyArray2};
 use pyo3::exceptions::{PyRuntimeError};
 use pyo3::prelude::*;
@@ -93,7 +94,7 @@ unsafe fn view1<'a, T: Element>(
     len: usize,
 ) -> Bound<'a, PyArray1<T>> {
     // copy the underlying memory into a Rust slice -> new ndarray -> Python array
-    let slice = std::slice::from_raw_parts(data_ptr as *const T, len);
+    let slice = unsafe { from_raw_parts(data_ptr as *const T, len) };
     PyArray1::from_slice(py, slice)
 }
 
@@ -104,7 +105,7 @@ unsafe fn view2<'a, T: Element + Copy>(
     cols: usize,
 ) -> Bound<'a, PyArray2<T>> {
     let len = rows.checked_mul(cols).expect("overflow");
-    let slice = std::slice::from_raw_parts(data_ptr as *const T, len);
+    let slice = unsafe { from_raw_parts(data_ptr as *const T, len) };
     let vec = slice.to_vec();
     let arr: Array2<T> = Array2::from_shape_vec((rows, cols), vec).expect("shape/len mismatch");
     arr.into_pyarray(py)
