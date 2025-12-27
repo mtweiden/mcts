@@ -21,7 +21,7 @@ ValueType = float
 BATCH_TIMEOUT = 0.005
 DEVICE = "cuda" if is_available() else "cpu"
 num_slots = 2048
-num_handlers = 1
+num_handlers = 2
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -49,7 +49,7 @@ MODEL.to(DEVICE)
 # Inference endpoint
 # ------------------------------------------------------------------------------
 
-def do_work(handler_id: int, arena_name: str) -> None:
+def do_work(handler_id: int, arena_name: str, num_handlers: int) -> None:
     arena = PyArena(arena_name, num_slots, num_handlers)
     while True:
         try:
@@ -120,9 +120,10 @@ def do_work(handler_id: int, arena_name: str) -> None:
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--arena-name", type=str, default='mcts')
-    parser.add_argument("--num-slots", type=int, default=num_slots)
-    parser.add_argument("--num-handlers", type=int, default=num_handlers)
-    parser.add_argument("--handler-id", type=int, default=0)
+    parser.add_argument("--arena_name", type=str, default='mcts')
+    parser.add_argument("--num_slots", type=int, default=num_slots)
+    parser.add_argument("--num_handlers", type=int, default=1)
+    parser.add_argument("--handler_id", type=int, default=0)
     args = parser.parse_args()
-    do_work(args.handler_id, args.arena_name)
+    arena_name = f"{args.arena_name}_{args.num_slots}_{args.num_handlers}"
+    do_work(args.handler_id, arena_name, args.num_handlers)

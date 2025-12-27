@@ -205,6 +205,7 @@ fn main() {
     // IPC parameters
     let mut worker_id = 0;
     let mut num_handlers = 1;
+    let num_slots = 2048;
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
@@ -228,9 +229,8 @@ fn main() {
         }
     }
 
-    let arena_name = "mcts";
-    let num_slots = 2048;
-    let arena = Arena::create_or_open(arena_name, num_slots, num_handlers).unwrap();
+    let arena_name = format!("mcts_{}_{}", num_slots, num_handlers);
+    let arena = Arena::create_or_open(&arena_name, num_slots, num_handlers).unwrap();
     let client = IpcClient::new(arena, worker_id);
     // Spawn all gatherers as independent tasks
     let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", worker_id);
