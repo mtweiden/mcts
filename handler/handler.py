@@ -19,10 +19,8 @@ ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
 BATCH_TIMEOUT = 0.005
-MAX_BATCH_SIZE = 1024
 DEVICE = "cuda" if is_available() else "cpu"
-arena_name = 'example_mcts'
-num_slots = 1024
+num_slots = 2048
 num_handlers = 1
 
 # ------------------------------------------------------------------------------
@@ -50,9 +48,9 @@ MODEL.to(DEVICE)
 # ------------------------------------------------------------------------------
 # Inference endpoint
 # ------------------------------------------------------------------------------
-arena = PyArena("example_mcts", num_slots, num_handlers)
 
-def do_work(handler_id: int) -> None:
+def do_work(handler_id: int, arena_name: str) -> None:
+    arena = PyArena(arena_name, num_slots, num_handlers)
     while True:
         try:
             sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
@@ -122,9 +120,9 @@ def do_work(handler_id: int) -> None:
 # ------------------------------------------------------------------------------
 if __name__ == "__main__":
     parser = ArgumentParser()
-    parser.add_argument("--arena-name", type=str, default=arena_name)
+    parser.add_argument("--arena-name", type=str, default='mcts')
     parser.add_argument("--num-slots", type=int, default=num_slots)
     parser.add_argument("--num-handlers", type=int, default=num_handlers)
     parser.add_argument("--handler-id", type=int, default=0)
     args = parser.parse_args()
-    do_work(args.handler_id)
+    do_work(args.handler_id, args.arena_name)

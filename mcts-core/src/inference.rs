@@ -35,7 +35,7 @@ impl IpcClient {
             arena,
             owner_id,
             next_req_id: AtomicU64::new(0),
-            print_timing: false,
+            print_timing: true,
         }
     }
 

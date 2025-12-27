@@ -228,7 +228,7 @@ fn main() {
         }
     }
 
-    let arena_name = "mcts_gather";
+    let arena_name = "mcts";
     let num_slots = 2048;
     let arena = Arena::create_or_open(arena_name, num_slots, num_handlers).unwrap();
     let client = IpcClient::new(arena, worker_id);
