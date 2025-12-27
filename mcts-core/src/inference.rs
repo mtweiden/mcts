@@ -151,11 +151,25 @@ impl InferenceClient for IpcClient {
 
             Self::copy_slot_into_resp(sr.slot, b, resp)?;
         }
+
+        // Record response time
         {
             let sm = self.arena.slot_mut(slot_idx);
             sm.slot.response_time_ns.store(now_ns(), Ordering::Release);
         }
 
+        // Optional: print timing info for instrumentation.
+        {
+            let sr = self.arena.slot(slot_idx);
+            let handler_start = sr.slot.handler_start_time_ns.load(Ordering::Acquire);
+            let request_time = sr.slot.request_time_ns.load(Ordering::Acquire);
+            let response_time = sr.slot.response_time_ns.load(Ordering::Acquire);
+            println!(
+                "request time: {}    response time: {}",
+                handler_start - request_time,
+                response_time - handler_start,
+            );
+        }
         self.arena.release_slot(slot_idx);
         Ok(())
     }
