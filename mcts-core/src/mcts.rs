@@ -1,71 +1,67 @@
 use crate::node::Node;
 use crate::enums::{Action, NodeId, Observation, Prior, Value};
-use crate::agent::Agent;
-use crate::network::InferenceRequest;
-use crate::network::InferenceResponse;
+use crate::inference::InferenceClient;
 use crate::environment::Environment as EnvTrait;
+use crate::comms::{RequestScratchPad, ResponseScratchPad};
 use std::collections::HashMap;
 use std::marker::PhantomData;
 
 
-/// Core Monte Carlo Tree Search engine, now generic over an Environment type `E`
-/// that implements the `EnvTrait` trait.
+/// ----------------------------------------------------------------------------
+/// Monte Carlo Tree Search
+/// ----------------------------------------------------------------------------
+/// Generic over an Environment type `E` that implements the `EnvTrait` trait.
 pub struct MCTS<E: EnvTrait> {
     // Arena style storage for all nodes.
     pub transposition_table: HashMap<NodeId, usize>,
     pub nodes: Vec<Node>,
     pub terminal_value: Value,
     pub batch_size: usize,
-    pub server_url: Option<String>,
-    pub client: Option<reqwest::blocking::Client>,
-
-    // Keep the generic type around (no runtime data).
+    pub to_agent: RequestScratchPad,
+    pub from_agent: ResponseScratchPad,
+    // For generic type E without storing it directly.
     _env_marker: PhantomData<E>,
 }
 
 impl<E: EnvTrait> MCTS<E> {
-    pub fn new(
-        terminal_value: Value,
-        batch_size: usize,
-        server_url: Option<String>,
-    ) -> Self {
-        let client = server_url
-            .as_ref()
-            .map(|_| reqwest::blocking::Client::new());
+
+    pub fn new(terminal_value: Value, batch_size: usize) -> Self {
         Self {
             transposition_table: HashMap::new(),
             nodes: Vec::new(),
             terminal_value,
             batch_size,
-            server_url,
-            client,
+            to_agent: RequestScratchPad::new(batch_size),
+            from_agent: ResponseScratchPad::new(batch_size),
             _env_marker: PhantomData,
         }
     }
 
-    /// Run MCTS for a given number of steps from the current environment state.
-    /// `env` is borrowed immutably; select_leaf clones it internally as needed.
-    pub fn run<T: Agent>(&mut self, env: &E, agent: &T, num_steps: usize) -> Node {
+    pub fn default() -> Self { Self::new(1.0, 8) }
+
+    /// Run MCTS for a given number of steps from the current environment state. `env` is borrowed
+    /// immutably; select_leaf clones it internally as needed. The `client` is an inference client
+    /// that provides value and prior estimates for leaf nodes.
+    pub fn run(&mut self, env: &E, client: &dyn InferenceClient, num_steps: usize) -> Node {
         // Ensure root node exists
         let root_hash = self.get_hash(env);
         if !self.node_exists(root_hash) {
             let obs = env.observation();
-            let (mut priors, value) = agent.infer(&obs);
+            let (p, v) = self.blocking_infer(&vec![obs], client);
+            let value = v[0];
+            let mut priors = p[0].clone();
             priors = self.normalize_prior(priors, env.valid_actions());
             self.create_node(env, priors, value);
         }
 
-        if env.done() {
-            return self.get_node_mut(root_hash).unwrap().clone();
-        }
+        if env.done() { return self.get_node_mut(root_hash).unwrap().clone(); }
 
-        let batches = num_steps / self.batch_size.max(1);
-        for _ in 0..batches {
+        let num_batches = num_steps / self.batch_size.max(1);
+        for _ in 0..num_batches {
             // Selection: collect a batch of leaf observations / metadata
             let mut leaf_batch: Vec<Observation> = Vec::with_capacity(self.batch_size);
             let mut path_batch: Vec<Vec<(NodeId, Action)>> = Vec::with_capacity(self.batch_size);
-            let mut parent_batch: Vec<(Option<NodeId>, Action, E)> =
-                Vec::with_capacity(self.batch_size);
+            let mut parent_batch: Vec<(Option<NodeId>, Action, E)> =Vec::with_capacity(self.batch_size);
             let mut repeat_batch: Vec<bool> = Vec::with_capacity(self.batch_size);
 
             for _ in 0..self.batch_size {
@@ -78,18 +74,10 @@ impl<E: EnvTrait> MCTS<E> {
                 repeat_batch.push(repeat);
             }
 
-            if leaf_batch.is_empty() {
-                continue;
-            }
+            if leaf_batch.is_empty() { continue; }
 
             // --- Batched Inference ---
-            let (prior_batch, value_batch) = if let Some(_) = self.server_url {
-                // Remote inference
-                self.remote_infer(&leaf_batch).unwrap()
-            } else {
-                // Local inference
-                agent.batch_infer(&leaf_batch)
-            };
+            let (prior_batch, value_batch) = self.blocking_infer(&leaf_batch, client);
 
             // Expansion & Backpropagation
             let n = prior_batch.len().min(value_batch.len()).min(parent_batch.len());
@@ -292,7 +280,7 @@ impl<E: EnvTrait> MCTS<E> {
         let mut path: Vec<(NodeId, Action)> = Vec::new();
         let mut node_id = root_id;
         let mut parent: Option<NodeId> = None;
-        let mut action: Action = usize::MAX;
+        let mut action: Action = Action::MAX;
         let mut repeat_detected = false;
 
         // work on a cloned environment so caller's env is not mutated
@@ -403,30 +391,20 @@ impl<E: EnvTrait> MCTS<E> {
         }
     }
 
-    pub fn remote_infer(
-        &self,
-        obs_batch: &[Observation],
-    ) -> anyhow::Result<(Vec<Prior>, Vec<Value>)> {
-        let client = self.client.as_ref().expect("HTTP client not initialized");
-        let server_url = self.server_url.as_ref().unwrap();
-        let req = InferenceRequest { observation_batch: obs_batch.to_vec() };
-        let resp = client
-            .post(format!("{}/infer", server_url))
-            .json(&req)
-            .send()?
-            .error_for_status()?
-            .json::<InferenceResponse>()?;
-
-        // response.prior_batch already contains Priors keyed by Action (usize),
-        // so we can use it directly.
-        let prior_batch: Vec<Prior> = resp.prior_batch;
-        Ok((prior_batch, resp.value_batch))
+    /// Do inference on a batch of observations
+    pub fn blocking_infer(&mut self, batch: &[Observation], client: &dyn InferenceClient) -> (Vec<Prior>, Vec<Value>) {
+        // Put PackedBatch into RequestScratchPad
+        self.to_agent.pack(batch);
+        // Get client to do inference on the packed batch
+        client.infer_into(&self.to_agent, batch.len(), &mut self.from_agent)
+            .expect("client inference failed");
+        // Extract outputs into Vec<Prior> and Vec<Value>
+        self.from_agent.unpack()
     }
 }
 
 // Note: tests must now construct the MCTS with the concrete environment type:
 // let mut mcts: MCTS<Environment> = MCTS::<tilers_core::env::Environment>::new(0.0, 4, None);
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -435,31 +413,27 @@ mod tests {
 
     fn make_priors(pairs: &[(Action, f32)]) -> Prior {
         let mut m = HashMap::new();
-        for &(a, p) in pairs {
-            m.insert(a, p);
-        }
+        for &(a, p) in pairs { m.insert(a, p); }
         m
     }
 
     fn make_priors_from_vec(actions: Vec<Action>) -> Prior {
         let mut m = HashMap::new();
         let prob = 1.0 / (actions.len() as f32);
-        for &a in &actions {
-            m.insert(a, prob);
-        }
+        for &a in &actions { m.insert(a, prob); }
         m
     }
 
     #[test]
     fn test_mcts_creation() {
-        let mcts: MCTS<Environment> = MCTS::new(1.0, 16, None);
+        let mcts: MCTS<Environment> = MCTS::new(1.0, 16);
         assert_eq!(mcts.terminal_value, 1.0);
         assert_eq!(mcts.batch_size, 16);
     }
 
     #[test]
     fn test_insert_and_get_node() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
         let node = Node::new(priors.clone(), 0.42, 1, None);
         mcts.insert_node(1, node);
@@ -471,7 +445,7 @@ mod tests {
 
     #[test]
     fn test_with_node_write_updates() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.1, 2, None);
         mcts.insert_node(2, node);
@@ -486,7 +460,7 @@ mod tests {
 
     #[test]
     fn test_recompute_value_leaf_sets_prior() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.33, 3, None);
         mcts.insert_node(3, node);
@@ -498,9 +472,9 @@ mod tests {
 
     #[test]
     fn test_puct_scores_and_select_puct() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         // one action with prior 1.0
-        let priors = make_priors(&[(0usize, 1.0f32)]);
+        let priors = make_priors(&[(0 as Action, 1.0f32)]);
         let node = Node::new(priors.clone(), 0.5, 4, None);
         mcts.insert_node(4, node);
 
@@ -517,8 +491,8 @@ mod tests {
 
     #[test]
     fn test_select_action() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
-        let priors = make_priors(&[(0usize, 0.5f32), (1usize, 0.5f32)]);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
+        let priors = make_priors(&[(0 as Action, 0.5f32), (1 as Action, 0.5f32)]);
         let mut node = Node::new(priors.clone(), 0.0, 5, None);
         node.edge_visits.insert(0, 10);
         node.edge_visits.insert(1, 20);
@@ -530,8 +504,8 @@ mod tests {
 
     #[test]
     fn test_select_action_is_none_if_no_visits() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
-        let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.8f32)]);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
+        let priors = make_priors(&[(0 as Action, 0.2f32), (1 as Action, 0.8f32)]);
         let node = Node::new(priors.clone(), 0.0, 6, None);
         mcts.insert_node(6, node);
         let node = mcts.get_node_mut(6).unwrap().clone();
@@ -541,8 +515,8 @@ mod tests {
 
     #[test]
     fn test_add_child_inserts_mapping() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
-        let parent_priors = make_priors(&[(0usize, 1.0f32)]);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
+        let parent_priors = make_priors(&[(0 as Action, 1.0f32)]);
         let parent = Node::new(parent_priors, 0.0, 10, None);
         let child = Node::new(make_priors(&[]), 0.0, 11, None);
         mcts.insert_node(10, parent);
@@ -560,7 +534,7 @@ mod tests {
 
     #[test]
     fn test_add_and_revert_virtual_losses() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.0, 20, None);
         mcts.insert_node(20, node);
@@ -580,7 +554,7 @@ mod tests {
 
     #[test]
     fn test_add_and_revert_penalties() {
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let priors = make_priors(&[]);
         let node = Node::new(priors, 0.0, 21, None);
         mcts.insert_node(21, node);
@@ -600,7 +574,7 @@ mod tests {
 
     #[test]
     fn test_check_state_repeat() {
-        let mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let path = vec![(1, 0), (2, 1), (3, 0)];
         assert!(mcts.check_state_repeat(2, &path));
         assert!(!mcts.check_state_repeat(4, &path));
@@ -610,14 +584,14 @@ mod tests {
     fn test_expand_inserts_node_and_updates_parent() {
         let mut env = Environment::new(4, 4, 2);
         let root_hash = env.hash_state() as NodeId;
-        let valid_actions = env.valid_actions();
+        let valid_actions: Vec<Action> = env.valid_actions().into_iter().map(|a| a as Action).collect();
         let priors = make_priors_from_vec(valid_actions.clone());
         let value = -1.0f32;
         let action = valid_actions[0];
-        env.step(action);
+        env.step(action as usize);
         let leaf_hash = env.hash_state() as NodeId;
 
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let parent = Node::new(priors.clone(), value, root_hash, None);
         mcts.insert_node(root_hash, parent);
 
@@ -638,29 +612,29 @@ mod tests {
             h q[0];
             cx q[0],q[1];";
         // Build a high value path
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
         let mut env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
         let mut env_clone = env.clone();
         // First node
         let hash_1 = env.hash_state() as NodeId;
-        let valid_actions_1 = env.valid_actions();
+        let valid_actions_1: Vec<Action> = env.valid_actions().into_iter().map(|a| a as Action).collect();
         let priors_1 = make_priors_from_vec(valid_actions_1.clone());
         let value_1 = 1.0f32;
         let action_1 = valid_actions_1[0];
         let node_1 = Node::new(priors_1.clone(), value_1, hash_1, None);
         mcts.insert_node(hash_1, node_1);
         // Second node
-        env.step(action_1);
+        env.step(action_1 as usize);
         let hash_2 = env.hash_state() as NodeId;
-        let valid_actions_2 = env.valid_actions();
+        let valid_actions_2: Vec<Action> = env.valid_actions().into_iter().map(|a| a as Action).collect();
         let priors_2 = make_priors_from_vec(valid_actions_2.clone());
         let value_2 = 2.0f32;
         let action_2 = valid_actions_2[0];
         mcts.expand(hash_1, action_1, env.clone(), priors_2.clone(), value_2);
         // Third node
-        env.step(action_2);
+        env.step(action_2 as usize);
         let hash_3 = env.hash_state() as NodeId;
-        let valid_actions_3 = env.valid_actions();
+        let valid_actions_3: Vec<Action> = env.valid_actions().into_iter().map(|a| a as Action).collect();
         let priors_3 = make_priors_from_vec(valid_actions_3.clone());
         let value_3 = 3.0f32;
         mcts.expand(hash_2, action_2, env.clone(), priors_3.clone(), value_3);
@@ -680,8 +654,8 @@ mod tests {
 
     #[test]
     fn test_normalize_prior() {
-        let mcts: MCTS<Environment> = MCTS::new(0.0, 4, None);
-        let priors = make_priors(&[(0usize, 0.2f32), (1usize, 0.3f32), (2usize, 0.5f32)]);
+        let mcts: MCTS<Environment> = MCTS::new(0.0, 4);
+        let priors = make_priors(&[(0 as Action, 0.2f32), (1 as Action, 0.3f32), (2 as Action, 0.5f32)]);
         let actions = vec![0, 1];
         let normalized = mcts.normalize_prior(priors, actions.clone());
         let total: f32 = normalized.values().sum();
@@ -707,8 +681,8 @@ mod tests {
         let env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
 
         // Create MCTS and a trivial agent. Adjust terminal value / batch size to taste.
-        let mut mcts: MCTS<Environment> = MCTS::new(0.0_f32, 4usize, None);
-        let agent = DummyAgent::new(env.num_actions()); // 4 actions
+        let mut mcts: MCTS<Environment> = MCTS::new(0.0_f32, 4usize);
+        let agent = DummyAgent::new();
 
         // Run MCTS for a small number of steps.
         let root_node = mcts.run(&env, &agent, 10000usize);

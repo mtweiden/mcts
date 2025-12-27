@@ -1,0 +1,15 @@
+[package]
+name = "mcts-ipc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "mcts_ipc"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = { version = "0.27.2", features = ["extension-module"] }
+numpy = "0.27"
+anyhow = "1"
+
+mcts-core = { path = "../mcts-core" }

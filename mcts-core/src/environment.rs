@@ -1,5 +1,6 @@
 use crate::enums::Action;
 use crate::enums::Observation;
+use crate::enums::TokenId;
 
 /// Abstract Environment trait used by MCTS (single-threaded).
 /// Implement this trait for any concrete environment you want to run MCTS on.
@@ -26,7 +27,7 @@ pub trait Environment: Clone {
 // Provide an implementation for tilers_core::env::Environment so existing code works.
 impl Environment for tilers_core::env::Environment {
     fn step(&mut self, action: Action) {
-        tilers_core::env::Environment::step(self, action);
+        tilers_core::env::Environment::step(self, action as usize);
     }
 
     fn done(&self) -> bool {
@@ -34,12 +35,21 @@ impl Environment for tilers_core::env::Environment {
     }
 
     fn observation(&self) -> Observation {
-        // tilers_core::env::Environment::observation(self)
-        vec![0]
+        let (placement, obj_0) = tilers_core::env::Environment::get_tokens(self);
+        let obj_1 = tilers_core::env::Environment::get_objective_tokens(self, 1);
+        let valid_actions = tilers_core::env::Environment::valid_actions(self);
+        let p: Vec<TokenId> = placement.iter().map(|&x| x as TokenId).collect();
+        let o0: Vec<TokenId> = obj_0.iter().map(|&x| x as TokenId).collect();
+        let o1: Vec<TokenId> = obj_1.iter().map(|&x| x as TokenId).collect();
+        let va: Vec<Action> = valid_actions.iter().map(|&x| x as Action).collect();
+        Observation::from((p, o0, o1, self.height, self.width, va))
     }
 
     fn valid_actions(&self) -> Vec<Action> {
         tilers_core::env::Environment::valid_actions(self)
+            .into_iter()
+            .map(|a| a as u16)
+            .collect()
     }
 
     fn hash_state(&self) -> u64 {

@@ -104,18 +104,18 @@ mod tests {
 
     #[test]
     fn test_node_creation() {
-        let mut priors = HashMap::new();
-        priors.insert(0, 0.5);
-        priors.insert(1, 0.5);
+        let mut priors: HashMap<Action, f32> = HashMap::new();
+        priors.insert(0 as u16, 0.5);
+        priors.insert(1 as u16, 0.5);
         let node = Node::new(priors.clone(), 0.0, 1, None);
         assert_eq!(node.id, 1);
         assert_eq!(node.prior_probs, priors);
         assert_eq!(node.value_estimate, 0.0);
         assert_eq!(node.node_visits, 0);
         assert!(node.children.is_empty());
-        assert_eq!(node.edge_visits, HashMap::from([(0, 0), (1, 0)]));
-        assert_eq!(node.virtual_losses, HashMap::from([(0, 0), (1, 0)]));
-        assert_eq!(node.edge_penalties, HashMap::from([(0, 0.0), (1, 0.0)]));
+        assert_eq!(node.edge_visits, HashMap::from([(0 as u16, 0), (1 as u16, 0)]));
+        assert_eq!(node.virtual_losses, HashMap::from([(0 as u16, 0), (1 as u16, 0)]));
+        assert_eq!(node.edge_penalties, HashMap::from([(0 as u16, 0.0), (1 as u16, 0.0)]));
         assert_eq!(node.value, 0.0);
         assert!(!node.terminal_state);
     }
