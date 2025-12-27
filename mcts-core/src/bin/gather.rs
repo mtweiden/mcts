@@ -4,6 +4,7 @@ use std::io::Write;
 use json::JsonValue;
 use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
+use rand::Rng;
 
 use mcts_core::enums::Action;
 use mcts_core::{Arena, InferenceClient, IpcClient, MCTS};
@@ -243,12 +244,17 @@ fn main() {
     );
 
     loop {
-        let mut env = Environment::new(height, width, num_blanks);
-        env.random_start(num_objectives, false);
+        let mut rng = rand::rng();
+        let h = rng.random_range(1..=height);
+        let w = rng.random_range(1..=width);
+        let nb = rng.random_range(1..=num_blanks);
+        let no = rng.random_range(2..=num_objectives);
+        let mut env = Environment::new(h, w, nb);
+        env.random_start(no, false);
         let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
         println!(
-            "Gatherer {} completed an episode: solution depth = {}, reference depth = {}",
-            worker_id, sol_depth, ref_depth
+           "Gatherer {} completed an episode: solution depth = {}, reference depth = {}",
+           worker_id, sol_depth, ref_depth
         );
     }
 }
