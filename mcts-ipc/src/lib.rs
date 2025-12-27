@@ -76,6 +76,29 @@ impl PyArena {
         let arena_obj: Py<PyArena> = slf.into_pyobject(py)?.unbind();
         Py::new(py, PySlotView { arena: arena_obj, slot, ptr })
     }
+
+    /// Try to pop a ready slot and return a view into its shared-memory data (non-blocking).
+    #[pyo3(signature = (handler, clear_outputs=false))]
+    pub fn try_pop_ready_view<'py>(
+        slf: PyRef<'py, Self>,
+        py: Python<'py>,
+        handler: usize,
+        clear_outputs: bool,
+    ) -> PyResult<Option<Py<PySlotView>>> {
+        // Non-blocking pop from the arena ready queue.
+        if let Some(slot) = slf.arena.try_pop_ready(handler) {
+            if clear_outputs {
+                slf.arena.clear_outputs(slot);
+            }
+            let ptr = slf.arena.slot_ptr(slot);
+            // convert the PyRef into a Py<PyArena> to keep the arena alive while the view exists
+            let arena_obj: Py<PyArena> = slf.into_pyobject(py)?.unbind();
+            let view = Py::new(py, PySlotView { arena: arena_obj, slot, ptr })?;
+            Ok(Some(view))
+        } else {
+            Ok(None)
+        }
+    }
 }
 
 #[pyclass(unsendable)]

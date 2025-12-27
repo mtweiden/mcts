@@ -492,6 +492,12 @@ impl Arena {
         self.header().ready_q[h].pop_blocking()
     }
 
+    pub fn try_pop_ready(&self, handler: usize) -> Option<u32> {
+        let n = self.header().num_handlers as usize;
+        let h = handler % n;
+        self.header().ready_q[h].try_pop()
+    }
+
     pub fn mark_done(&self, slot: u32) {
         let s = unsafe { &*self.slot_ptr(slot) };
         s.state.store(SLOT_DONE, Ordering::Release);
