@@ -26,6 +26,7 @@ pub struct IpcClient {
     arena: Arena,
     owner_id: u32,
     next_req_id: AtomicU64,
+    print_timing: bool,
 }
 
 impl IpcClient {
@@ -34,6 +35,7 @@ impl IpcClient {
             arena,
             owner_id,
             next_req_id: AtomicU64::new(0),
+            print_timing: false,
         }
     }
 
@@ -159,7 +161,7 @@ impl InferenceClient for IpcClient {
         }
 
         // Optional: print timing info for instrumentation.
-        {
+        if self.print_timing {
             let sr = self.arena.slot(slot_idx);
             let handler_start = sr.slot.handler_start_time_ns.load(Ordering::Acquire);
             let request_time = sr.slot.request_time_ns.load(Ordering::Acquire);
@@ -169,7 +171,7 @@ impl InferenceClient for IpcClient {
                 handler_start - request_time,
                 response_time - handler_start,
             );
-        }
+        };
         self.arena.release_slot(slot_idx);
         Ok(())
     }
