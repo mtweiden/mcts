@@ -83,38 +83,41 @@ def do_work(arena: PyArena, handler_id: int) -> None:
         masks_list = []
         hs = []
         ws = []
+        slot_batch_sizes = []
 
         for sv in slot_views:
-            p = np.asarray(sv.placement())
-            # trim trailing zeros per-row by slicing later after computing max len
+            p = np.asarray(sv.placement())        # shape (b_i, GRID_MAX)
             placements_list.append(p)
-            obj0_list.append(np.asarray(sv.obj0()))
-            obj1_list.append(np.asarray(sv.obj1()))
-            masks_list.append(np.asarray(sv.action_mask()))
-            hs.append(int(np.asarray(sv.h())[0]))
-            ws.append(int(np.asarray(sv.w())[0]))
+            obj0_list.append(np.asarray(sv.obj0()))        # (b_i, MAX_OBJ0)
+            obj1_list.append(np.asarray(sv.obj1()))        # (b_i, MAX_OBJ1)
+            masks_list.append(np.asarray(sv.action_mask()))# (b_i, NUM_ACTIONS)
+            h_arr = np.asarray(sv.h()).tolist()             # (b_i,)
+            w_arr = np.asarray(sv.w()).tolist()
+            hs.extend(h_arr)
+            ws.extend(w_arr)
+            slot_batch_sizes.append(p.shape[0])
 
-        # compute max lengths and stack (vectorized, minimal Python loop)
-        placements_arr = np.stack(placements_list, axis=0)
-        p_lens = np.count_nonzero(placements_arr, axis=1)
+        # concatenate along the batch dimension to form a single large batch
+        placements_cat = np.concatenate(placements_list, axis=0)   # (total_obs, max_p)
+        p_lens = np.count_nonzero(placements_cat, axis=1)
         max_p = max(1, int(p_lens.max()))
-        placements_np = placements_arr[:, :max_p].astype(np.int32, copy=False)
+        placements_np = placements_cat[:, :max_p].astype(np.int32, copy=False)
         placements = torch.from_numpy(placements_np).to(DEVICE)
 
-        obj0_arr = np.stack(obj0_list, axis=0)
-        o0_lens = np.count_nonzero(obj0_arr, axis=1)
+        obj0_cat = np.concatenate(obj0_list, axis=0)
+        o0_lens = np.count_nonzero(obj0_cat, axis=1)
         max_o0 = max(1, int(o0_lens.max()))
-        obj0_np2 = obj0_arr[:, :max_o0].astype(np.int32, copy=False)
+        obj0_np2 = obj0_cat[:, :max_o0].astype(np.int32, copy=False)
         objectives_0 = torch.from_numpy(obj0_np2).to(DEVICE)
 
-        obj1_arr = np.stack(obj1_list, axis=0)
-        o1_lens = np.count_nonzero(obj1_arr, axis=1)
+        obj1_cat = np.concatenate(obj1_list, axis=0)
+        o1_lens = np.count_nonzero(obj1_cat, axis=1)
         max_o1 = max(1, int(o1_lens.max()))
-        obj1_np2 = obj1_arr[:, :max_o1].astype(np.int32, copy=False)
+        obj1_np2 = obj1_cat[:, :max_o1].astype(np.int32, copy=False)
         objectives_1 = torch.from_numpy(obj1_np2).to(DEVICE)
 
-        action_mask_np = np.stack(masks_list, axis=0)  # shape (b, NUM_ACTIONS)
-        action_masks = torch.from_numpy(action_mask_np.astype(bool, copy=False)).to(DEVICE)
+        action_mask_cat = np.concatenate(masks_list, axis=0)  # (total_obs, NUM_ACTIONS)
+        action_masks = torch.from_numpy(action_mask_cat.astype(bool, copy=False)).to(DEVICE)
 
         heights_t = tensor(hs, device=DEVICE, dtype=int32)
         widths_t = tensor(ws, device=DEVICE, dtype=int32)
@@ -132,18 +135,25 @@ def do_work(arena: PyArena, handler_id: int) -> None:
                 action_mask=action_masks,
             )
 
-        priors_np = priors_tensor.detach().cpu().numpy()
-        values_np = values_tensor.squeeze(-1).detach().cpu().numpy()
+        priors_np = priors_tensor.detach().cpu().numpy()   # (total_obs, NUM_ACTIONS)
+        values_np = values_tensor.squeeze(-1).detach().cpu().numpy()  # (total_obs,)
 
-        # write results back to each slot and mark done
-        for i, sv in enumerate(slot_views):
-            priors_arr = np.asarray(sv.priors())
-            values_arr = np.asarray(sv.values())
-            n = priors_np.shape[1]
-            priors_arr[:, :n] = np.where(priors_np[i:i+1, :n] > 1e-6, priors_np[i:i+1, :n], 0.0)
-            if n < priors_arr.shape[1]:
-                priors_arr[:, n:] = 0.0
-            values_arr[:] = values_np[i]
+        # reseparate outputs per-slot and write back
+        idx = 0
+        for slot_len, sv in zip(slot_batch_sizes, slot_views):
+            pri_slice = priors_np[idx: idx + slot_len]    # (slot_len, NUM_ACTIONS)
+            val_slice = values_np[idx: idx + slot_len]    # (slot_len,)
+            idx += slot_len
+
+            priors_arr = np.asarray(sv.priors())   # shape (b_slot, NUM_ACTIONS)
+            values_arr = np.asarray(sv.values())   # shape (b_slot,)
+
+            n_cols = pri_slice.shape[1]
+            priors_arr[:slot_len, :n_cols] = np.where(pri_slice > 1e-6, pri_slice, 0.0)
+            if n_cols < priors_arr.shape[1]:
+                priors_arr[:slot_len, n_cols:] = 0.0
+
+            values_arr[:slot_len] = val_slice
             sv.mark_done()
 
 # ------------------------------------------------------------------------------
@@ -157,5 +167,5 @@ if __name__ == "__main__":
     parser.add_argument("--handler_id", type=int, default=0)
     args = parser.parse_args()
     arena_name = f"{args.arena_name}_{args.num_slots}_{args.num_handlers}"
-    arena = PyArena(arena_name, num_slots, args.num_handlers)
+    arena = PyArena(arena_name, args.num_slots, args.num_handlers)
     do_work(arena, args.handler_id)
