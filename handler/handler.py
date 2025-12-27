@@ -19,8 +19,6 @@ ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
 BATCH_TIMEOUT = 0.005
-num_slots = 2048
-num_handlers = 2
 MAX_BATCH = 64  # tune to your system
 
 # ------------------------------------------------------------------------------
@@ -48,7 +46,7 @@ if ckpt is not None:
 # Inference endpoint
 # ------------------------------------------------------------------------------
 
-def do_work(arena: PyArena, handler_id: int) -> None:
+def do_work(arena: PyArena, handler_id: int, device: str) -> None:
     while True:
         try:
             # block for first request
@@ -98,25 +96,25 @@ def do_work(arena: PyArena, handler_id: int) -> None:
         p_lens = np.count_nonzero(placements_cat, axis=1)
         max_p = max(1, int(p_lens.max()))
         placements_np = placements_cat[:, :max_p].astype(np.int32, copy=False)
-        placements = torch.from_numpy(placements_np).to(DEVICE)
+        placements = torch.from_numpy(placements_np).to(device)
 
         obj0_cat = np.concatenate(obj0_list, axis=0)
         o0_lens = np.count_nonzero(obj0_cat, axis=1)
         max_o0 = max(1, int(o0_lens.max()))
         obj0_np2 = obj0_cat[:, :max_o0].astype(np.int32, copy=False)
-        objectives_0 = torch.from_numpy(obj0_np2).to(DEVICE)
+        objectives_0 = torch.from_numpy(obj0_np2).to(device)
 
         obj1_cat = np.concatenate(obj1_list, axis=0)
         o1_lens = np.count_nonzero(obj1_cat, axis=1)
         max_o1 = max(1, int(o1_lens.max()))
         obj1_np2 = obj1_cat[:, :max_o1].astype(np.int32, copy=False)
-        objectives_1 = torch.from_numpy(obj1_np2).to(DEVICE)
+        objectives_1 = torch.from_numpy(obj1_np2).to(device)
 
         action_mask_cat = np.concatenate(masks_list, axis=0)  # (total_obs, NUM_ACTIONS)
-        action_masks = torch.from_numpy(action_mask_cat.astype(bool, copy=False)).to(DEVICE)
+        action_masks = torch.from_numpy(action_mask_cat.astype(bool, copy=False)).to(device)
 
-        heights_t = tensor(hs, device=DEVICE, dtype=int32)
-        widths_t = tensor(ws, device=DEVICE, dtype=int32)
+        heights_t = tensor(hs, device=device, dtype=int32)
+        widths_t = tensor(ws, device=device, dtype=int32)
 
         # model inference
         with no_grad():
@@ -156,7 +154,7 @@ def do_work(arena: PyArena, handler_id: int) -> None:
 if __name__ == "__main__":
     parser = ArgumentParser()
     parser.add_argument("--arena_name", type=str, default='mcts')
-    parser.add_argument("--num_slots", type=int, default=num_slots)
+    parser.add_argument("--num_slots", type=int, default=2048)
     parser.add_argument("--num_handlers", type=int, default=1)
     parser.add_argument("--handler_id", type=int, default=0)
     args = parser.parse_args()
@@ -173,4 +171,4 @@ if __name__ == "__main__":
 
     arena_name = f"{args.arena_name}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
-    do_work(arena, args.handler_id)
+    do_work(arena, args.handler_id, device)
