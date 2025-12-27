@@ -249,6 +249,7 @@ fn main() {
         let w = rng.random_range(1..=width);
         let nb = rng.random_range(1..=num_blanks);
         let no = rng.random_range(2..=num_objectives);
+        if nb >= (h * w) - 1 || (h <= 2 && w <= 2) { continue; }
         let mut env = Environment::new(h, w, nb);
         env.random_start(no, false);
         let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
