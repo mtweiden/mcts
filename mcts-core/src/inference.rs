@@ -37,6 +37,11 @@ impl IpcClient {
         }
     }
 
+    pub fn set_handler_start_time(&self, slot_idx: u32) {
+        let sm = self.arena.slot_mut(slot_idx);
+        sm.slot.handler_start_time_ns.store(now_ns(), Ordering::Release);
+    }
+
     #[inline]
     fn copy_req_into_slot(req: &RequestScratchPad, b: usize, slot: &mut Slot) -> Result<()> {
         if b == 0 || b > MAX_BATCH {
