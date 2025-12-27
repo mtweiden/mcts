@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 
 use crate::comms::{RequestScratchPad, ResponseScratchPad};
 use crate::enums::{GRID_MAX, MAX_BATCH, MAX_OBJ0, MAX_OBJ1, NUM_ACTIONS};
-use crate::ipc_core::{Arena, Slot, SLOT_DONE, SLOT_READY};
+use crate::ipc_core::{now_ns, Arena, Slot, SLOT_DONE, SLOT_READY};
 
 // ---------------------------------------------------------------------------------------------
 // Generic inference boundary trait
@@ -35,6 +35,11 @@ impl IpcClient {
             owner_id,
             next_req_id: AtomicU64::new(0),
         }
+    }
+
+    pub fn set_handler_start_time(&self, slot_idx: u32) {
+        let sm = self.arena.slot_mut(slot_idx);
+        sm.slot.handler_start_time_ns.store(now_ns(), Ordering::Release);
     }
 
     #[inline]
@@ -113,13 +118,11 @@ impl InferenceClient for IpcClient {
         // Write request
         {
             let sm = self.arena.slot_mut(slot_idx);
-
+            sm.slot.request_time_ns.store(now_ns(), Ordering::Release);
             sm.slot.b = b as u32;
             sm.slot.owner_id = self.owner_id;
             sm.slot.req_id = req_id;
-
             Self::copy_req_into_slot(req, b, sm.slot)?;
-
             // Publish READY after all writes.
             sm.slot.state.store(SLOT_READY, Ordering::Release);
         }
@@ -147,6 +150,10 @@ impl InferenceClient for IpcClient {
             debug_assert_eq!(sr.slot.state.load(Ordering::Acquire), SLOT_DONE);
 
             Self::copy_slot_into_resp(sr.slot, b, resp)?;
+        }
+        {
+            let sm = self.arena.slot_mut(slot_idx);
+            sm.slot.response_time_ns.store(now_ns(), Ordering::Release);
         }
 
         self.arena.release_slot(slot_idx);

@@ -1,4 +1,5 @@
 use std::slice::from_raw_parts;
+use std::sync::atomic::Ordering;
 use numpy::{Element, PyArray1, PyArray2};
 use pyo3::exceptions::{PyRuntimeError};
 use pyo3::prelude::*;
@@ -6,7 +7,7 @@ use pyo3::types::PyModule;
 use pyo3::Bound;
 
 use mcts_core::enums::{GRID_MAX, MAX_BATCH, MAX_OBJ0, MAX_OBJ1, NUM_ACTIONS};
-use mcts_core::ipc_core::{Arena, Slot};
+use mcts_core::ipc_core::{Arena, Slot, now_ns};
 
 use numpy::ndarray::Array2;
 use numpy::IntoPyArray;
@@ -125,6 +126,11 @@ impl PySlotView {
         }
     }
 
+    pub fn set_handler_start_time(&self) {
+        let s = unsafe { &*self.ptr };
+        s.handler_start_time_ns.store(now_ns(), Ordering::Release);
+    }
+
     // ---- inputs (views) ----
     pub fn h<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
         unsafe {
@@ -207,7 +213,6 @@ impl PySlotView {
         }
     }
 
-    /// Convenience: mark this slot done using the backing arena.
     pub fn mark_done(&self, py: Python<'_>) -> PyResult<()> {
         let arena_ref = self.arena.borrow(py);
         arena_ref.arena.mark_done(self.slot);

@@ -90,6 +90,8 @@ def do_work(handler_id: int) -> None:
         heights_t = tensor(h_np.astype(np.int32), device=DEVICE, dtype=int32)
         widths_t = tensor(w_np.astype(np.int32), device=DEVICE, dtype=int32)
 
+        sv.set_handler_start_time()
+
         with no_grad():
             priors_tensor, values_tensor = MODEL.infer(
                 placement=placements,

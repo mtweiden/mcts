@@ -1,13 +1,22 @@
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use memmap2::{MmapMut, MmapOptions};
+use libc::{clock_gettime, timespec, CLOCK_MONOTONIC};
 
 use crate::enums::{Action, Observation, Prior, TokenId, Value};
 use crate::enums::{GRID_MAX, MAX_BATCH, MAX_OBJ0, MAX_OBJ1, NUM_ACTIONS};
+
+pub fn now_ns() -> u64 {
+    unsafe {
+        let mut ts: timespec = std::mem::zeroed();
+        clock_gettime(CLOCK_MONOTONIC, &mut ts);
+        (ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)
+    }
+}
 
 // ---------------------------------------------------------------------------------------------
 // IPC Shared Memory Slot
@@ -37,7 +46,6 @@ pub struct Slot {
     pub w: [u8; MAX_BATCH],
     pub obj0_len: [u16; MAX_BATCH],
     pub obj1_len: [u16; MAX_BATCH],
-
     pub placement: [u16; MAX_BATCH * GRID_MAX],
     pub obj0: [u16; MAX_BATCH * MAX_OBJ0],
     pub obj1: [u16; MAX_BATCH * MAX_OBJ1],
@@ -46,6 +54,11 @@ pub struct Slot {
     // ----- outputs -----
     pub priors: [f32; MAX_BATCH * NUM_ACTIONS],
     pub values: [f32; MAX_BATCH],
+
+    // ----- timing -----
+    pub request_time_ns: AtomicU64,
+    pub handler_start_time_ns: AtomicU64,
+    pub response_time_ns: AtomicU64,
 }
 
 impl Slot {
