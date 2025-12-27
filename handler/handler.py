@@ -55,6 +55,7 @@ def do_work(arena: PyArena, handler_id: int) -> None:
         try:
             # block for first request
             first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
+            first_sv.set_handler_start_time()
         except KeyboardInterrupt:
             break
 
@@ -70,12 +71,10 @@ def do_work(arena: PyArena, handler_id: int) -> None:
                 # small sleep to avoid busy spin
                 time.sleep(0.0005)
                 continue
+            sv.set_handler_start_time()
             slot_views.append(sv)
 
         # Now convert collected slot_views into batched tensors
-        b = len(slot_views)
-        placement_np = np.asarray(slot_views[0].placement())[:b, :]  # will slice below per row
-        # gather numpy arrays for all slots
         placements_list = []
         obj0_list = []
         obj1_list = []
