@@ -2,10 +2,10 @@ import logging
 from pathlib import Path
 from argparse import ArgumentParser
 
+import time
 import numpy as np
-from torch import int32
-from torch import no_grad
-from torch import tensor
+import torch
+from torch import int32, no_grad, tensor
 from torch.cuda import is_available
 
 from tile import Agent
@@ -22,6 +22,7 @@ BATCH_TIMEOUT = 0.005
 DEVICE = "cuda" if is_available() else "cpu"
 num_slots = 2048
 num_handlers = 2
+MAX_BATCH = 32  # tune to your system
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -49,47 +50,76 @@ MODEL.to(DEVICE)
 # Inference endpoint
 # ------------------------------------------------------------------------------
 
-def do_work(handler_id: int, arena_name: str, num_handlers: int) -> None:
+def do_work(handler_id: int, arena_name: str) -> None:
     arena = PyArena(arena_name, num_slots, num_handlers)
     while True:
         try:
-            sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
+            # block for first request
+            first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
         except KeyboardInterrupt:
             break
 
-        # Read inputs from the shared slot view
-        placement_np = np.asarray(sv.placement())   # (b, GRID_MAX)
-        obj0_np = np.asarray(sv.obj0())             # (b, MAX_OBJ0)
-        obj1_np = np.asarray(sv.obj1())             # (b, MAX_OBJ1)
-        h_np = np.asarray(sv.h())                   # (b,)
-        w_np = np.asarray(sv.w())                   # (b,)
-        action_mask_np = np.asarray(sv.action_mask())  # (b, NUM_ACTIONS)
+        slot_views = [first_sv]
+        start = time.monotonic()
+        # try to gather additional ready slots until timeout or MAX_BATCH
+        while len(slot_views) < MAX_BATCH and (time.monotonic() - start) < BATCH_TIMEOUT:
+            # try_pop_ready_view is an assumed non-blocking API.
+            # If your PyArena doesn't expose one, implement a small helper on the Rust side
+            # that returns None immediately when no ready slot exists.
+            sv = arena.try_pop_ready_view(handler=handler_id, clear_outputs=True)
+            if sv is None:
+                # small sleep to avoid busy spin
+                time.sleep(0.0005)
+                continue
+            slot_views.append(sv)
 
-        # compute per-column/trailing-nonzero extents and slice once
-        placement_lens = np.count_nonzero(placement_np, axis=1)
-        max_p_len = int(max(1, placement_lens.max()))
-        placements_np = placement_np[:, :max_p_len].astype(np.int32, copy=False)
-        placements = tensor(placements_np, device=DEVICE, dtype=int32)  # shape (b, max_p_len)
+        # Now convert collected slot_views into batched tensors
+        b = len(slot_views)
+        placement_np = np.asarray(slot_views[0].placement())[:b, :]  # will slice below per row
+        # gather numpy arrays for all slots
+        placements_list = []
+        obj0_list = []
+        obj1_list = []
+        masks_list = []
+        hs = []
+        ws = []
 
-        # objectives
-        obj0_lens = np.count_nonzero(obj0_np, axis=1)
-        max_o0 = int(max(1, obj0_lens.max()))
-        obj0_np2 = obj0_np[:, :max_o0].astype(np.int32, copy=False)
-        objectives_0 = tensor(obj0_np2, device=DEVICE, dtype=int32)
+        for sv in slot_views:
+            p = np.asarray(sv.placement())
+            # trim trailing zeros per-row by slicing later after computing max len
+            placements_list.append(p)
+            obj0_list.append(np.asarray(sv.obj0()))
+            obj1_list.append(np.asarray(sv.obj1()))
+            masks_list.append(np.asarray(sv.action_mask()))
+            hs.append(int(np.asarray(sv.h())[0]))
+            ws.append(int(np.asarray(sv.w())[0]))
 
-        obj1_lens = np.count_nonzero(obj1_np, axis=1)
-        max_o1 = int(max(1, obj1_lens.max()))
-        obj1_np2 = obj1_np[:, :max_o1].astype(np.int32, copy=False)
-        objectives_1 = tensor(obj1_np2, device=DEVICE, dtype=int32)
+        # compute max lengths and stack (vectorized, minimal Python loop)
+        placements_arr = np.stack(placements_list, axis=0)
+        p_lens = np.count_nonzero(placements_arr, axis=1)
+        max_p = max(1, int(p_lens.max()))
+        placements_np = placements_arr[:, :max_p].astype(np.int32, copy=False)
+        placements = torch.from_numpy(placements_np).to(DEVICE)
 
-        action_masks = tensor(action_mask_np).to(DEVICE)
+        obj0_arr = np.stack(obj0_list, axis=0)
+        o0_lens = np.count_nonzero(obj0_arr, axis=1)
+        max_o0 = max(1, int(o0_lens.max()))
+        obj0_np2 = obj0_arr[:, :max_o0].astype(np.int32, copy=False)
+        objectives_0 = torch.from_numpy(obj0_np2).to(DEVICE)
 
-        # heights/widths
-        heights_t = tensor(h_np.astype(np.int32), device=DEVICE, dtype=int32)
-        widths_t = tensor(w_np.astype(np.int32), device=DEVICE, dtype=int32)
+        obj1_arr = np.stack(obj1_list, axis=0)
+        o1_lens = np.count_nonzero(obj1_arr, axis=1)
+        max_o1 = max(1, int(o1_lens.max()))
+        obj1_np2 = obj1_arr[:, :max_o1].astype(np.int32, copy=False)
+        objectives_1 = torch.from_numpy(obj1_np2).to(DEVICE)
 
-        sv.set_handler_start_time()
+        action_mask_np = np.stack(masks_list, axis=0)  # shape (b, NUM_ACTIONS)
+        action_masks = torch.from_numpy(action_mask_np.astype(bool, copy=False)).to(DEVICE)
 
+        heights_t = tensor(hs, device=DEVICE, dtype=int32)
+        widths_t = tensor(ws, device=DEVICE, dtype=int32)
+
+        # model inference
         with no_grad():
             priors_tensor, values_tensor = MODEL.infer(
                 placement=placements,
@@ -103,17 +133,16 @@ def do_work(handler_id: int, arena_name: str, num_handlers: int) -> None:
         priors_np = priors_tensor.detach().cpu().numpy()
         values_np = values_tensor.squeeze(-1).detach().cpu().numpy()
 
-        priors_arr = np.asarray(sv.priors())
-        values_arr = np.asarray(sv.values())
-
-        n = priors_np.shape[1]
-        priors_arr[:, :n] = np.where(priors_np[:, :] > 1e-6, priors_np[:, :], 0.0)
-        priors_arr[:, n:] = 0.0  # zero out any excess actions
-
-        values_arr[:] = values_np[:]
-
-        # mark slot done so producer can consume results
-        sv.mark_done()
+        # write results back to each slot and mark done
+        for i, sv in enumerate(slot_views):
+            priors_arr = np.asarray(sv.priors())
+            values_arr = np.asarray(sv.values())
+            n = priors_np.shape[1]
+            priors_arr[:, :n] = np.where(priors_np[i:i+1, :n] > 1e-6, priors_np[i:i+1, :n], 0.0)
+            if n < priors_arr.shape[1]:
+                priors_arr[:, n:] = 0.0
+            values_arr[:] = values_np[i]
+            sv.mark_done()
 
 # ------------------------------------------------------------------------------
 # Entry point
