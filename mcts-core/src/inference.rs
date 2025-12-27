@@ -168,8 +168,8 @@ impl InferenceClient for IpcClient {
             let response_time = sr.slot.response_time_ns.load(Ordering::Acquire);
             println!(
                 "request time: {}    response time: {}",
-                handler_start - request_time,
-                response_time - handler_start,
+                (handler_start - request_time) as f64 / 1e6,
+                (response_time - handler_start) as f64 / 1e6,
             );
         };
         self.arena.release_slot(slot_idx);
