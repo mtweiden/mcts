@@ -22,7 +22,7 @@ BATCH_TIMEOUT = 0.005
 DEVICE = "cuda" if is_available() else "cpu"
 num_slots = 2048
 num_handlers = 2
-MAX_BATCH = 32  # tune to your system
+MAX_BATCH = 64  # tune to your system
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -50,8 +50,7 @@ MODEL.to(DEVICE)
 # Inference endpoint
 # ------------------------------------------------------------------------------
 
-def do_work(handler_id: int, arena_name: str) -> None:
-    arena = PyArena(arena_name, num_slots, num_handlers)
+def do_work(arena: PyArena, handler_id: int) -> None:
     while True:
         try:
             # block for first request
@@ -75,6 +74,7 @@ def do_work(handler_id: int, arena_name: str) -> None:
 
         # Now convert collected slot_views into batched tensors
         b = len(slot_views)
+        print(b)
         placement_np = np.asarray(slot_views[0].placement())[:b, :]  # will slice below per row
         # gather numpy arrays for all slots
         placements_list = []
@@ -119,6 +119,8 @@ def do_work(handler_id: int, arena_name: str) -> None:
         heights_t = tensor(hs, device=DEVICE, dtype=int32)
         widths_t = tensor(ws, device=DEVICE, dtype=int32)
 
+        import pdb; pdb.set_trace()
+
         # model inference
         with no_grad():
             priors_tensor, values_tensor = MODEL.infer(
@@ -155,4 +157,5 @@ if __name__ == "__main__":
     parser.add_argument("--handler_id", type=int, default=0)
     args = parser.parse_args()
     arena_name = f"{args.arena_name}_{args.num_slots}_{args.num_handlers}"
-    do_work(args.handler_id, arena_name, args.num_handlers)
+    arena = PyArena(arena_name, num_slots, args.num_handlers)
+    do_work(arena, args.handler_id)
