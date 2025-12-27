@@ -19,7 +19,6 @@ ObsType = list[float]
 PriorType = dict[int, float]
 ValueType = float
 BATCH_TIMEOUT = 0.005
-DEVICE = "cuda" if is_available() else "cpu"
 num_slots = 2048
 num_handlers = 2
 MAX_BATCH = 64  # tune to your system
@@ -44,7 +43,6 @@ MODEL = Agent()
 ckpt = latest_checkpoint()
 if ckpt is not None:
     MODEL.load_state(ckpt)
-MODEL.to(DEVICE)
 
 # ------------------------------------------------------------------------------
 # Inference endpoint
@@ -162,6 +160,17 @@ if __name__ == "__main__":
     parser.add_argument("--num_handlers", type=int, default=1)
     parser.add_argument("--handler_id", type=int, default=0)
     args = parser.parse_args()
+
+    # choose GPU per handler process
+    if torch.cuda.is_available():
+        ngpu = torch.cuda.device_count()
+        device_idx = args.handler_id % ngpu
+        torch.cuda.set_device(device_idx)
+        device = f"cuda:{device_idx}"
+    else:
+        device = "cpu"
+    MODEL.to(device)
+
     arena_name = f"{args.arena_name}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
     do_work(arena, args.handler_id)
