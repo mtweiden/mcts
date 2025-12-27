@@ -167,7 +167,7 @@ impl SpinLock {
     }
 }
 
-pub const QCAP: usize = 1024;
+pub const QCAP: usize = 2048;
 
 /// A simpled fixed-size ring queue that stores slot indices for IPC.
 #[repr(C)]
