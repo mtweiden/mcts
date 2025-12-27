@@ -74,7 +74,6 @@ def do_work(arena: PyArena, handler_id: int) -> None:
 
         # Now convert collected slot_views into batched tensors
         b = len(slot_views)
-        print(b)
         placement_np = np.asarray(slot_views[0].placement())[:b, :]  # will slice below per row
         # gather numpy arrays for all slots
         placements_list = []
@@ -121,8 +120,6 @@ def do_work(arena: PyArena, handler_id: int) -> None:
 
         heights_t = tensor(hs, device=DEVICE, dtype=int32)
         widths_t = tensor(ws, device=DEVICE, dtype=int32)
-
-        import pdb; pdb.set_trace()
 
         # model inference
         with no_grad():
