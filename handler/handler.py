@@ -106,7 +106,10 @@ def do_work(handler_id: int) -> None:
         priors_arr = np.asarray(sv.priors())
         values_arr = np.asarray(sv.values())
 
-        priors_arr[:, :] = np.where(priors_np[:, :] > 1e-6, priors_np[:, :], 0.0)
+        n = priors_np.shape[1]
+        priors_arr[:, :n] = np.where(priors_np[:, :] > 1e-6, priors_np[:, :], 0.0)
+        priors_arr[:, n:] = 0.0  # zero out any excess actions
+
         values_arr[:] = values_np[:]
 
         # mark slot done so producer can consume results
