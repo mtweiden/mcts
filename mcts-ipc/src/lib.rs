@@ -171,6 +171,14 @@ impl PySlotView {
         }
     }
 
+    pub fn num_ancillas<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
+        unsafe {
+            let s = &mut *self.ptr;
+            let b = batch_len_from_slot(s);
+            Ok(view1(py, s.num_ancillas.as_mut_ptr(), b))
+        }
+    }
+
     pub fn obj0_len<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u16>>> {
         unsafe {
             let s = &mut *self.ptr;
