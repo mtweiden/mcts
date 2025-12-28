@@ -88,10 +88,10 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             masks_list.append(np.asarray(sv.action_mask()))# (b_i, NUM_ACTIONS)
             h_arr = np.asarray(sv.h()).tolist()             # (b_i,)
             w_arr = np.asarray(sv.w()).tolist()
-            ancillas_arr = np.asarray(sv.num_ancillas()).tolist()
-            hs.extend(h_arr)
-            ws.extend(w_arr)
-            num_ancillas.extend(ancillas_arr)
+            ancillas_arr = np.asarray(sv.num_ancillas()).tolist()  # type: ignore
+            hs.extend(h_arr)  # type: ignore
+            ws.extend(w_arr)  # type: ignore
+            num_ancillas.extend(ancillas_arr)  # type: ignore
             slot_batch_sizes.append(p.shape[0])
 
         # concatenate along the batch dimension to form a single large batch
@@ -118,6 +118,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
         heights_t = tensor(hs, device=device, dtype=int32)
         widths_t = tensor(ws, device=device, dtype=int32)
+        num_ancillas_t = tensor(num_ancillas, device=device, dtype=int32)
 
         # model inference
         with no_grad():
@@ -127,7 +128,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 lookahead_objectives=objectives_1,
                 heights=heights_t,
                 widths=widths_t,
-                num_
+                num_ancillas=num_ancillas_t,
                 action_mask=action_masks,
             )
 
