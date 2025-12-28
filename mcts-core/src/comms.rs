@@ -65,6 +65,7 @@ pub struct RequestScratchPad {
     pub max_batch: usize,
     pub h: Vec<u8>,
     pub w: Vec<u8>,
+    pub num_ancillas: Vec<u8>,
     pub obj0_len: Vec<u16>,
     pub obj1_len: Vec<u16>,
     pub placement: Vec<TokenId>,  // [B*GRID_MAX]
@@ -79,6 +80,7 @@ impl RequestScratchPad {
             max_batch,
             h: vec![0; max_batch],
             w: vec![0; max_batch],
+            num_ancillas: vec![0; max_batch],
             obj0_len: vec![0; max_batch],
             obj1_len: vec![0; max_batch],
             placement: vec![PAD_U16; max_batch * GRID_MAX],
@@ -93,6 +95,7 @@ impl RequestScratchPad {
         for (i, o) in obs.iter().enumerate() {
             self.h[i] = o.height as u8;
             self.w[i] = o.width as u8;
+            self.num_ancillas[i] = o.num_ancillas as u8;
 
             // placement
             let p = &mut self.placement[i * GRID_MAX..(i + 1) * GRID_MAX];
@@ -129,6 +132,7 @@ impl RequestScratchPad {
 
             let height = self.h[i] as usize;
             let width = self.w[i] as usize;
+            let num_ancillas = self.num_ancillas[i] as usize;
 
             let placement_start = i * GRID_MAX;
             let placement_end = (i + 1) * GRID_MAX;
@@ -170,6 +174,7 @@ impl RequestScratchPad {
             let obs = Observation {
                 height,
                 width,
+                num_ancillas,
                 placement,
                 objectives_0,
                 objectives_1,
