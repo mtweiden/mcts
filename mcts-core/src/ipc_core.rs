@@ -44,6 +44,7 @@ pub struct Slot {
     // ----- inputs -----
     pub h: [u8; MAX_BATCH],
     pub w: [u8; MAX_BATCH],
+    pub num_ancillas: [u8; MAX_BATCH],
     pub obj0_len: [u16; MAX_BATCH],
     pub obj1_len: [u16; MAX_BATCH],
     pub placement: [u16; MAX_BATCH * GRID_MAX],
@@ -73,6 +74,7 @@ impl Slot {
         for i in 0..b {
             let height = self.h[i] as usize;
             let width = self.w[i] as usize;
+            let num_ancillas = self.num_ancillas[i] as usize;
 
             // placement
             let placement_len = (height * width).min(GRID_MAX);
@@ -111,6 +113,7 @@ impl Slot {
                 objectives_1,
                 height,
                 width,
+                num_ancillas,
                 valid_actions,
             });
         }

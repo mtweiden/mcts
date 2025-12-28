@@ -39,26 +39,28 @@ pub struct Observation {
     pub objectives_1: Vec<TokenId>,
     pub height: usize,
     pub width: usize,
+    pub num_ancillas: usize,
     pub valid_actions: Vec<Action>,
 }
 
 /// Convenience conversions to/from the old tuple shape:
-impl From<(Vec<TokenId>, Vec<TokenId>, Vec<TokenId>, usize, usize, Vec<Action>)> for Observation {
-    fn from(t: (Vec<TokenId>, Vec<TokenId>, Vec<TokenId>, usize, usize, Vec<Action>)) -> Self {
+impl From<(Vec<TokenId>, Vec<TokenId>, Vec<TokenId>, usize, usize, usize, Vec<Action>)> for Observation {
+    fn from(t: (Vec<TokenId>, Vec<TokenId>, Vec<TokenId>, usize, usize, usize, Vec<Action>)) -> Self {
         Self {
             placement: t.0,
             objectives_0: t.1,
             objectives_1: t.2,
             height: t.3,
             width: t.4,
-            valid_actions: t.5,
+            num_ancillas: t.5,
+            valid_actions: t.6,
         }
     }
 }
 
-impl From<Observation> for (Vec<TokenId>, Vec<TokenId>, Vec<TokenId>, usize, usize, Vec<Action>) {
+impl From<Observation> for (Vec<TokenId>, Vec<TokenId>, Vec<TokenId>, usize, usize, usize, Vec<Action>) {
     fn from(o: Observation) -> Self {
-        (o.placement, o.objectives_0, o.objectives_1, o.height, o.width, o.valid_actions)
+        (o.placement, o.objectives_0, o.objectives_1, o.height, o.width, o.num_ancillas, o.valid_actions)
     }
 }
 
