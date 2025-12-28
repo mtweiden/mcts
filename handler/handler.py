@@ -79,6 +79,7 @@ def do_work(arena: PyArena, handler_id: int) -> None:
         masks_list = []
         hs = []
         ws = []
+        num_ancillas = []
         slot_batch_sizes = []
 
         for sv in slot_views:
@@ -89,8 +90,10 @@ def do_work(arena: PyArena, handler_id: int) -> None:
             masks_list.append(np.asarray(sv.action_mask()))# (b_i, NUM_ACTIONS)
             h_arr = np.asarray(sv.h()).tolist()             # (b_i,)
             w_arr = np.asarray(sv.w()).tolist()
+            ancillas_arr = np.asarray(sv.num_ancillas()).tolist()
             hs.extend(h_arr)
             ws.extend(w_arr)
+            num_ancillas.extend(ancillas_arr)
             slot_batch_sizes.append(p.shape[0])
 
         # concatenate along the batch dimension to form a single large batch
@@ -126,6 +129,7 @@ def do_work(arena: PyArena, handler_id: int) -> None:
                 lookahead_objectives=objectives_1,
                 heights=heights_t,
                 widths=widths_t,
+                num_
                 action_mask=action_masks,
             )
 
