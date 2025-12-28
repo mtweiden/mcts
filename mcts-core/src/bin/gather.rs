@@ -182,6 +182,7 @@ impl Gatherer {
             let mut record = JsonValue::new_object();
             record["height"] = game.height.into();
             record["width"] = game.width.into();
+            record["num_ancillas"] = game.num_ancillas.into();
             record["placement"] = placement_tokens_json;
             record["objectives_0"] = objectives_0_tokens_json;
             record["objectives_1"] = objectives_1_tokens_json;
