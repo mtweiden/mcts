@@ -1,5 +1,7 @@
 use crate::enums::Action;
 use crate::enums::NodeId;
+use crate::enums::Prior;
+use crate::enums::Value;
 use std::collections::HashMap;
 
 
@@ -7,8 +9,8 @@ use std::collections::HashMap;
 #[derive(Clone)]
 pub struct Node {
     pub id: NodeId,
-    pub prior_probs: HashMap<Action, f32>,
-    pub value_estimate: f32,
+    pub prior_probs: Prior,
+    pub value_estimate: Value,
     pub node_visits: usize,
     pub children: HashMap<Action, NodeId>,
     pub edge_visits: HashMap<Action, usize>,
