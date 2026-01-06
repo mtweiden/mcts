@@ -7,24 +7,20 @@ use crate::enums::TokenId;
 pub trait Environment: Clone {
     /// Apply the action to the environment (mutates self).
     fn step(&mut self, action: Action);
-
     /// Is the environment in a terminal state?
     fn done(&self) -> bool;
-
     /// Return the observation vector for the current state.
     fn observation(&self) -> Observation;
-
     /// Return the list of valid actions in the current state.
     fn valid_actions(&self) -> Vec<Action>;
-
     /// Return a compact hash / id for the current state.
     fn hash_state(&self) -> u64;
-
     /// Render a string representation (used for debugging / repr).
     fn render(&self) -> String;
 }
 
-// Provide an implementation for tilers_core::env::Environment so existing code works.
+/// A Concrete example
+/// Provides an implementation for tilers_core::env::Environment so existing code works.
 impl Environment for tilers_core::env::Environment {
     fn step(&mut self, action: Action) {
         tilers_core::env::Environment::step(self, action as usize);
