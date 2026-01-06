@@ -2,6 +2,7 @@
 members = [
   "mcts-core",
   "mcts-ipc",
+  "pymcts",
 ]
 
 [profile.release]
