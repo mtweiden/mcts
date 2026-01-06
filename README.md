@@ -39,7 +39,48 @@ impl Environment for tilers_core::env::Environment {
 ```
 
 # `mcts-ipc`
-This directory contains shim code so that Python processes can communicate over shared memory IPC. This lets neural networks defined in, say, PyTorch communicate with the rust MCTS code.
+This directory contains shim code so that Python processes can handle inference requests when MCTS is running in rust. This lets neural networks defined in, say, PyTorch communicate with the rust MCTS code.
+
+```python
+# Example handler code
+import numpy as np
+from mcts_ipc import PyArena
+
+name = 'example_mcts'  # Needs to match name that gatherers use
+# num_slots should almost always just be the default
+# num_handlers should be close to the number of GPUs used for inference
+num_slots = 2048
+num_handlers = 2
+arena = PyArena(name, num_slots=num_slots, num_handlers=num_handlers)
+
+# Assume this is handler 0. Launch another similar process with id = 1.
+handler_id = 0
+while True:
+    # Get next ready slot of data
+    sv = arena.pop_ready_view(handler=handler_id)
+    # input information
+    action_mask = np.asarray(sv.action_mask())  # shape (b, NUM_ACTIONS)
+    done = np.sum(np.asarray(sv.obj0())) == 0   # shape (b, MAX_OBJ0)
+    # output information
+    priors = np.asarray(sv.priors())  # shape (b, NUM_ACTIONS)
+    values = np.asarray(sv.values())  # shape (b,)
+    priors[:] = 0.0
+    # Doing "inference"...
+    # Otherwise put PyTorch inference code here
+    b, n = priors.shape
+    for j in range(b):
+        norm = np.sum(action_mask[j])
+        for k in range(n):
+            if action_mask[j, k]:
+                priors[j, k] = 1.0 / norm
+        if done:
+            values[j] = 1.0
+        else:
+            values[j] = -1.0
+    # Let gatherers know that inference is done
+    sv.mark_done()
+```
+
 
 # `pymcts`
 Enables MCTS to be run with Python environments and Agents.
