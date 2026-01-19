@@ -113,6 +113,7 @@ impl Gatherer {
         // Only consider the first two layers of gates
         let mut game = env.clone();
         game.drop_objectives_beyond_nth_layer(2);
+        game.set_cultivation_time(10);
         let reference_depth = self.solve_with_heuristic(&mut game);
 
         // Set up data storage
