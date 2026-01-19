@@ -248,6 +248,10 @@ fn main() {
         let mut rng = rand::rng();
         let h = rng.random_range(1..=height);
         let w = rng.random_range(1..=width);
+        let dim_max = h.max(w);
+        let dim_min = h.min(w);
+        let h = dim_min;
+        let w = dim_max;
         let nb = rng.random_range(1..=num_blanks);
         let no = rng.random_range(2..=num_objectives);
         if nb >= (h * w) - 1 || (h <= 2 && w <= 2) { continue; }
