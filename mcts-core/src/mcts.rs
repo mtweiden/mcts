@@ -588,7 +588,7 @@ mod tests {
         let priors = make_priors_from_vec(valid_actions.clone());
         let value = -1.0f32;
         let action = valid_actions[0];
-        env.step(action as usize);
+        let _ = env.step(action as usize);
         let leaf_hash = env.hash_state() as NodeId;
 
         let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
@@ -613,7 +613,7 @@ mod tests {
             cx q[0],q[1];";
         // Build a high value path
         let mut mcts: MCTS<Environment> = MCTS::new(0.0, 4);
-        let mut env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
+        let mut env = Environment::from_qasm(qasm, 2, Some(4), Some(4)).unwrap();
         let mut env_clone = env.clone();
         // First node
         let hash_1 = env.hash_state() as NodeId;
@@ -624,7 +624,7 @@ mod tests {
         let node_1 = Node::new(priors_1.clone(), value_1, hash_1, None);
         mcts.insert_node(hash_1, node_1);
         // Second node
-        env.step(action_1 as usize);
+        let _ = env.step(action_1 as usize);
         let hash_2 = env.hash_state() as NodeId;
         let valid_actions_2: Vec<Action> = env.valid_actions().into_iter().map(|a| a as Action).collect();
         let priors_2 = make_priors_from_vec(valid_actions_2.clone());
@@ -632,7 +632,7 @@ mod tests {
         let action_2 = valid_actions_2[0];
         mcts.expand(hash_1, action_1, env.clone(), priors_2.clone(), value_2);
         // Third node
-        env.step(action_2 as usize);
+        let _ = env.step(action_2 as usize);
         let hash_3 = env.hash_state() as NodeId;
         let valid_actions_3: Vec<Action> = env.valid_actions().into_iter().map(|a| a as Action).collect();
         let priors_3 = make_priors_from_vec(valid_actions_3.clone());
@@ -678,7 +678,7 @@ mod tests {
         ";
 
         // Build the environment. from_qasm takes Option<usize> for height/width.
-        let env = Environment::from_qasm(qasm, 2, Some(4), Some(4));
+        let env = Environment::from_qasm(qasm, 2, Some(4), Some(4)).unwrap();
 
         // Create MCTS and a trivial agent. Adjust terminal value / batch size to taste.
         let mut mcts: MCTS<Environment> = MCTS::new(0.0_f32, 4usize);
