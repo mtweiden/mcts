@@ -121,11 +121,20 @@ impl Gatherer {
         // Compute how much depth is left to be added after each action
         for i in 0..agent_actions.len() {
 
-            // Determine the depth of the alternate agent's solution from this state
-            let ref_depth = self.solve_with_heuristic(&env);
-
             // Starting at environment state after action i-1
             env.executed_objectives.clear();
+
+            // Make sure we're not in a scenario where the heuristic solver is unable
+            // to take any moves.
+            let valid_actions = env.valid_actions();
+            let ref_depth = if !valid_actions.contains(&0) && !valid_actions.iter().any(|&a| a > env.num_ancillas) {
+                let mut temp_env = env.clone();
+                temp_env.clear_cultivated_resources();
+                self.solve_with_heuristic(&temp_env)
+            } else {
+                // Determine the depth of the alternate agent's solution from this state
+                self.solve_with_heuristic(&env)
+            };
 
             // Determine the depth of the agent-in-question's solution from this state
             let mut temp_env = env.clone();
@@ -134,15 +143,14 @@ impl Gatherer {
                 let _ = temp_env.step(*ac);
                 temp_env.finish_cultivating();
             }
+
             let agent_depth = temp_env.depth(true);
 
             // Score this transition
-            let score = if env.done() || agent_depth < ref_depth { 
+            let score = if env.done() {
                 1.0
-            } else if agent_depth == ref_depth {
-                0.0
             } else {
-                -1.0
+                ((ref_depth - agent_depth) / 2.0).tanh()
             };
             scores.push(score);
 
@@ -183,23 +191,28 @@ impl Gatherer {
             // Select action and step the environment
             let action = self.select_action(&root, &game);
             let _ = game.step(action as usize);
+            game.finish_cultivating();  // Cultivate resources in a single step
             taken_actions.push(action as usize);
-            // Cultivate resources in a single step
-            game.finish_cultivating();
             if game.done() { break; }
         }
 
         // Do not save partial solutions
         if !game.done() { return (f32::INFINITY, reference_depth as f32); }
 
+        let solution_depth = game.depth(true);
+
         // Loss condition
-        let scores = self.score_transitions(env, &taken_actions);
+        let mut game = env.copy();
+        game.set_cultivation_time(10);
+        let scores = self.score_transitions(&game, &taken_actions);
         // Save data to output_path in NDJSON format
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.output_path)
             .expect("Unable to open output file");
+
+        writeln!(file, "\n").expect("Failed to write record");
 
         for (((p, o0, o1), va, ev), score) in zip(temp_data, scores) {
             // Build JSON using `json` crate (avoids serde_json)
@@ -242,7 +255,6 @@ impl Gatherer {
             let line = record.dump(); // compact JSON string
             writeln!(file, "{}", line).expect("Failed to write record");
          }
-         let solution_depth = game.depth(true);
          (solution_depth as f32, reference_depth as f32)
     }
 }
@@ -281,11 +293,13 @@ fn main() {
         }
     }
 
-    let arena_name = format!("mcts_{}_{}", num_slots, num_handlers);
+    // let arena_name = format!("mcts_{}_{}", num_slots, num_handlers);
+    let arena_name = "example_mcts".to_string();
     let arena = Arena::create_or_open(&arena_name, num_slots, num_handlers).unwrap();
     let client = IpcClient::new(arena, worker_id);
     // Spawn all gatherers as independent tasks
-    let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", worker_id);
+    // let output_path = format!("/pscratch/sd/m/mtweiden/tile_mcts/data/output-{}.json", worker_id);
+    let output_path = format!("output-{}.json", worker_id);
     let gatherer = Gatherer::new(
         8,         // inference batch size
         10_000,    // MCTS steps
@@ -303,7 +317,7 @@ fn main() {
         let h = dim_min;
         let w = dim_max;
         let nb = rng.random_range(1..=num_blanks);
-        let no = rng.random_range(2..=num_objectives);
+        let no = rng.random_range(1..=num_objectives);
         if nb >= (h * w) - 1 || (h <= 2 && w <= 2) { continue; }
         let mut env = Environment::new(h, w, nb);
         env.random_start(no, false);
