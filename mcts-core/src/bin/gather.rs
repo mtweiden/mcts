@@ -1,6 +1,7 @@
 use std::env;
 use std::collections::HashMap;
 use std::io::Write;
+use std::iter::zip;
 use json::JsonValue;
 use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
@@ -53,7 +54,7 @@ impl Gatherer {
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
-    pub fn solve_with_heuristic(&self, env: &mut Environment) -> f32 {
+    pub fn solve_with_heuristic(&self, env: &Environment) -> f32 {
         let mut solved_env = env.clone();
         solved_env.solve(true);
         solved_env.depth(true)
@@ -106,6 +107,52 @@ impl Gatherer {
         valid_actions[dist.sample(&mut rng)] as Action
     }
 
+    /// For each action taken, compare the agent's score to the heuristic's along every step of
+    /// the trajectory.
+    pub fn score_transitions(
+        &self,
+        base_env: &Environment,
+        agent_actions: &Vec<usize>,
+    ) -> Vec<f32> {
+        let mut scores: Vec<f32> = Vec::with_capacity(agent_actions.len() - 1);
+
+        let mut env = base_env.clone();
+
+        // Compute how much depth is left to be added after each action
+        for i in 0..agent_actions.len() {
+
+            // Determine the depth of the alternate agent's solution from this state
+            let ref_depth = self.solve_with_heuristic(&env);
+
+            // Starting at environment state after action i-1
+            env.executed_objectives.clear();
+
+            // Determine the depth of the agent-in-question's solution from this state
+            let mut temp_env = env.clone();
+            let remaining_actions = &agent_actions[i..];
+            for ac in remaining_actions {
+                let _ = temp_env.step(*ac);
+                temp_env.finish_cultivating();
+            }
+            let agent_depth = temp_env.depth(true);
+
+            // Score this transition
+            let score = if env.done() || agent_depth < ref_depth { 
+                1.0
+            } else if agent_depth == ref_depth {
+                0.0
+            } else {
+                -1.0
+            };
+            scores.push(score);
+
+            let ac = agent_actions[i];
+            let _ = env.step(ac);
+            env.finish_cultivating();
+        }
+        scores
+    }
+
     pub fn gather(&self, env: &Environment, client: &dyn InferenceClient) -> (f32, f32) {
         // Set up MCTS and Agent and copy the Environment
         let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.batch_size);
@@ -120,32 +167,33 @@ impl Gatherer {
         // Format: ((placement, objectives_0, objectives_1), valid_actions, visit_counts)
         let mut temp_data: Vec<((Vec<usize>, Vec<usize>, Vec<usize>), Vec<usize>, HashMap<Action, usize>)> = Vec::new();
 
+        let mut taken_actions = vec![];
         for _ in 0..self.max_actions {
             // Run MCTS
             let root = mcts.run(&game , client, self.mcts_steps);
 
             // Store the data
-            let (placement, objectives_0) = game.get_tokens();
-            let objectives_1 = game.get_objective_tokens(1);
+            let placement = game.get_placement_tokens().unwrap();
+            let objectives_0 = game.get_objective_tokens(0).unwrap();
+            let objectives_1 = game.get_objective_tokens(1).unwrap();
             let edge_visits = root.edge_visits.clone();
             let valid_actions = game.valid_actions();
             temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
 
             // Select action and step the environment
             let action = self.select_action(&root, &game);
-            game.step(action as usize);
+            let _ = game.step(action as usize);
+            taken_actions.push(action as usize);
+            // Cultivate resources in a single step
+            game.finish_cultivating();
             if game.done() { break; }
         }
 
+        // Do not save partial solutions
+        if !game.done() { return (f32::INFINITY, reference_depth as f32); }
+
         // Loss condition
-        let solution_depth = game.depth(true);
-        let reward =  if !game.done() || solution_depth > reference_depth {
-            -1.0
-        } else if solution_depth == reference_depth{
-            0.0
-        } else {
-            1.0
-        };
+        let scores = self.score_transitions(env, &taken_actions);
         // Save data to output_path in NDJSON format
         let mut file = std::fs::OpenOptions::new()
             .create(true)
@@ -153,30 +201,30 @@ impl Gatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        for ((placement, objectives_0, objectives_1), valid_actions, edge_visits) in temp_data {
+        for (((p, o0, o1), va, ev), score) in zip(temp_data, scores) {
             // Build JSON using `json` crate (avoids serde_json)
             let mut placement_tokens_json = JsonValue::new_array();
-            for t in placement {
+            for t in p {
                 placement_tokens_json.push(t).expect("failed to push token");
             }
 
             let mut valid_actions_json = JsonValue::new_array();
-            for ac in valid_actions {
-                valid_actions_json.push(ac).expect("failed to push token");
+            for a in va {
+                valid_actions_json.push(a).expect("failed to push token");
             }
 
             let mut objectives_0_tokens_json = JsonValue::new_array();
-            for t in objectives_0 {
+            for t in o0 {
                 objectives_0_tokens_json.push(t).expect("failed to push token");
             }
 
             let mut objectives_1_tokens_json = JsonValue::new_array();
-            for t in objectives_1 {
+            for t in o1 {
                 objectives_1_tokens_json.push(t).expect("failed to push token");
             }
 
             let mut visits_json = JsonValue::new_object();
-            for (action, count) in edge_visits {
+            for (action, count) in ev {
                 visits_json[action.to_string()] = count.into();
             }
 
@@ -189,11 +237,12 @@ impl Gatherer {
             record["objectives_1"] = objectives_1_tokens_json;
             record["valid_actions"] = valid_actions_json;
             record["edge_visits"] = visits_json;
-            record["reward"] = reward.into();
+            record["reward"] = score.into();
 
             let line = record.dump(); // compact JSON string
             writeln!(file, "{}", line).expect("Failed to write record");
          }
+         let solution_depth = game.depth(true);
          (solution_depth as f32, reference_depth as f32)
     }
 }
@@ -242,13 +291,13 @@ fn main() {
         10_000,    // MCTS steps
         80,       // max actions
         output_path,
-        0.25,  // noise strength
+        0.10,  // noise strength
     );
 
     loop {
         let mut rng = rand::rng();
-        let h = rng.random_range(1..=height);
-        let w = rng.random_range(1..=width);
+        let h = rng.random_range(2..=height);
+        let w = rng.random_range(2..=width);
         let dim_max = h.max(w);
         let dim_min = h.min(w);
         let h = dim_min;
