@@ -23,7 +23,8 @@ pub trait Environment: Clone {
 /// Provides an implementation for tilers_core::env::Environment so existing code works.
 impl Environment for tilers_core::env::Environment {
     fn step(&mut self, action: Action) {
-        tilers_core::env::Environment::step(self, action as usize);
+        let _ = tilers_core::env::Environment::step(self, action as usize);
+        tilers_core::env::Environment::finish_cultivating(self);
     }
 
     fn done(&self) -> bool {
@@ -31,8 +32,9 @@ impl Environment for tilers_core::env::Environment {
     }
 
     fn observation(&self) -> Observation {
-        let (placement, obj_0) = tilers_core::env::Environment::get_tokens(self);
-        let obj_1 = tilers_core::env::Environment::get_objective_tokens(self, 1);
+        let placement = tilers_core::env::Environment::get_placement_tokens(self).unwrap();
+        let obj_0 = tilers_core::env::Environment::get_objective_tokens(self, 0).unwrap();
+        let obj_1 = tilers_core::env::Environment::get_objective_tokens(self, 1).unwrap();
         let valid_actions = tilers_core::env::Environment::valid_actions(self);
         let p: Vec<TokenId> = placement.iter().map(|&x| x as TokenId).collect();
         let o0: Vec<TokenId> = obj_0.iter().map(|&x| x as TokenId).collect();
