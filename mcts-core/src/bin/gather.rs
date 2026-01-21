@@ -269,6 +269,7 @@ fn main() {
     // IPC parameters
     let mut worker_id = 0;
     let mut num_handlers = 1;
+    let mut num_shuffles = 0;
     let num_slots = 2048;
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -290,6 +291,9 @@ fn main() {
         }
         if args[i] == "--num_handlers" && i + 1 < args.len() {
             num_handlers = args[i + 1].parse().unwrap_or(1);
+        }
+        if args[i] == "--num_shuffles" && i + 1 < args.len() {
+            num_shuffles = args[i + 1].parse().unwrap_or(0);
         }
     }
 
@@ -320,7 +324,8 @@ fn main() {
         let no = rng.random_range(1..=num_objectives);
         if nb >= (h * w) - 1 || (h <= 2 && w <= 2) { continue; }
         let mut env = Environment::new(h, w, nb);
-        env.random_start(no, false);
+        env.random_objectives(no, false);
+        env.shuffle(num_shuffles);
         let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
         println!(
            "Gatherer {} completed an episode: solution depth = {}, reference depth = {}",
