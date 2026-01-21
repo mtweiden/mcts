@@ -16,7 +16,7 @@ pub fn run_producer(producer_id: usize, arena_name: &str, num_slots: usize, num_
         while !env.done() {
             let node = mcts.run(&env, &client, 10000);
             let action = node.select_action().unwrap();
-            env.step(action as usize);
+            let _ = env.step(action as usize);
             println!("{}", env.render());
         }
     }
