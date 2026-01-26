@@ -328,8 +328,8 @@ fn main() {
         env.shuffle(num_shuffles);
         let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
         println!(
-           "Gatherer {} completed an episode: solution depth = {}, reference depth = {}",
-           worker_id, sol_depth, ref_depth
+           "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): solution depth = {}, reference depth = {}",
+           worker_id, h, w, nb, no, sol_depth, ref_depth
         );
     }
 }
