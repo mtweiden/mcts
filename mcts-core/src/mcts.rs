@@ -106,11 +106,12 @@ impl<E: EnvTrait> MCTS<E> {
         value: Value,
     ) -> NodeId {
         let node_id = self.get_hash(env);
-        let repr = env.render();
+        // let repr = Some(env.render());
+        let repr = None;
         let node = if env.done() {
-            Node::new_terminal(node_id, self.terminal_value, Some(repr))
+            Node::new_terminal(node_id, self.terminal_value, repr)
         } else {
-            Node::new(priors, value, node_id, Some(repr))
+            Node::new(priors, value, node_id, repr)
         };
         self.insert_node(node_id, node);
         node_id
