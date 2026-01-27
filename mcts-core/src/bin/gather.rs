@@ -6,6 +6,7 @@ use json::JsonValue;
 use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
 use rand::Rng;
+use rand::seq::SliceRandom;
 
 use mcts_core::enums::Action;
 use mcts_core::{Arena, InferenceClient, IpcClient, MCTS};
@@ -260,6 +261,23 @@ impl Gatherer {
 }
 
 
+pub fn shuffle_ancilla<'a>(env: &'a mut Environment, rng: &mut impl Rng) -> &'a Environment {
+    let qubits = env.placement.qubits.clone();
+    let ancilla_indices: Vec<usize> = (0..qubits.len())
+        .filter(|&i| qubits[i].is_ancilla())
+        .collect();
+    let mut shuffled_ancilla_indices = ancilla_indices.clone();
+    shuffled_ancilla_indices.shuffle(rng);
+    let mut new_qubits = qubits.clone();
+
+    for (orig_idx, shuffled_idx) in zip(ancilla_indices.iter(), shuffled_ancilla_indices.iter()) {
+        new_qubits[*orig_idx] = qubits[*shuffled_idx].clone();
+    }
+    env.set_layout(new_qubits).unwrap();
+    env
+}
+
+
 fn main() {
     // Environment parameters
     let mut height = 4;
@@ -326,6 +344,7 @@ fn main() {
         let mut env = Environment::new(h, w, nb);
         env.random_objectives(no, false);
         env.shuffle(num_shuffles);
+        shuffle_ancilla(&mut env, &mut rng);
         let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
         println!(
            "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): solution depth = {}, reference depth = {}",
