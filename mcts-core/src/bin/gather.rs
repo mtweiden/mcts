@@ -154,7 +154,9 @@ impl Gatherer {
             let score = if next_env.done() {
                 1.0f32
             } else {
-                ((ref_depth - agent_depth) / 2.0).tanh()
+                // Small bias so recreating the heuristic's actions is not neutral but
+                // slightly rewarded.
+                ((0.1 + ref_depth - agent_depth) / 2.0).tanh()
             };
             scores.push(score);
 
