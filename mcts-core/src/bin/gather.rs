@@ -181,7 +181,7 @@ impl Gatherer {
         scores
     }
 
-    pub fn gather(&self, env: &Environment, client: &dyn InferenceClient) -> (f32, f32) {
+    pub fn gather(&self, env: &Environment, client: &dyn InferenceClient) -> (f32, f32, bool) {
         // Set up MCTS and Agent and copy the Environment
         let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.batch_size);
 
@@ -216,25 +216,48 @@ impl Gatherer {
             if game.done() { break; }
         }
 
-        // Do not save partial solutions
-        if !game.done() { return (f32::INFINITY, reference_depth as f32); }
+        let mut scores: Vec<f32> = Vec::new();
+        // Use bootstrapping to determine value if not solved
+        let solution_depth = if !game.done() {
+            // If not solved, keep a bootstrapped partial example (heuristic estimate) instead of dropping it.
+            // heuristic estimate from current partial state
+            let bootstrap_depth = self.solve_with_heuristic(&game);
+            let bootstrap_value = ((0.1 + reference_depth - bootstrap_depth) / 2.0).tanh();
 
-        let solution_depth = game.depth(true);
+            let placement = game.get_placement_tokens().unwrap();
+            let objectives_0 = game.get_objective_tokens(0).unwrap();
+            let objectives_1 = game.get_objective_tokens(1).unwrap();
+            let valid_actions = game.valid_actions();
+            let edge_visits: HashMap<Action, usize> = HashMap::new();
 
-        // Loss condition
-        let mut game = env.copy();
-        game.set_cultivation_time(10);
-        let mut scores = self.score_transitions(&game, &taken_actions);
+            temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
 
-        // Append final terminal state so we train on the done state itself.
-        // Build a terminal record matching temp_data shape with empty visits.
-        let final_placement = game.get_placement_tokens().unwrap();
-        let final_o0 = game.get_objective_tokens(0).unwrap();
-        let final_o1 = game.get_objective_tokens(1).unwrap();
-        let final_valid: Vec<usize> = vec![];
-        let final_visits: std::collections::HashMap<Action, usize> = HashMap::new();
-        temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
-        scores.push(self.terminal_value);
+            // Give everything the bootstrap value
+            for _ in 0..temp_data.len() - 1 { scores.push(bootstrap_value); }
+
+            // For displaying purposes
+            bootstrap_depth
+
+        } else {
+            // If solved add the terminal state with a value of +1.0
+            let solution_depth = game.depth(true);
+            // Loss condition
+            let mut game = env.copy();
+            game.set_cultivation_time(10);
+            scores = self.score_transitions(&game, &taken_actions);
+
+            // Append final terminal state so we train on the done state itself.
+            // Build a terminal record matching temp_data shape with empty visits.
+            let final_placement = game.get_placement_tokens().unwrap();
+            let final_o0 = game.get_objective_tokens(0).unwrap();
+            let final_o1 = game.get_objective_tokens(1).unwrap();
+            let final_valid: Vec<usize> = vec![];
+            let final_visits: HashMap<Action, usize> = HashMap::new();
+            temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
+            scores.push(self.terminal_value);
+            solution_depth
+        };
+
 
         // Save data to output_path in NDJSON format
         let mut file = std::fs::OpenOptions::new()
@@ -286,7 +309,7 @@ impl Gatherer {
             let line = record.dump(); // compact JSON string
             writeln!(file, "{}", line).expect("Failed to write record");
          }
-         (solution_depth as f32, reference_depth as f32)
+        (solution_depth as f32, reference_depth as f32, game.done())
     }
 }
 
@@ -375,10 +398,17 @@ fn main() {
         env.random_objectives(no, false);
         env.shuffle(num_shuffles);
         shuffle_ancilla(&mut env, &mut rng);
-        let (sol_depth, ref_depth) = gatherer.gather(&env, &client);
-        println!(
-           "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): solution depth = {}, reference depth = {}",
-           worker_id, h, w, nb, no, sol_depth, ref_depth
-        );
+        let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client);
+        if done {
+            println!(
+            "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): solution depth = {}, reference depth = {}",
+            worker_id, h, w, nb, no, sol_depth, ref_depth
+            );
+        } else {
+            println!(
+            "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): (bootstrapped) depth = {}, reference depth = {}",
+            worker_id, h, w, nb, no, sol_depth, ref_depth
+            );
+        }
     }
 }
