@@ -119,6 +119,20 @@ impl Gatherer {
 
         let mut env = base_env.clone();
 
+        // If the agent is better than the heuristic from the start, reward immediately.
+        let initial_ref_depth = self.solve_with_heuristic(&env);
+        let initial_agent_depth = {
+            let mut temp_env = env.clone();
+            for ac in agent_actions {
+                let _ = temp_env.step(*ac);
+                temp_env.finish_cultivating();
+            }
+            temp_env.depth(true)
+        };
+        if initial_agent_depth < initial_ref_depth {
+            return vec![1.0; agent_actions.len()];
+        }
+
         // For each action in the agent trajectory, produce a value target for the
         // current state (before taking that action).
         for i in 0..agent_actions.len() {
