@@ -224,7 +224,18 @@ impl Gatherer {
         // Loss condition
         let mut game = env.copy();
         game.set_cultivation_time(10);
-        let scores = self.score_transitions(&game, &taken_actions);
+        let mut scores = self.score_transitions(&game, &taken_actions);
+
+        // Append final terminal state so we train on the done state itself.
+        // Build a terminal record matching temp_data shape with empty visits.
+        let final_placement = game.get_placement_tokens().unwrap();
+        let final_o0 = game.get_objective_tokens(0).unwrap();
+        let final_o1 = game.get_objective_tokens(1).unwrap();
+        let final_valid: Vec<usize> = vec![];
+        let final_visits: std::collections::HashMap<Action, usize> = HashMap::new();
+        temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
+        scores.push(self.terminal_value);
+
         // Save data to output_path in NDJSON format
         let mut file = std::fs::OpenOptions::new()
             .create(true)
