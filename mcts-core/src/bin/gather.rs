@@ -242,9 +242,9 @@ impl Gatherer {
             // If solved add the terminal state with a value of +1.0
             let solution_depth = game.depth(true);
             // Loss condition
-            let mut game = env.copy();
-            game.set_cultivation_time(10);
-            scores = self.score_transitions(&game, &taken_actions);
+            let mut scoring_game = env.copy();
+            scoring_game.set_cultivation_time(10);
+            scores = self.score_transitions(&scoring_game, &taken_actions);
 
             // Append final terminal state so we train on the done state itself.
             // Build a terminal record matching temp_data shape with empty visits.
@@ -265,8 +265,6 @@ impl Gatherer {
             .append(true)
             .open(&self.output_path)
             .expect("Unable to open output file");
-
-        writeln!(file, "\n").expect("Failed to write record");
 
         for (((p, o0, o1), va, ev), score) in zip(temp_data, scores) {
             // Build JSON using `json` crate (avoids serde_json)
@@ -308,7 +306,9 @@ impl Gatherer {
 
             let line = record.dump(); // compact JSON string
             writeln!(file, "{}", line).expect("Failed to write record");
-         }
+        }
+        writeln!(file, "").expect("Failed to write newline");
+        file.flush().expect("Failed to flush file");
         (solution_depth as f32, reference_depth as f32, game.done())
     }
 }
