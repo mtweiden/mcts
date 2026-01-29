@@ -115,47 +115,50 @@ impl Gatherer {
         base_env: &Environment,
         agent_actions: &Vec<usize>,
     ) -> Vec<f32> {
-        let mut scores: Vec<f32> = Vec::with_capacity(agent_actions.len() - 1);
+        let mut scores: Vec<f32> = Vec::with_capacity(agent_actions.len());
 
         let mut env = base_env.clone();
 
-        // Compute how much depth is left to be added after each action
+        // For each action in the agent trajectory, produce a value target for the
+        // current state (before taking that action).
         for i in 0..agent_actions.len() {
-
             // Starting at environment state after action i-1
             env.executed_objectives.clear();
 
-            // Make sure we're not in a scenario where the heuristic solver is unable
-            // to take any moves.
+            // Heuristic reference depth from this state (clear cultivated resources
+            // when necessary so heuristic can move).
             let valid_actions = env.valid_actions();
             let ref_depth = if !valid_actions.contains(&0) && !valid_actions.iter().any(|&a| a > env.num_ancillas) {
-                let mut temp_env = env.clone();
-                temp_env.clear_cultivated_resources();
-                self.solve_with_heuristic(&temp_env)
+                let mut tmp = env.clone();
+                tmp.clear_cultivated_resources();
+                self.solve_with_heuristic(&tmp)
             } else {
-                // Determine the depth of the alternate agent's solution from this state
                 self.solve_with_heuristic(&env)
             };
 
-            // Determine the depth of the agent-in-question's solution from this state
+            // Depth if the agent follows its remaining actions from this state
             let mut temp_env = env.clone();
             let remaining_actions = &agent_actions[i..];
             for ac in remaining_actions {
                 let _ = temp_env.step(*ac);
                 temp_env.finish_cultivating();
             }
-
             let agent_depth = temp_env.depth(true);
 
-            // Score this transition
-            let score = if env.done() {
-                1.0
+            // Check whether the immediate action finishes the game (score = +1.0).
+            let ac = agent_actions[i];
+            let mut next_env = env.clone();
+            let _ = next_env.step(ac);
+            next_env.finish_cultivating();
+
+            let score = if next_env.done() {
+                1.0f32
             } else {
                 ((ref_depth - agent_depth) / 2.0).tanh()
             };
             scores.push(score);
 
-            let ac = agent_actions[i];
+            // Advance the working environment by the chosen action
             let _ = env.step(ac);
             env.finish_cultivating();
         }
