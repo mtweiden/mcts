@@ -396,6 +396,11 @@ fn main() {
         if nb >= (h * w) - 1 || (h <= 2 && w <= 2) { continue; }
         let mut env = Environment::new(h, w, nb);
         env.random_objectives(no, false);
+        if env.valid_actions().contains(&0) {
+            let mut tmp_env = env.clone();
+            let _ = tmp_env.step(0);
+            if tmp_env.done() { continue; }
+        }
         env.shuffle(num_shuffles);
         shuffle_ancilla(&mut env, &mut rng);
         let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client);
