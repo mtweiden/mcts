@@ -101,7 +101,7 @@ while not env.done():
         if visits > most_visits:
             most_visits = visits
             best_action = action
-        env.step(best_action)
+    env.step(best_action)
 ```
 
 # TODO
