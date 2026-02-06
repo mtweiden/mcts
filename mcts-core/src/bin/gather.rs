@@ -90,15 +90,15 @@ impl Gatherer {
             .collect()
     }
 
-    pub fn select_action(&self, node: &Node, env: &Environment) -> Action {
+    pub fn select_action(&self, node: &Node, env: &Environment, noiseless: bool) -> Action {
         let valid_actions = env.valid_actions();
         let num_actions = valid_actions.len();
         if num_actions == 0 { panic!("No valid actions available"); }
-        let noise = self._dirichlet_noise(num_actions);
         let probs = self._action_probabilities(
             &valid_actions.iter()
                 .map(|&a| *node.edge_visits.get(&(a as Action)).unwrap_or(&0)).collect()
         );
+        let noise = if !noiseless { self._dirichlet_noise(num_actions) } else { vec![0.0; num_actions] };
         let mixed_probs: Vec<f64> = probs.iter().zip(noise.iter())
             .map(|(&p, &n)| (1.0 - self.noise_strength) * p + self.noise_strength * n)
             .map(|x| x.max(0.0)) // prevent tiny negatives
@@ -196,7 +196,7 @@ impl Gatherer {
         let mut temp_data: Vec<((Vec<usize>, Vec<usize>, Vec<usize>), Vec<usize>, HashMap<Action, usize>)> = Vec::new();
 
         let mut taken_actions = vec![];
-        for _ in 0..self.max_actions {
+        for step in 0..self.max_actions {
             // Run MCTS
             let root = mcts.run(&game , client, self.mcts_steps);
 
@@ -209,7 +209,8 @@ impl Gatherer {
             temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
 
             // Select action and step the environment
-            let action = self.select_action(&root, &game);
+            let noiseless = step > 0;
+            let action = self.select_action(&root, &game, noiseless);
             let _ = game.step(action as usize);
             game.finish_cultivating();  // Cultivate resources in a single step
             taken_actions.push(action as usize);
