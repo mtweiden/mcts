@@ -77,9 +77,10 @@ impl MctsAgent {
             // Call inference on Python agent
             let out = self.agent.as_ref().call_method1(py, "infer", (obs_dicts,)).unwrap();
             let tup = out.as_ref().cast_bound::<PyTuple>(py).unwrap();
-            // item0: dict[int (Action), float (Probability)]
-            // item1: float (Value)
-            let prior: Vec<Prior> = tup.get_item(0).unwrap().extract().unwrap();
+            // item0: list[dict[int (Action), float (Probability)]]
+            // item1: list[float (Value)]
+            let prior_list = tup.get_item(0).unwrap();
+            let prior: Vec<Prior> = prior_list.extract().unwrap();
             let value: Vec<Value> = tup.get_item(1).unwrap().extract().unwrap();
             (prior, value)
         });
@@ -132,17 +133,13 @@ impl GenericRustEnvironment for MctsEnvironment {
     fn observation(&self) -> Observation {
         Python::attach(|py| {
             let env = self.obj.as_ref();
-            let obs_obj  = env.call_method0(py, "observation").unwrap();
-            let obs_dict = obs_obj.as_ref().cast_bound::<PyDict>(py).unwrap();
-
-            let placement: Vec<TokenId> = obs_dict.get_item("placement").unwrap().unwrap().extract().unwrap();
-            let objectives_0: Vec<TokenId> = obs_dict.get_item("objectives_0").unwrap().unwrap().extract().unwrap();
-            let objectives_1: Vec<TokenId> = obs_dict.get_item("objectives_1").unwrap().unwrap().extract().unwrap();
-            let height: usize = obs_dict.get_item("height").unwrap().unwrap().extract().unwrap();
-            let width: usize = obs_dict.get_item("width").unwrap().unwrap().extract().unwrap();
-            let num_ancillas: usize = obs_dict.get_item("num_ancillas").unwrap().unwrap().extract().unwrap();
-            let valid_actions: Vec<Action> = obs_dict.get_item("valid_actions").unwrap().unwrap().extract().unwrap();
-
+            let placement: Vec<TokenId> = env.call_method0(py, "get_placement_tokens").unwrap().extract(py).unwrap();
+            let objectives_0: Vec<TokenId> = env.call_method1(py, "get_objective_tokens", (0,)).unwrap().extract(py).unwrap();
+            let objectives_1: Vec<TokenId> = env.call_method1(py, "get_objective_tokens", (1,)).unwrap().extract(py).unwrap();
+            let height: usize = env.getattr(py, "height").unwrap().extract(py).unwrap();
+            let width: usize = env.getattr(py, "width").unwrap().extract(py).unwrap();
+            let num_ancillas: usize = env.getattr(py, "num_ancillas").unwrap().extract(py).unwrap();
+            let valid_actions: Vec<Action> = env.call_method0(py, "valid_actions").unwrap().extract(py).unwrap();
             Observation::from((placement, objectives_0, objectives_1, height, width, num_ancillas, valid_actions))
         })
     }
