@@ -7,6 +7,8 @@ use rand_distr::{Gamma, Distribution};
 use rand_distr::weighted::WeightedIndex;
 use rand::Rng;
 use rand::seq::SliceRandom;
+use rand::SeedableRng;
+use rand::rngs::StdRng;
 
 use mcts_core::enums::Action;
 use mcts_core::{Arena, InferenceClient, IpcClient, MCTS};
@@ -338,6 +340,7 @@ fn main() {
     let mut width = 4;
     let mut num_objectives = 2;
     let mut num_blanks = 2;
+    let mut seed: Option<i32> = None;
     // IPC parameters
     let mut worker_id = 0;
     let mut num_handlers = 1;
@@ -367,6 +370,9 @@ fn main() {
         if args[i] == "--num_shuffles" && i + 1 < args.len() {
             num_shuffles = args[i + 1].parse().unwrap_or(0);
         }
+        if args[i] == "--seed" && i + 1 < args.len() {
+            seed = args[i + 1].parse().ok();
+        }
     }
 
     // let arena_name = format!("mcts_{}_{}", num_slots, num_handlers);
@@ -385,7 +391,15 @@ fn main() {
     );
 
     loop {
-        let mut rng = rand::rng();
+        // Prepare the RNG
+        let mut rng = if let Some(s) = seed {
+            let rng = StdRng::seed_from_u64(s as u64);
+            seed = Some(s + 1); // Increment seed for next iteration
+            rng
+        } else {
+            StdRng::from_os_rng()
+        };
+
         let h = rng.random_range(2..=height);
         let w = rng.random_range(2..=width);
         let dim_max = h.max(w);
@@ -396,6 +410,10 @@ fn main() {
         let no = rng.random_range(1..=num_objectives);
         if nb >= (h * w) - 1 || (h <= 2 && w <= 2) { continue; }
         let mut env = Environment::new(h, w, nb);
+
+        // Seed the environment
+        if !seed.is_none() { env.set_seed(Some(seed.unwrap() as u64)) }
+
         env.random_objectives(no, false);
         if env.valid_actions().contains(&0) {
             let mut tmp_env = env.clone();
