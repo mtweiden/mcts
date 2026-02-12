@@ -183,6 +183,31 @@ impl Gatherer {
         scores
     }
 
+    pub fn supervised_edge_visits(
+        &self,
+        selected_action: Action,
+        valid_actions: &Vec<usize>,
+        weight_on_selected: f32,
+    ) -> HashMap<Action, usize> {
+        assert!(weight_on_selected >= 0.0 && weight_on_selected <= 1.0, "weight_on_selected must be in [0, 1]");
+        let num_actions = valid_actions.len();
+        let weight_on_unselected = if num_actions > 1 {
+            (1.0 - weight_on_selected) / (num_actions as f32 - 1.0)
+        } else {
+            0.0
+        };
+        let mut edge_visits: HashMap<Action, usize> = HashMap::new();
+        for &action in valid_actions {
+            let visits = if action == (selected_action as usize) {
+                (weight_on_selected * 1000.0) as usize
+            } else {
+                (weight_on_unselected * 1000.0) as usize
+            };
+            edge_visits.insert(action as Action, visits);
+        }
+        edge_visits
+    }
+
     pub fn gather(&self, env: &Environment, client: &dyn InferenceClient) -> (f32, f32, bool) {
         // Set up MCTS and Agent and copy the Environment
         let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.batch_size);
@@ -220,27 +245,67 @@ impl Gatherer {
         }
 
         let mut scores: Vec<f32> = Vec::new();
-        // Use bootstrapping to determine value if not solved
+        // If not solved, bootstrap using a heuristic solution from the final state so that
+        // some supervised learning can be done.
         let solution_depth = if !game.done() {
-            // If not solved, keep a bootstrapped partial example (heuristic estimate) instead of dropping it.
-            // heuristic estimate from current partial state
-            let bootstrap_depth = self.solve_with_heuristic(&game);
-            let bootstrap_value = ((0.1 + reference_depth - bootstrap_depth) / 2.0).tanh();
+            // Ensure that actions up to now are scored as bad since they didn't lead to a solution
+            for _ in 0..taken_actions.len() { scores.push(-1.0) }
+            let bootstrap_actions = game.solve(false);
+            for window in bootstrap_actions.windows(2) {
+                let ac = window[0];
+                let next_ac = window[1];
+                let placement = game.get_placement_tokens().unwrap();
+                let objectives_0 = game.get_objective_tokens(0).unwrap();
+                let objectives_1 = game.get_objective_tokens(1).unwrap();
+                let valid_actions = game.valid_actions();
 
-            let placement = game.get_placement_tokens().unwrap();
-            let objectives_0 = game.get_objective_tokens(0).unwrap();
-            let objectives_1 = game.get_objective_tokens(1).unwrap();
-            let valid_actions = game.valid_actions();
-            let edge_visits: HashMap<Action, usize> = HashMap::new();
+                // Small positive reward for following the heuristic solution, even if it doesn't
+                // solve the game. We want to get closer to getting solutions in this case.
+                scores.push(0.1);
 
-            temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
+                // Construct a plausable visit count distribution that heavily favors the next
+                // action in the heuristic solution, but still has some mass on other valid actions.
+                let edge_visits = self.supervised_edge_visits(
+                    next_ac as Action,
+                    &valid_actions, 
+                    0.75,
+                );
+                temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
 
-            // Give everything the bootstrap value
-            for _ in 0..temp_data.len() - 1 { scores.push(bootstrap_value); }
+                // Advance to next state
+                let _ = game.step(ac);
+                game.finish_cultivating();
+            }
+
+            // There's still one more action to do before reaching the terminal state
+            if let Some(&last_ac) = bootstrap_actions.last() {
+                let placement = game.get_placement_tokens().unwrap();
+                let objectives_0 = game.get_objective_tokens(0).unwrap();
+                let objectives_1 = game.get_objective_tokens(1).unwrap();
+                let valid_actions = game.valid_actions();
+                let edge_visits = self.supervised_edge_visits(
+                    last_ac as Action,
+                    &valid_actions, 
+                    0.75,
+                );
+
+                scores.push(0.5 * self.terminal_value);
+                temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
+                let _ = game.step(last_ac);
+                game.finish_cultivating();
+            }
+
+            // Make sure the terminal state gets added too
+            let final_placement = game.get_placement_tokens().unwrap();
+            let final_o0 = game.get_objective_tokens(0).unwrap();
+            let final_o1 = game.get_objective_tokens(1).unwrap();
+            let final_valid: Vec<usize> = vec![];
+            let final_visits: HashMap<Action, usize> = HashMap::new();
+            temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
+            scores.push(self.terminal_value);
 
             // For displaying purposes
-            bootstrap_depth
-
+            game.depth(true)
         } else {
             // If solved add the terminal state with a value of +1.0
             let solution_depth = game.depth(true);
