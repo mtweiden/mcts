@@ -117,7 +117,8 @@ impl Gatherer {
         base_env: &Environment,
         agent_actions: &Vec<usize>,
     ) -> Vec<f32> {
-        let mut scores: Vec<f32> = Vec::with_capacity(agent_actions.len());
+        // Plus 1 for the terminal state at the end
+        let mut scores: Vec<f32> = Vec::with_capacity(agent_actions.len() + 1);
 
         let mut env = base_env.clone();
 
@@ -244,87 +245,50 @@ impl Gatherer {
             if game.done() { break; }
         }
 
-        let mut scores: Vec<f32> = Vec::new();
         // If not solved, bootstrap using a heuristic solution from the final state so that
         // some supervised learning can be done.
         let solution_depth = if !game.done() {
-            // Ensure that actions up to now are scored as bad since they didn't lead to a solution
-            for _ in 0..taken_actions.len() { scores.push(-1.0) }
             let bootstrap_actions = game.solve(false);
-            for window in bootstrap_actions.windows(2) {
-                let ac = window[0];
-                let next_ac = window[1];
+            for ac in bootstrap_actions {
                 let placement = game.get_placement_tokens().unwrap();
                 let objectives_0 = game.get_objective_tokens(0).unwrap();
                 let objectives_1 = game.get_objective_tokens(1).unwrap();
                 let valid_actions = game.valid_actions();
-
-                // Small positive reward for following the heuristic solution, even if it doesn't
-                // solve the game. We want to get closer to getting solutions in this case.
-                scores.push(0.1);
-
                 // Construct a plausable visit count distribution that heavily favors the next
                 // action in the heuristic solution, but still has some mass on other valid actions.
                 let edge_visits = self.supervised_edge_visits(
-                    next_ac as Action,
+                    ac as Action,
                     &valid_actions, 
-                    0.75,
+                    0.7,
                 );
                 temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
-
                 // Advance to next state
                 let _ = game.step(ac);
                 game.finish_cultivating();
+                // Record heuristic action
+                taken_actions.push(ac);
             }
-
-            // There's still one more action to do before reaching the terminal state
-            if let Some(&last_ac) = bootstrap_actions.last() {
-                let placement = game.get_placement_tokens().unwrap();
-                let objectives_0 = game.get_objective_tokens(0).unwrap();
-                let objectives_1 = game.get_objective_tokens(1).unwrap();
-                let valid_actions = game.valid_actions();
-                let edge_visits = self.supervised_edge_visits(
-                    last_ac as Action,
-                    &valid_actions, 
-                    0.75,
-                );
-
-                scores.push(0.5 * self.terminal_value);
-                temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
-                let _ = game.step(last_ac);
-                game.finish_cultivating();
-            }
-
-            // Make sure the terminal state gets added too
-            let final_placement = game.get_placement_tokens().unwrap();
-            let final_o0 = game.get_objective_tokens(0).unwrap();
-            let final_o1 = game.get_objective_tokens(1).unwrap();
-            let final_valid: Vec<usize> = vec![];
-            let final_visits: HashMap<Action, usize> = HashMap::new();
-            temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
-            scores.push(self.terminal_value);
-
-            // For displaying purposes
             game.depth(true)
         } else {
             // If solved add the terminal state with a value of +1.0
             let solution_depth = game.depth(true);
-            // Loss condition
-            let mut scoring_game = env.copy();
-            scoring_game.set_cultivation_time(10);
-            scores = self.score_transitions(&scoring_game, &taken_actions);
-
-            // Append final terminal state so we train on the done state itself.
-            // Build a terminal record matching temp_data shape with empty visits.
-            let final_placement = game.get_placement_tokens().unwrap();
-            let final_o0 = game.get_objective_tokens(0).unwrap();
-            let final_o1 = game.get_objective_tokens(1).unwrap();
-            let final_valid: Vec<usize> = vec![];
-            let final_visits: HashMap<Action, usize> = HashMap::new();
-            temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
-            scores.push(self.terminal_value);
             solution_depth
         };
+        assert!(game.done(), "Heuristic failed to solve the environment");
+        // Append final terminal state so we train on the done state itself.
+        // Build a terminal record matching temp_data shape with empty visits.
+        let final_placement = game.get_placement_tokens().unwrap();
+        let final_o0 = game.get_objective_tokens(0).unwrap();
+        let final_o1 = game.get_objective_tokens(1).unwrap();
+        let final_valid: Vec<usize> = vec![];
+        let final_visits: HashMap<Action, usize> = HashMap::new();
+        temp_data.push(((final_placement, final_o0, final_o1), final_valid, final_visits));
+
+        // Determine scores for all transitions
+        let mut scoring_game = env.copy();
+        scoring_game.set_cultivation_time(10);
+        let mut scores = self.score_transitions(&scoring_game, &taken_actions);
+        scores.push(self.terminal_value);
 
 
         // Save data to output_path in NDJSON format
