@@ -243,6 +243,9 @@ impl Gatherer {
             game.finish_cultivating();  // Cultivate resources in a single step
             taken_actions.push(action as usize);
             if game.done() { break; }
+
+            // Advance the root
+            mcts.advance_root(action);
         }
 
         // If not solved, bootstrap using a heuristic solution from the final state so that
