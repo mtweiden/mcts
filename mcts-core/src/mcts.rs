@@ -222,7 +222,7 @@ impl<E: EnvTrait> MCTS<E> {
         scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(action, _)| action)
     }
 
-    pub fn select_action(&self, node: Node) -> Option<Action> {
+    pub fn select_action(&self, node: &Node) -> Option<Action> {
         node.select_action()
     }
 
@@ -358,7 +358,6 @@ impl<E: EnvTrait> MCTS<E> {
                 }
             } else {
                 parent.children.insert(action, leaf_id);
-                *parent.edge_visits.entry(action).or_insert(0) += 1;
                 for (&a, &cid) in &parent.children {
                     if cid == leaf_id && a != action {
                         eprintln!("[Alias detected] actions {} - {}", a, action);
@@ -374,21 +373,29 @@ impl<E: EnvTrait> MCTS<E> {
         if search_path.is_empty() {
             return;
         }
-
+        // First revert virtual losses along the search path.
+        for &(node_hash, action) in search_path.iter().rev() {
+            if let Some(node) = self.get_node_mut(node_hash) {
+                node.revert_virtual_loss(action);
+            }
+        }
+        // Handle the outcome of the path.
         if repeat_detected {
+            // If a repeat was detected, just apply the penalty and stop. We don't have a new value
+            // to propagate, and we don't want to reward this path with a visit.
             if let Some((last_parent_hash, last_action)) = search_path.last() {
                 if let Some(last_parent) = self.get_node_mut(*last_parent_hash) {
                     last_parent.apply_penalty(*last_action);
                 }
             }
-        }
-
-        for &(node_hash, action) in search_path.iter().rev() {
-            if let Some(node) = self.get_node_mut(node_hash) {
-                node.revert_virtual_loss(action);
-                *node.edge_visits.entry(action).or_insert(0) += 1;
+        } else {
+            // If it was a successful expansion, increment visits and recompute values.
+            for &(node_hash, action) in search_path.iter().rev() {
+                if let Some(node) = self.get_node_mut(node_hash) {
+                    *node.edge_visits.entry(action).or_insert(0) += 1;
+                }
+                self.recompute_value(node_hash);
             }
-            self.recompute_value(node_hash);
         }
     }
 
@@ -499,7 +506,7 @@ mod tests {
         node.edge_visits.insert(1, 20);
         mcts.insert_node(5, node);
         let node = mcts.get_node_mut(5).unwrap().clone();
-        let chosen = mcts.select_action(node).unwrap();
+        let chosen = mcts.select_action(&node).unwrap();
         assert_eq!(chosen, 1); // action 1 has more visits, prefer higher prior
     }
 
@@ -510,7 +517,7 @@ mod tests {
         let node = Node::new(priors.clone(), 0.0, 6, None);
         mcts.insert_node(6, node);
         let node = mcts.get_node_mut(6).unwrap().clone();
-        let chosen = mcts.select_action(node);
+        let chosen = mcts.select_action(&node);
         assert_eq!(chosen, None);
     }
 
