@@ -12,6 +12,8 @@ use std::marker::PhantomData;
 /// ----------------------------------------------------------------------------
 /// Generic over an Environment type `E` that implements the `EnvTrait` trait.
 pub struct MCTS<E: EnvTrait> {
+    // Track the current root of the search tree
+    pub root_id: Option<NodeId>,
     // Arena style storage for all nodes.
     pub transposition_table: HashMap<NodeId, usize>,
     pub nodes: Vec<Node>,
@@ -27,6 +29,7 @@ impl<E: EnvTrait> MCTS<E> {
 
     pub fn new(terminal_value: Value, batch_size: usize) -> Self {
         Self {
+            root_id: None,
             transposition_table: HashMap::new(),
             nodes: Vec::new(),
             terminal_value,
@@ -43,8 +46,10 @@ impl<E: EnvTrait> MCTS<E> {
     /// immutably; select_leaf clones it internally as needed. The `client` is an inference client
     /// that provides value and prior estimates for leaf nodes.
     pub fn run(&mut self, env: &E, client: &dyn InferenceClient, num_steps: usize) -> Node {
-        // Ensure root node exists
+        // Set the current root for the search session
         let root_hash = self.get_hash(env);
+        self.root_id = Some(root_hash);
+        // Check if the current root node exists
         if !self.node_exists(root_hash) {
             let obs = env.observation();
             let (p, v) = self.blocking_infer(&vec![obs], client);
@@ -93,6 +98,62 @@ impl<E: EnvTrait> MCTS<E> {
             }
         }
         self.get_node_mut(root_hash).unwrap().clone()
+    }
+
+    /// Advances the root of the tree to the child corresponding to the given action.
+    /// This preserves the entire subtree of that child for the next search, allowing for
+    /// MCTS to think more deeply.
+    /// 
+    /// If the child node does not exist in the tree, the tree is effectively reset by
+    /// setting the root to `None`.
+    pub fn advance_root(&mut self, action: Action) {
+        let old_root_id = match self.root_id {
+            Some(id) => id,
+            None => return, // no root to advance from
+        };
+        // Immutable borrow to get the children map
+        let old_root_node = match self.get_node_immut(old_root_id) {
+            Some(node) => node,
+            None => {
+                // A bug or inconsistent state. The root ID should always be valid.
+                eprintln!(
+                    "[MCTS] Root ID {} not found in transposition table while advancing root.",
+                    old_root_id
+                );
+                self.root_id = None;
+                return;
+            }
+        };
+        if let Some(&new_root_id) = old_root_node.children.get(&action) {
+            self.root_id = Some(new_root_id);
+            // TODO: Implement pruning here to conserve memory for long games.
+            // The goal is to remove all nodes that are no longer reachable from the `new_root_id`.
+            // This is a non-trivial garbage collection process because of the arena storage.
+            //
+            // HIGH-LEVEL ALGORITHM:
+            // 1. Perform a graph traversal (like DFS or BFS) starting from `new_root_id`.
+            //    Collect all reachable `NodeId`s into a `HashSet` for fast lookups.
+            //
+            // 2. Create a new `nodes_after_pruning: Vec<Node>` and a new
+            //    `table_after_pruning: HashMap<NodeId, usize>`.
+            //
+            // 3. Iterate through `self.nodes`. If a node's `id` is in the reachable set,
+            //    clone it and push it into `nodes_after_pruning`.
+            //
+            // 4. As you add a node, populate `table_after_pruning`, mapping the `NodeId`
+            //    to its new index in the `nodes_after_pruning` vector.
+            //
+            // 5. Finally, replace the old data structures with the pruned ones:
+            //    `self.nodes = nodes_after_pruning;`
+            //    `self.transposition_table = table_after_pruning;`
+            //
+            // This process rebuilds the arena with only the necessary nodes, keeping all
+            // indices in the transposition table valid relative to the new `nodes` vector.
+        } else {
+            // The action does not lead to a known child. This might happen if the search is
+            // shallow and the node was never fully expanded.
+            self.root_id = None; 
+        }
     }
 
     /// ------------------------------------------------------------------------
