@@ -65,14 +65,13 @@ impl Gatherer {
 
     /// Directly sampling from Dirichlet distribution requires num_actions to be known at
     /// compile time, so we sample using Gamma distributions instead.
-    fn _dirichlet_noise(&self, num_actions: usize) -> Vec<f64> {
+    fn _dirichlet_noise(&self, num_actions: usize, rng: &mut impl Rng) -> Vec<f64> {
         let alpha = 10f64 / (num_actions as f64);  // Rule of thumb for Dirichlet noise
-        let mut rng = rand::rng();
         let alphas = vec![alpha; num_actions];
         let mut xs: Vec<f64> = alphas.iter()
             .map(|&a| {
                 let gamma = Gamma::new(a, 1.0).unwrap();
-                gamma.sample(&mut rng)
+                gamma.sample(rng)
             })
             .collect();
         let sum_xs: f64 = xs.iter().sum();
@@ -92,7 +91,7 @@ impl Gatherer {
             .collect()
     }
 
-    pub fn select_action(&self, node: &Node, env: &Environment, noiseless: bool) -> Action {
+    pub fn select_action(&self, node: &Node, env: &Environment, noiseless: bool, rng: &mut impl Rng) -> Action {
         let valid_actions = env.valid_actions();
         let num_actions = valid_actions.len();
         if num_actions == 0 { panic!("No valid actions available"); }
@@ -100,7 +99,7 @@ impl Gatherer {
             &valid_actions.iter()
                 .map(|&a| *node.edge_visits.get(&(a as Action)).unwrap_or(&0)).collect()
         );
-        let noise = if !noiseless { self._dirichlet_noise(num_actions) } else { vec![0.0; num_actions] };
+        let noise = if !noiseless { self._dirichlet_noise(num_actions, rng) } else { vec![0.0; num_actions] };
         let mixed_probs: Vec<f64> = probs.iter().zip(noise.iter())
             .map(|(&p, &n)| (1.0 - self.noise_strength) * p + self.noise_strength * n)
             .map(|x| x.max(0.0)) // prevent tiny negatives
@@ -209,7 +208,7 @@ impl Gatherer {
         edge_visits
     }
 
-    pub fn gather(&self, env: &Environment, client: &dyn InferenceClient) -> (f32, f32, bool) {
+    pub fn gather(&self, env: &Environment, client: &dyn InferenceClient, rng: &mut impl Rng) -> (f32, f32, bool) {
         // Set up MCTS and Agent and copy the Environment
         let mut mcts: MCTS<Environment> = MCTS::new(self.terminal_value, self.batch_size);
 
@@ -237,8 +236,9 @@ impl Gatherer {
             temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
 
             // Select action and step the environment
-            let noiseless = step > 0;
-            let action = self.select_action(&root, &game, noiseless);
+            // Add noise if we're very close to the root to encourage exploration
+            let noiseless = step > 2;
+            let action = self.select_action(&root, &game, noiseless, rng);
             let _ = game.step(action as usize);
             game.finish_cultivating();  // Cultivate resources in a single step
             taken_actions.push(action as usize);
@@ -454,7 +454,8 @@ fn main() {
         }
         env.shuffle(num_shuffles);
         shuffle_ancilla(&mut env, &mut rng);
-        let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client);
+        let mut game_rng = StdRng::from_os_rng();
+        let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client, &mut game_rng);
         if done {
             println!(
             "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): solution depth = {}, reference depth = {}",
