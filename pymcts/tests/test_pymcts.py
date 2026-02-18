@@ -19,6 +19,9 @@ class DummyEnvironment:
     def __init__(self, target_value: int) -> None:
         self.target_value = target_value
         self.current_value = 0
+        self.height = 1
+        self.width = 1
+        self.num_ancillas = 0
 
     def step(self, action: int) -> None:
         assert action in [0, 1]
@@ -27,6 +30,12 @@ class DummyEnvironment:
         else:
             if self.current_value > 0:
                 self.current_value -= 1
+    
+    def get_placement_tokens(self) -> list[int]:
+        return [self.current_value]
+    
+    def get_objective_tokens(self, x: int) -> list[int]:
+        return []
 
     def done(self) -> bool:
         return self.current_value >= self.target_value
@@ -78,11 +87,6 @@ class TestPyMcts:
         mcts = PyMcts(terminal_value=1.0, batch_size=1)
         mcts_node = mcts.run(mcts_env, mcts_agent, num_steps=100)
         assert mcts_node.id() == 0
-        # assert hasattr(mcts_node, 'id')
-        # assert hasattr(mcts_node, 'prior_probs')
-        # assert hasattr(mcts_node, 'value')
-        # assert hasattr(mcts_node, 'terminal_state')
-        # assert hasattr(mcts_node, 'repr')
     
     def test_full_loop(self) -> None:
         agent = DummyAgent()
@@ -100,3 +104,15 @@ class TestPyMcts:
                     best_action = action
             env.step(best_action)
         assert env.current_value >= env.target_value
+    
+    def test_advance_root(self) -> None:
+        agent = DummyAgent()
+        env = DummyEnvironment(target_value=5)
+        mcts_agent = MctsAgent(agent)
+        mcts_env = MctsEnvironment(env)
+        mcts = PyMcts(terminal_value=1.0, batch_size=1)
+        node = mcts.run(mcts_env, mcts_agent, num_steps=100)
+        assert node.id() == 0
+        mcts.advance_root(0)
+        node = mcts.run(mcts_env, mcts_agent, num_steps=0)
+        assert any(v > 0 for v in node.edge_visits().values())

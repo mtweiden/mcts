@@ -254,4 +254,9 @@ impl PyMcts {
         let mcts_node = MctsNode { inner: node.clone() };
         Ok(mcts_node)
     }
+
+    fn advance_root(&mut self, action: Action) -> PyResult<()> {
+        self.inner.advance_root(action);
+        Ok(())
+    }
 }
