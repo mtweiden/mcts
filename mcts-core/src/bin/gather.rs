@@ -419,7 +419,7 @@ fn main() {
         10_000,    // MCTS steps
         80,       // max actions
         output_path,
-        0.10,  // noise strength
+        0.20,  // noise strength
     );
 
     loop {
