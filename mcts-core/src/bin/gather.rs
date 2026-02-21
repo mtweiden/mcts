@@ -14,6 +14,7 @@ use mcts_core::enums::Action;
 use mcts_core::{Arena, InferenceClient, IpcClient, MCTS};
 use mcts_core::node::Node;
 use tilers_core::env::Environment;
+use tilers_core::solver::Solver;
 
 /// ----------------------------------------------------------------------------
 /// Gatherer
@@ -59,7 +60,8 @@ impl Gatherer {
     /// Solve the environment using a heuristic solver and return the depth of the solution.
     pub fn solve_with_heuristic(&self, env: &Environment) -> f32 {
         let mut solved_env = env.clone();
-        solved_env.solve(true);
+        let solver = Solver::new();
+        let _ = solver.solve(&mut solved_env, true).unwrap();
         solved_env.depth(true)
     }
 
@@ -144,7 +146,7 @@ impl Gatherer {
             // Heuristic reference depth from this state (clear cultivated resources
             // when necessary so heuristic can move).
             let valid_actions = env.valid_actions();
-            let ref_depth = if !valid_actions.contains(&0) && !valid_actions.iter().any(|&a| a > env.num_ancillas) {
+            let ref_depth = if !valid_actions.contains(&0) && !valid_actions.iter().any(|&a| a > env.num_ancillas()) {
                 let mut tmp = env.clone();
                 tmp.clear_cultivated_resources();
                 self.solve_with_heuristic(&tmp)
@@ -251,7 +253,8 @@ impl Gatherer {
         // If not solved, bootstrap using a heuristic solution from the final state so that
         // some supervised learning can be done.
         let solution_depth = if !game.done() {
-            let bootstrap_actions = game.solve(false);
+            let solver = Solver::new();
+            let bootstrap_actions = solver.solve(&mut game, false).unwrap();
             for ac in bootstrap_actions {
                 let placement = game.get_placement_tokens().unwrap();
                 let objectives_0 = game.get_objective_tokens(0).unwrap();
@@ -331,7 +334,7 @@ impl Gatherer {
             let mut record = JsonValue::new_object();
             record["height"] = game.height.into();
             record["width"] = game.width.into();
-            record["num_ancillas"] = game.num_ancillas.into();
+            record["num_ancillas"] = game.num_ancillas().into();
             record["placement"] = placement_tokens_json;
             record["objectives_0"] = objectives_0_tokens_json;
             record["objectives_1"] = objectives_1_tokens_json;

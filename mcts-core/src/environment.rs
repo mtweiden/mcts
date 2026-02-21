@@ -40,7 +40,7 @@ impl Environment for tilers_core::env::Environment {
         let o0: Vec<TokenId> = obj_0.iter().map(|&x| x as TokenId).collect();
         let o1: Vec<TokenId> = obj_1.iter().map(|&x| x as TokenId).collect();
         let va: Vec<Action> = valid_actions.iter().map(|&x| x as Action).collect();
-        Observation::from((p, o0, o1, self.height, self.width, self.num_ancillas, va))
+        Observation::from((p, o0, o1, self.height, self.width, self.num_ancillas(), va))
     }
 
     fn valid_actions(&self) -> Vec<Action> {
