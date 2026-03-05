@@ -62,7 +62,7 @@ impl Gatherer {
         let mut solved_env = env.clone();
         let solver = Solver::new();
         let _ = solver.solve(&mut solved_env, true).unwrap();
-        solved_env.depth(true)
+        solved_env.depth(true, true)
     }
 
     /// Directly sampling from Dirichlet distribution requires num_actions to be known at
@@ -129,9 +129,9 @@ impl Gatherer {
             let mut temp_env = env.clone();
             for ac in agent_actions {
                 let _ = temp_env.step(*ac);
-                temp_env.finish_cultivating();
+                temp_env.finish_cultivating(None, None);
             }
-            temp_env.depth(true)
+            temp_env.depth(true, true)
         };
         if initial_agent_depth < initial_ref_depth {
             return vec![1.0; agent_actions.len()];
@@ -159,15 +159,15 @@ impl Gatherer {
             let remaining_actions = &agent_actions[i..];
             for ac in remaining_actions {
                 let _ = temp_env.step(*ac);
-                temp_env.finish_cultivating();
+                temp_env.finish_cultivating(None, None);
             }
-            let agent_depth = temp_env.depth(true);
+            let agent_depth = temp_env.depth(true, true);
 
             // Check whether the immediate action finishes the game (score = +1.0).
             let ac = agent_actions[i];
             let mut next_env = env.clone();
             let _ = next_env.step(ac);
-            next_env.finish_cultivating();
+            next_env.finish_cultivating(None, None);
 
             let score = if next_env.done() {
                 1.0f32
@@ -180,7 +180,7 @@ impl Gatherer {
 
             // Advance the working environment by the chosen action
             let _ = env.step(ac);
-            env.finish_cultivating();
+            env.finish_cultivating(None, None);
         }
         scores
     }
@@ -242,7 +242,7 @@ impl Gatherer {
             let noiseless = step > 2;
             let action = self.select_action(&root, &game, noiseless, rng);
             let _ = game.step(action as usize);
-            game.finish_cultivating();  // Cultivate resources in a single step
+            game.finish_cultivating(None, None);  // Cultivate resources in a single step
             taken_actions.push(action as usize);
             if game.done() { break; }
 
@@ -270,14 +270,14 @@ impl Gatherer {
                 temp_data.push(((placement, objectives_0, objectives_1), valid_actions, edge_visits));
                 // Advance to next state
                 let _ = game.step(ac);
-                game.finish_cultivating();
+                game.finish_cultivating(None, None);
                 // Record heuristic action
                 taken_actions.push(ac);
             }
-            game.depth(true)
+            game.depth(true, true)
         } else {
             // If solved add the terminal state with a value of +1.0
-            let solution_depth = game.depth(true);
+            let solution_depth = game.depth(true, true);
             solution_depth
         };
         assert!(game.done(), "Heuristic failed to solve the environment");
