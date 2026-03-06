@@ -136,7 +136,6 @@ impl TilersSlot {
                 }
             }
         }
-
         Ok(())
     }
 
@@ -199,7 +198,6 @@ impl TilersSlot {
                         )
                     );
                 }
-
                 objectives.push(layer);
             }
 
@@ -219,7 +217,6 @@ impl TilersSlot {
                 action_mask,
             });
         }
-
         out
     }
 }
