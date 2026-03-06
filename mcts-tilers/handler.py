@@ -86,8 +86,6 @@ def unpack_objectives_batch(
         opcodes:    (total, max_no) u8
         arg0s:      (total, max_no) i32
         arg1s:      (total, max_no) i32
-        durations:  (total, max_no) u8
-        directions: (total, max_no) u8
     Only layers 0..max_nl are returned.
     """
     total = raw.shape[0]
@@ -100,8 +98,6 @@ def unpack_objectives_batch(
         opcodes = np.zeros((total, max_no), dtype=np.uint8)
         arg0s = np.zeros((total, max_no), dtype=np.int32)
         arg1s = np.zeros((total, max_no), dtype=np.int32)
-        durations = np.zeros((total, max_no), dtype=np.uint8)
-        directions = np.zeros((total, max_no), dtype=np.uint8)
 
         layer_offset = l * OBJECTIVES_LAYER_MAX
 
@@ -115,15 +111,11 @@ def unpack_objectives_batch(
             opcodes[i, :no] = buf[:, 0]
             arg0s[i, :no] = buf[:, 1:5].copy().view(np.int32).reshape(no)
             arg1s[i, :no] = buf[:, 5:9].copy().view(np.int32).reshape(no)
-            durations[i, :no] = buf[:, 9]
-            directions[i, :no] = buf[:, 10]
 
         layers.append({
             "opcodes": opcodes,
             "arg0s": arg0s,
             "arg1s": arg1s,
-            "durations": durations,
-            "directions": directions,
         })
 
     return layers
@@ -138,9 +130,9 @@ _RAW_OPCODE_TO_TOKEN: dict[int, int] = {
     5:  4,   # Sdg
     6:  5,   # SX
     7:  5,   # SXdg
-    10: 2,   # RZ
-    13: 6,   # T
-    14: 6,   # Tdg
+    8:  6,   # T
+    9:  6,   # Tdg
+    12: 2,   # RZ
     16: 7,   # MEASURE
     17: 10,  # RESET
 }
