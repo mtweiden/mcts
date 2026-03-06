@@ -415,13 +415,28 @@ impl<S: SlotInit> Arena<S> {
     pub fn pop_ready(&self, handler: usize) -> u32 {
         let n = self.header().num_handlers as usize;
         let h = handler % n;
-        self.header().ready_q[h].pop_blocking()
+        let slot = self.header().ready_q[h].pop_blocking();
+        
+        // Synchronize with the producer's Release store to state.
+        // This ensures all writes (b, placement, etc.) are visible.
+        let s = unsafe { &*self.slot_ptr(slot) };
+        let st = s.state().load(Ordering::Acquire);
+        debug_assert_eq!(st, SLOT_READY);
+        
+        slot
     }
 
     pub fn try_pop_ready(&self, handler: usize) -> Option<u32> {
         let n = self.header().num_handlers as usize;
         let h = handler % n;
-        self.header().ready_q[h].try_pop()
+        let slot = self.header().ready_q[h].try_pop()?;
+        
+        // Synchronize with the producer's Release store to state.
+        let s = unsafe { &*self.slot_ptr(slot) };
+        let st = s.state().load(Ordering::Acquire);
+        debug_assert_eq!(st, SLOT_READY);
+        
+        Some(slot)
     }
 }
 

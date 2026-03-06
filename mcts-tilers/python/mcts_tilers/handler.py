@@ -219,7 +219,6 @@ def build_boards(
 # ------------------------------------------------------------------------------
 # Inference loop
 # ------------------------------------------------------------------------------
-
 def do_work(arena: PyArena, handler_id: int, device: str) -> None:
     while True:
         try:
@@ -253,17 +252,19 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
             for sv in slot_views:
                 b_i = sv.b()
+                if b_i <= 0:
+                    continue  # Skip uninitialized/invalid slots
                 slot_batch_sizes.append(b_i)
 
-                placement_list.append(np.asarray(sv.placement()))
-                objectives_list.append(np.asarray(sv.objectives()))
-                mask_list.append(np.asarray(sv.action_mask()))
-                h_list.append(np.asarray(sv.h()))
-                w_list.append(np.asarray(sv.w()))
-                ancillas_list.append(np.asarray(sv.num_ancillas()))
-                nq_list.append(np.asarray(sv.num_qubits()))
-                nl_list.append(np.asarray(sv.num_layers()))
-                no_list.append(np.asarray(sv.num_objectives()))
+                placement_list.append(np.asarray(sv.placement())[:b_i])
+                objectives_list.append(np.asarray(sv.objectives())[:b_i])
+                mask_list.append(np.asarray(sv.action_mask())[:b_i])
+                h_list.append(np.asarray(sv.h())[:b_i])
+                w_list.append(np.asarray(sv.w())[:b_i])
+                ancillas_list.append(np.asarray(sv.num_ancillas())[:b_i])
+                nq_list.append(np.asarray(sv.num_qubits())[:b_i])
+                nl_list.append(np.asarray(sv.num_layers())[:b_i])
+                no_list.append(np.asarray(sv.num_objectives())[:b_i])
 
             # Concatenate into single batch
             placement_raw = np.concatenate(placement_list, axis=0)
