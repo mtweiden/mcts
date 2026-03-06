@@ -267,7 +267,12 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 nq_list.append(np.asarray(sv.num_qubits())[:b_i])
                 # num_layers must be the same for all instances
                 nl_list.append(np.asarray(sv.num_layers())[:b_i])
-                assert all((sv.num_layers() == nl_list[0]).all() for sv in valid_slot_views), "Inconsistent num_layers across slots"
+                if not all((sv.num_layers() == nl_list[0]).all() for sv in valid_slot_views):
+                    base_size = nl_list[0].shape[0]
+                    for sv in valid_slot_views:
+                        if not (sv.num_layers() == nl_list[0]).all():
+                            print(f"[DEBUG] Slot {sv.slot} has inconsistent num_layers: {sv.num_layers()} vs {base_size}")
+                    raise ValueError("Inconsistent num_layers across slots in the same batch")
                 no_list.append(np.asarray(sv.num_objectives())[:b_i])
             
             if not valid_slot_views:
