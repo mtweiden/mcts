@@ -155,16 +155,14 @@ def build_boards(
     """
     Transform placements and objectives into board tensors.
 
-    Replicates construct_board() from tile/board.py on batched numpy arrays.
-
     Returns:
-        boards: (total, max_nl * max_nq * 3) int32, zero-padded
+        boards: (total, max_nl, max_nq, 3) int32, zero-padded
     """
     total = qubit_ids.shape[0]
     max_nq = qubit_ids.shape[1]
     max_nl = len(obj_layers)
 
-    boards = np.zeros((total, max_nl * max_nq * 3), dtype=np.int32)
+    boards = np.zeros((total, max_nl, max_nq, 3), dtype=np.int32)
 
     for i in range(total):
         nq = int(num_qubits[i])
@@ -193,25 +191,23 @@ def build_boards(
 
                 tag += 1
 
-            layer_offset = l * max_nq * 3
             for j in range(nq):
                 qid = int(qubit_ids[i, j])
                 ori_token = _RAW_ORI_TO_TOKEN.get(int(qubit_oris[i, j]), 1)
-                cell_offset = layer_offset + j * 3
 
                 if qid in board_map:
                     op, t = board_map[qid]
-                    boards[i, cell_offset] = op
-                    boards[i, cell_offset + 1] = t
-                    boards[i, cell_offset + 2] = ori_token
+                    boards[i, l, j, 0] = op
+                    boards[i, l, j, 1] = t
+                    boards[i, l, j, 2] = ori_token
                 elif qid < 0:
-                    boards[i, cell_offset] = 11
-                    boards[i, cell_offset + 1] = -(qid + 1) + 2
-                    boards[i, cell_offset + 2] = ori_token
+                    boards[i, l, j, 0] = 11
+                    boards[i, l, j, 1] = -(qid + 1) + 2
+                    boards[i, l, j, 2] = ori_token
                 else:
-                    boards[i, cell_offset] = 1
-                    boards[i, cell_offset + 1] = 1
-                    boards[i, cell_offset + 2] = 1
+                    boards[i, l, j, 0] = 1
+                    boards[i, l, j, 1] = 1
+                    boards[i, l, j, 2] = 1
 
     return boards
 
