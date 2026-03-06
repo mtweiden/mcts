@@ -43,6 +43,7 @@ class PyArena:
     def try_pop_ready_view(
         self, *, handler: int, clear_outputs: bool = True,
     ) -> PySlotView | None: ...
+    def force_reset(self) -> None: ...
     def submit_and_collect(
         self,
         h: int,

@@ -155,6 +155,9 @@ impl PyArena {
 
         Ok((priors_vecs, values))
     }
+
+    /// Reset the arena
+    pub fn force_reset(&self) { self.arena.force_reset(); }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

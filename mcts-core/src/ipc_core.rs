@@ -290,7 +290,7 @@ impl<S: SlotInit> Arena<S> {
                     (*hdr).next_handler.store(0, Ordering::Relaxed);
 
                     // init slots and free list
-                    for i in 0..(num_slots - 1) {
+                    for i in 0..num_slots {
                         let s = &*slots.add(i);
                         s.init_free();
                         (*hdr).free_q.try_push(i as u32).unwrap();
@@ -340,6 +340,30 @@ impl<S: SlotInit> Arena<S> {
             slots,
             num_slots: num_slots as u32,
         })
+    }
+
+    /// We need a way to ensure that the arena starts in a clean state.
+    pub fn force_reset(&self) {
+        unsafe {
+            let hdr = &*self.hdr;
+            
+            // Drain and reinit all queues
+            hdr.free_q.init();
+            for q in &hdr.ready_q {
+                q.init();
+            }
+            hdr.next_handler.store(0, Ordering::Relaxed);
+            
+            // Reset all slots and repopulate free queue
+            for i in 0..self.num_slots {
+                let s = &*self.slots.add(i as usize);
+                s.init_free();
+                hdr.free_q.try_push(i).unwrap();
+            }
+            
+            // Full fence to publish everything
+            std::sync::atomic::fence(Ordering::SeqCst);
+        }
     }
 
     #[inline]
