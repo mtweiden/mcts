@@ -5,16 +5,12 @@ from argparse import ArgumentParser
 import time
 import numpy as np
 import torch
-from torch import int32, no_grad, tensor
+from torch import no_grad
 
 from tile import Agent
 
-from mcts_tilers import (
-    PyArena,
-    QUBIT_SIZE, OBJECTIVE_SIZE,
-    PLACEMENT_MAX, OBJECTIVES_LAYER_MAX, OBJECTIVES_MAX,
-    LOOKAHEAD_MAX, GRID_MAX, NUM_ACTIONS,
-)
+from mcts_tilers import PyArena
+from mcts_tilers import QUBIT_SIZE, OBJECTIVE_SIZE, OBJECTIVES_LAYER_MAX
 
 # ------------------------------------------------------------------------------
 # Constants
@@ -49,7 +45,6 @@ if ckpt is not None:
 # ------------------------------------------------------------------------------
 # Unpacking helpers
 # ------------------------------------------------------------------------------
-
 def unpack_placement_batch(
     raw: np.ndarray,       # (total, PLACEMENT_MAX) u8
     num_qubits: np.ndarray # (total,) u16
