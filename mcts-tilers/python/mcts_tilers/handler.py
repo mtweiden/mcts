@@ -346,11 +346,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if torch.cuda.is_available():
+        print(f"CUDA is available. {torch.cuda.device_count()} devices found.")
         ngpu = torch.cuda.device_count()
         device_idx = args.handler_id % ngpu
         torch.cuda.set_device(device_idx)
         device = f"cuda:{device_idx}"
     else:
+        print("CUDA is not available. Using CPU.")
         device = "cpu"
     MODEL.to(device)
 

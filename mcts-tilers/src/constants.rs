@@ -15,12 +15,12 @@ pub const MAX_BATCH: usize = 8;
 pub const QUBIT_SIZE: usize = 5;
 /// Packed objective size: 1 opcode + 4 arg0 + 4 arg1
 pub const OBJECTIVE_SIZE: usize = 9;
-/// Max bytes for placement per observation
-pub const PLACEMENT_MAX: usize = GRID_MAX * QUBIT_SIZE;
-/// Max bytes for one layer of objectives
-pub const OBJECTIVES_LAYER_MAX: usize = GRID_MAX * OBJECTIVE_SIZE;
-/// Max bytes for all objective layers per observation
-pub const OBJECTIVES_MAX: usize = LOOKAHEAD_MAX * OBJECTIVES_LAYER_MAX;
+/// Max bytes for placement per observation (GRID_MAX * QUBIT_SIZE)
+pub const PLACEMENT_MAX: usize = 2000;
+/// Max bytes for one layer of objectives (GRID_MAX * OBJECTIVE_SIZE)
+pub const OBJECTIVES_LAYER_MAX: usize = 3600;
+/// Max bytes for all objective layers per observation (LOOKAHEAD_MAX * OBJECTIVES_LAYER_MAX)
+pub const OBJECTIVES_MAX: usize = 10800;
 
 /// Actions are represented as dense u16 values
 pub type Action = u16;
