@@ -265,7 +265,9 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 w_list.append(np.asarray(sv.w())[:b_i])
                 ancillas_list.append(np.asarray(sv.num_ancillas())[:b_i])
                 nq_list.append(np.asarray(sv.num_qubits())[:b_i])
+                # num_layers must be the same for all instances
                 nl_list.append(np.asarray(sv.num_layers())[:b_i])
+                assert all((sv.num_layers() == nl_list[0]).all() for sv in valid_slot_views), "Inconsistent num_layers across slots"
                 no_list.append(np.asarray(sv.num_objectives())[:b_i])
             
             if not valid_slot_views:
