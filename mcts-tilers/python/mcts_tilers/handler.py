@@ -223,6 +223,9 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
     while True:
         try:
             first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
+            print(f"[handler {handler_id}] waiting for ready slot...")
+            first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
+            print(f"[handler {handler_id}] got slot {first_sv.slot}, b={first_sv.b()}")
             first_sv.set_handler_start_time()
         except KeyboardInterrupt:
             break
@@ -248,13 +251,16 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             nq_list = []
             nl_list = []
             no_list = []
-            slot_batch_sizes = []
 
+            slot_batch_sizes = []
+            valid_slot_views = []
             for sv in slot_views:
                 b_i = sv.b()
                 if b_i <= 0:
+                    sv.mark_done()
                     continue  # Skip uninitialized/invalid slots
                 slot_batch_sizes.append(b_i)
+                valid_slot_views.append(sv)
 
                 placement_list.append(np.asarray(sv.placement())[:b_i])
                 objectives_list.append(np.asarray(sv.objectives())[:b_i])
@@ -265,6 +271,9 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 nq_list.append(np.asarray(sv.num_qubits())[:b_i])
                 nl_list.append(np.asarray(sv.num_layers())[:b_i])
                 no_list.append(np.asarray(sv.num_objectives())[:b_i])
+            
+            if not valid_slot_views:
+                continue  # No valid slots to process
 
             # Concatenate into single batch
             placement_raw = np.concatenate(placement_list, axis=0)
@@ -310,7 +319,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
             # Write back per-slot
             idx = 0
-            for slot_len, sv in zip(slot_batch_sizes, slot_views):
+            for slot_len, sv in zip(slot_batch_sizes, valid_slot_views):
                 pri_slice = np.ascontiguousarray(priors_np[idx: idx + slot_len])
                 val_slice = np.ascontiguousarray(values_np[idx: idx + slot_len])
                 idx += slot_len
@@ -322,7 +331,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 sv.mark_done()
 
         except KeyboardInterrupt:
-            for sv in slot_views:
+            for sv in valid_slot_views:
                 try:
                     sv.mark_done()
                 except Exception:
