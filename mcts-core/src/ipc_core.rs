@@ -1,6 +1,6 @@
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
@@ -15,6 +15,29 @@ pub fn now_ns() -> u64 {
         (ts.tv_sec as u64) * 1_000_000_000u64 + (ts.tv_nsec as u64)
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// An IPC capable inference client communicating via shared memory.
+// ---------------------------------------------------------------------------------------------
+#[allow(dead_code)]
+pub struct IpcClient<S: SlotInit> {
+    arena: Arena<S>,
+    owner_id: u32,
+    next_req_id: AtomicU64,
+    print_timing: bool,
+}
+
+impl<S: SlotInit> IpcClient<S> {
+    pub fn new(arena: Arena<S>, owner_id: u32) -> Self {
+        Self {
+            arena,
+            owner_id,
+            next_req_id: AtomicU64::new(0),
+            print_timing: true,
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------------------------
 // SpinLock

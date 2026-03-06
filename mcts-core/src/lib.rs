@@ -7,5 +7,5 @@ pub mod inference;
 pub use crate::mcts::MCTS;
 pub use crate::node::Node;
 pub use crate::environment::Environment;
-pub use crate::inference::{InferenceClient, IpcClient};
-pub use crate::ipc_core::{Arena, SLOT_READY, SLOT_DONE, MAX_HANDLERS};
+pub use crate::inference::InferenceClient;
+pub use crate::ipc_core::{Arena, IpcClient, SLOT_READY, SLOT_DONE, MAX_HANDLERS};
