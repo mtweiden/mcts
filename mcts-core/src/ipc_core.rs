@@ -21,10 +21,10 @@ pub fn now_ns() -> u64 {
 // ---------------------------------------------------------------------------------------------
 #[allow(dead_code)]
 pub struct IpcClient<S: SlotInit> {
-    arena: Arena<S>,
-    owner_id: u32,
-    next_req_id: AtomicU64,
-    print_timing: bool,
+    pub arena: Arena<S>,
+    pub owner_id: u32,
+    pub next_req_id: AtomicU64,
+    pub print_timing: bool,
 }
 
 impl<S: SlotInit> IpcClient<S> {
