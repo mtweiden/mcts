@@ -5,7 +5,7 @@ use mcts_core::ipc_core::{SlotInit, SLOT_FREE};
 
 use tilers::qubit::Qubit;
 use tilers::objective::Objective;
-use tilers::enums::{Direction, Operation, Orientation, QubitId};
+use tilers::enums::{Operation, Orientation, QubitId};
 
 use crate::constants::*;
 use crate::environment::TilersObs;
@@ -47,6 +47,31 @@ pub struct TilersSlot {
     pub request_time_ns: AtomicU64,
     pub handler_start_time_ns: AtomicU64,
     pub response_time_ns: AtomicU64,
+}
+
+impl Default for TilersSlot {
+    fn default() -> Self {
+        Self {
+            state: AtomicU32::new(SLOT_FREE),
+            b: 0,
+            owner_id: 0,
+            req_id: 0,
+            h: [0; MAX_BATCH],
+            w: [0; MAX_BATCH],
+            num_ancillas: [0; MAX_BATCH],
+            num_qubits: [0; MAX_BATCH],
+            num_layers: [0; MAX_BATCH],
+            num_objectives: [[0; LOOKAHEAD_MAX]; MAX_BATCH],
+            placement: [[0; PLACEMENT_MAX]; MAX_BATCH],
+            objectives: [[0; OBJECTIVES_MAX]; MAX_BATCH],
+            action_mask: [0; MAX_BATCH * NUM_ACTIONS],
+            priors: [0.0; MAX_BATCH * NUM_ACTIONS],
+            values: [0.0; MAX_BATCH],
+            request_time_ns: AtomicU64::new(0),
+            handler_start_time_ns: AtomicU64::new(0),
+            response_time_ns: AtomicU64::new(0),
+        }
+    }
 }
 
 impl SlotInit for TilersSlot {
@@ -98,8 +123,6 @@ impl TilersSlot {
                     self.objectives[i][offset + 1..offset + 5].copy_from_slice(&a0);
                     let a1 = obj.arg_1.as_i32().to_le_bytes();
                     self.objectives[i][offset + 5..offset + 9].copy_from_slice(&a1);
-                    self.objectives[i][offset + 9] = obj.duration as u8;
-                    self.objectives[i][offset + 10] = obj.direction as u8;
                 }
             }
 
@@ -151,6 +174,7 @@ impl TilersSlot {
                 let no = self.num_objectives[i][l] as usize;
                 let layer_offset = l * OBJECTIVES_LAYER_MAX;
                 let mut layer = Vec::with_capacity(no);
+
                 for k in 0..no {
                     let offset = layer_offset + k * OBJECTIVE_SIZE;
                     let opcode = self.objectives[i][offset];
@@ -166,19 +190,16 @@ impl TilersSlot {
                         self.objectives[i][offset + 7],
                         self.objectives[i][offset + 8],
                     ]);
-                    let duration = self.objectives[i][offset + 9] as usize;
-                    let direction = self.objectives[i][offset + 10];
-                    layer.push(Objective {
-                        opcode: Operation::from_u8(opcode).unwrap(),
-                        arg_0: QubitId(arg_0),
-                        // WARNING: ancilla list is not serialized through IPC. This means we
-                        // cannot send concrete objectives through IPC.
-                        ancilla: Vec::new(),
-                        arg_1: QubitId(arg_1),
-                        duration,
-                        direction: Direction::from_u8(direction).unwrap(),
-                    });
+                    layer.push(
+                        Objective::new(
+                            Operation::from_u8(opcode).unwrap(),
+                            QubitId(arg_0),
+                            vec![],
+                            QubitId(arg_1),
+                        )
+                    );
                 }
+
                 objectives.push(layer);
             }
 
@@ -200,5 +221,61 @@ impl TilersSlot {
         }
 
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::environment::TilersObs;
+    use tilers::qubit::{Qubit};
+    use tilers::objective::Objective;
+    use tilers::enums::{Orientation, QubitId};
+
+    #[test]
+    fn test_slot_roundtrip() {
+        let obs = TilersObs {
+            placement: vec![
+                Qubit { id: QubitId(0), orientation: Orientation::Vertical },
+                Qubit { id: QubitId(1), orientation: Orientation::Horizontal },
+            ],
+            objectives: vec![vec![Objective::cx(QubitId(0), QubitId(1))]],
+            height: 3,
+            width: 4,
+            num_ancillas: 1,
+            action_mask: vec![true, false, true, false],
+        };
+
+        let mut slot = TilersSlot::default();
+        slot.pack_observations(&[obs]).unwrap();
+
+        // Read back and verify fields match
+        assert_eq!(slot.b, 1);
+        assert_eq!(slot.h[0], 3);
+        assert_eq!(slot.w[0], 4);
+        assert_eq!(slot.num_ancillas[0], 1);
+        assert_eq!(slot.num_qubits[0], 2);
+        assert_eq!(slot.num_layers[0], 1);
+        assert_eq!(slot.num_objectives[0][0], 1);
+
+        // Test full roundtrip through unpack
+        let unpacked = slot.unpack_observations();
+        assert_eq!(unpacked.len(), 1);
+        let u = &unpacked[0];
+        assert_eq!(u.height, 3);
+        assert_eq!(u.width, 4);
+        assert_eq!(u.num_ancillas, 1);
+        assert_eq!(u.placement.len(), 2);
+        assert_eq!(u.placement[0].id, QubitId(0));
+        assert_eq!(u.placement[1].id, QubitId(1));
+        assert_eq!(u.objectives.len(), 1);
+        assert_eq!(u.objectives[0].len(), 1);
+        assert_eq!(u.objectives[0][0].opcode, Operation::CX);
+        assert_eq!(u.objectives[0][0].arg_0, QubitId(0));
+        assert_eq!(u.objectives[0][0].arg_1, QubitId(1));
+        assert!(u.action_mask[0]);
+        assert!(!u.action_mask[1]);
+        assert!(u.action_mask[2]);
+        assert!(!u.action_mask[3]);
     }
 }
