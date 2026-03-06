@@ -36,7 +36,7 @@ def latest_checkpoint() -> str | None:
     return files[-1]
 
 
-MODEL = Agent()
+MODEL = Agent(embedding_dim=100, num_layers=16, lookahead=1)
 ckpt = latest_checkpoint()
 if ckpt is not None:
     MODEL.load_state(ckpt)
