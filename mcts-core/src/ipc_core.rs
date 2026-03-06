@@ -346,22 +346,31 @@ impl<S: SlotInit> Arena<S> {
     pub fn force_reset(&self) {
         unsafe {
             let hdr = &*self.hdr;
-            
+
+            // Ensure any stale lock state is cleared before we touch the queues
+            std::sync::atomic::fence(Ordering::SeqCst);
+
             // Drain and reinit all queues
             hdr.free_q.init();
             for q in &hdr.ready_q {
                 q.init();
             }
             hdr.next_handler.store(0, Ordering::Relaxed);
-            
+
+            std::sync::atomic::fence(Ordering::SeqCst);
+
             // Reset all slots and repopulate free queue
             for i in 0..self.num_slots {
                 let s = &*self.slots.add(i as usize);
                 s.init_free();
-                hdr.free_q.try_push(i).unwrap();
+                if hdr.free_q.try_push(i).is_err() {
+                    panic!(
+                        "force_reset: free_q full at slot {}; num_slots={} QCAP={}",
+                        i, self.num_slots, QCAP
+                    );
+                }
             }
-            
-            // Full fence to publish everything
+
             std::sync::atomic::fence(Ordering::SeqCst);
         }
     }
