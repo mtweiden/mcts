@@ -228,9 +228,12 @@ impl TilersSlot {
 mod tests {
     use super::*;
     use crate::environment::TilersObs;
+    use crate::environment::TilersEnv;
+    use mcts_core::Environment;
     use tilers::qubit::{Qubit};
     use tilers::objective::Objective;
     use tilers::enums::{Orientation, QubitId};
+    use tilers::env::Environment as TilersEnvInner;
 
     #[test]
     fn test_slot_roundtrip() {
@@ -277,5 +280,165 @@ mod tests {
         assert!(!u.action_mask[1]);
         assert!(u.action_mask[2]);
         assert!(!u.action_mask[3]);
+    }
+
+    #[test]
+    fn test_slot_roundtrip_larger_grid() {
+        let mut placement = Vec::new();
+        for i in 0..25 {
+            placement.push(Qubit {
+                id: QubitId(i),
+                orientation: if i % 2 == 0 { Orientation::Vertical } else { Orientation::Horizontal },
+            });
+        }
+        // Add some ancillas with negative IDs
+        placement.push(Qubit { id: QubitId(-1), orientation: Orientation::Vertical });
+        placement.push(Qubit { id: QubitId(-2), orientation: Orientation::Horizontal });
+
+        let obs = TilersObs {
+            placement,
+            objectives: vec![],
+            height: 5,
+            width: 5,
+            num_ancillas: 2,
+            action_mask: vec![false; NUM_ACTIONS],
+        };
+
+        let mut slot = TilersSlot::default();
+        slot.pack_observations(&[obs]).unwrap();
+        let unpacked = slot.unpack_observations();
+        let u = &unpacked[0];
+
+        assert_eq!(u.placement.len(), 27);
+        assert_eq!(u.placement[25].id, QubitId(-1));
+        assert_eq!(u.placement[26].id, QubitId(-2));
+        assert_eq!(u.placement[0].orientation, Orientation::Vertical);
+        assert_eq!(u.placement[1].orientation, Orientation::Horizontal);
+    }
+
+    #[test]
+    fn test_slot_roundtrip_multi_layer() {
+        let obs = TilersObs {
+            placement: vec![
+                Qubit { id: QubitId(0), orientation: Orientation::Vertical },
+                Qubit { id: QubitId(1), orientation: Orientation::Horizontal },
+                Qubit { id: QubitId(2), orientation: Orientation::Vertical },
+            ],
+            objectives: vec![
+                vec![
+                    Objective::cx(QubitId(0), QubitId(1)),
+                ],
+                vec![
+                    Objective::cz(QubitId(1), QubitId(2)),
+                    Objective::x(QubitId(0)),
+                ],
+            ],
+            height: 3,
+            width: 3,
+            num_ancillas: 0,
+            action_mask: vec![true; NUM_ACTIONS],
+        };
+
+        let mut slot = TilersSlot::default();
+        slot.pack_observations(&[obs]).unwrap();
+        let unpacked = slot.unpack_observations();
+        let u = &unpacked[0];
+
+        assert_eq!(u.objectives.len(), 2);
+        assert_eq!(u.objectives[0].len(), 1);
+        assert_eq!(u.objectives[0][0].opcode, Operation::CX);
+        assert_eq!(u.objectives[1].len(), 2);
+        assert_eq!(u.objectives[1][0].opcode, Operation::CZ);
+        assert_eq!(u.objectives[1][1].opcode, Operation::X);
+    }
+
+    #[test]
+    fn test_slot_roundtrip_batch() {
+        let obs1 = TilersObs {
+            placement: vec![Qubit { id: QubitId(0), orientation: Orientation::Vertical }],
+            objectives: vec![vec![
+                Objective::cx(QubitId(0), QubitId(1)),
+            ]],
+            height: 3,
+            width: 3,
+            num_ancillas: 0,
+            action_mask: vec![true; NUM_ACTIONS],
+        };
+
+        let obs2 = TilersObs {
+            placement: vec![
+                Qubit { id: QubitId(10), orientation: Orientation::Horizontal },
+                Qubit { id: QubitId(11), orientation: Orientation::Vertical },
+            ],
+            objectives: vec![vec![
+                Objective::cz(QubitId(10), QubitId(11)),
+            ]],
+            height: 5,
+            width: 4,
+            num_ancillas: 1,
+            action_mask: vec![false; NUM_ACTIONS],
+        };
+
+        let mut slot = TilersSlot::default();
+        slot.pack_observations(&[obs1, obs2]).unwrap();
+        let unpacked = slot.unpack_observations();
+
+        assert_eq!(unpacked.len(), 2);
+
+        assert_eq!(unpacked[0].height, 3);
+        assert_eq!(unpacked[0].placement[0].id, QubitId(0));
+        assert_eq!(unpacked[0].objectives[0][0].opcode, Operation::CX);
+        assert!(unpacked[0].action_mask[0]);
+
+        assert_eq!(unpacked[1].height, 5);
+        assert_eq!(unpacked[1].width, 4);
+        assert_eq!(unpacked[1].num_ancillas, 1);
+        assert_eq!(unpacked[1].placement[0].id, QubitId(10));
+        assert_eq!(unpacked[1].objectives[0][0].opcode, Operation::CZ);
+        assert!(!unpacked[1].action_mask[0]);
+    }
+
+    #[test]
+    fn test_action_mask_roundtrip() {
+        let mut mask = vec![false; NUM_ACTIONS];
+        mask[0] = true;
+        mask[42] = true;
+        mask[NUM_ACTIONS - 1] = true;
+
+        let obs = TilersObs {
+            placement: vec![Qubit { id: QubitId(0), orientation: Orientation::Vertical }],
+            objectives: vec![],
+            height: 2,
+            width: 2,
+            num_ancillas: 0,
+            action_mask: mask.clone(),
+        };
+
+        let mut slot = TilersSlot::default();
+        slot.pack_observations(&[obs]).unwrap();
+        let unpacked = slot.unpack_observations();
+
+        assert!(unpacked[0].action_mask[0]);
+        assert!(unpacked[0].action_mask[42]);
+        assert!(unpacked[0].action_mask[NUM_ACTIONS - 1]);
+        assert!(!unpacked[0].action_mask[1]);
+        assert!(!unpacked[0].action_mask[43]);
+    }    
+
+    #[test]
+    fn test_env_to_slot_roundtrip() {
+        let env = TilersEnvInner::new(3, 3, 1);
+        // set up objectives however your Environment API requires
+        let tilers_env = TilersEnv::new(env, 2);
+        let obs = tilers_env.observation();
+
+        let mut slot = TilersSlot::default();
+        slot.pack_observations(&[obs.clone()]).unwrap();
+        let unpacked = slot.unpack_observations();
+
+        assert_eq!(unpacked[0].height, obs.height);
+        assert_eq!(unpacked[0].width, obs.width);
+        assert_eq!(unpacked[0].placement.len(), obs.placement.len());
+        assert_eq!(unpacked[0].objectives.len(), obs.objectives.len());
     }
 }
