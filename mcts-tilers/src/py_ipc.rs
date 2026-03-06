@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use numpy::ndarray::Array2;
 use numpy::{Element, IntoPyArray, PyArray1, PyArray2};
 use numpy::PyArrayMethods;
+use numpy::PyUntypedArrayMethods;
 use pyo3::exceptions::PyRuntimeError;
 use pyo3::prelude::*;
 use pyo3::Bound;
@@ -302,7 +303,8 @@ impl PySlotView {
         Ok(unsafe { copy_to_array1(py, s.values.as_ptr(), b) })
     }
 
-    /// Write priors (b, NUM_ACTIONS) and values (b,) back into the slot.
+    /// Write priors (b, num_actions) and values (b,) back into the slot.
+    /// num_actions may be <= NUM_ACTIONS; remaining columns are zero-filled.
     pub fn write_priors_values<'py>(
         &self,
         _py: Python<'py>,
@@ -313,16 +315,23 @@ impl PySlotView {
         let s = unsafe { &mut *self.ptr };
 
         let priors_ro = priors.readonly();
-        let priors_slice = priors_ro.as_slice()
-            .map_err(|e| PyRuntimeError::new_err(format!("priors not contiguous: {e}")))?;
-
-        if priors_slice.len() != b * NUM_ACTIONS {
+        let priors_shape = priors_ro.shape();
+        if priors_shape[0] != b {
             return Err(PyRuntimeError::new_err(format!(
-                "expected priors of len {}, got {}",
-                b * NUM_ACTIONS,
-                priors_slice.len()
+                "expected priors with {} rows, got {}",
+                b, priors_shape[0]
             )));
         }
+        let num_actions = priors_shape[1];
+        if num_actions > NUM_ACTIONS {
+            return Err(PyRuntimeError::new_err(format!(
+                "priors has {} columns, max is NUM_ACTIONS={}",
+                num_actions, NUM_ACTIONS
+            )));
+        }
+
+        let priors_slice = priors_ro.as_slice()
+            .map_err(|e| PyRuntimeError::new_err(format!("priors not contiguous: {e}")))?;
 
         let values_ro = values.readonly();
         let values_slice = values_ro.as_slice()
@@ -331,12 +340,19 @@ impl PySlotView {
         if values_slice.len() != b {
             return Err(PyRuntimeError::new_err(format!(
                 "expected values of len {}, got {}",
-                b,
-                values_slice.len()
+                b, values_slice.len()
             )));
         }
 
-        s.priors[..b * NUM_ACTIONS].copy_from_slice(priors_slice);
+        // Zero-fill the entire priors region, then copy each row
+        s.priors[..b * NUM_ACTIONS].fill(0.0);
+        for i in 0..b {
+            let src_start = i * num_actions;
+            let dst_start = i * NUM_ACTIONS;
+            s.priors[dst_start..dst_start + num_actions]
+                .copy_from_slice(&priors_slice[src_start..src_start + num_actions]);
+        }
+
         s.values[..b].copy_from_slice(values_slice);
 
         Ok(())
