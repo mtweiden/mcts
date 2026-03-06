@@ -1,9 +1,9 @@
 [workspace]
-resolver = "3"
 members = [
   "mcts-core",
-  # "mcts-tilers",
+  "mcts-tilers",
 ]
+resolver = "2"
 
 [profile.release]
 opt-level = 3
