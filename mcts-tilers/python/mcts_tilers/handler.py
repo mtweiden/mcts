@@ -363,5 +363,7 @@ if __name__ == "__main__":
 
     arena_name = f"{args.arena_name}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
+    print(f"[arena] force_reset on '{arena.arena_name()}', {arena.num_slots()} slots")
     arena.force_reset()  # Clear any stale state from previous runs
+    print(f"[arena] force_reset complete")
     do_work(arena, args.handler_id, device)
