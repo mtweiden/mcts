@@ -2,8 +2,7 @@
 resolver = "3"
 members = [
   "mcts-core",
-  "mcts-ipc",
-  "pymcts",
+  # "mcts-tilers",
 ]
 
 [profile.release]

@@ -1,60 +1,28 @@
-use crate::enums::Action;
-use crate::enums::Observation;
-use crate::enums::TokenId;
+use std::fmt::Debug;
+use std::hash::Hash;
 
-/// Abstract Environment trait used by MCTS (single-threaded).
+/// A generic observation type
+pub trait Obs: Clone + Debug + Send + Hash + Eq {}
+
+/// A generic action type
+pub trait Act: Copy + Debug + Send + Hash + Eq {}
+impl<T: Copy + Debug + Send + Hash + Eq> Act for T {}
+
 /// Implement this trait for any concrete environment you want to run MCTS on.
 pub trait Environment: Clone {
+    type Act: Act;
+    type Obs: Obs;
+
     /// Apply the action to the environment (mutates self).
-    fn step(&mut self, action: Action);
+    fn step(&mut self, action: Self::Act);
     /// Is the environment in a terminal state?
     fn done(&self) -> bool;
     /// Return the observation vector for the current state.
-    fn observation(&self) -> Observation;
+    fn observation(&self) -> Self::Obs;
     /// Return the list of valid actions in the current state.
-    fn valid_actions(&self) -> Vec<Action>;
+    fn valid_actions(&self) -> Vec<Self::Act>;
     /// Return a compact hash / id for the current state.
-    fn hash_state(&self) -> u64;
+    fn hash(&self) -> u64;
     /// Render a string representation (used for debugging / repr).
     fn render(&self) -> String;
-}
-
-/// A Concrete example
-/// Provides an implementation for tilers_core::env::Environment so existing code works.
-impl Environment for tilers_core::env::Environment {
-    fn step(&mut self, action: Action) {
-        let _ = tilers_core::env::Environment::step(self, action as usize);
-        tilers_core::env::Environment::finish_cultivating(self);
-    }
-
-    fn done(&self) -> bool {
-        tilers_core::env::Environment::done(self)
-    }
-
-    fn observation(&self) -> Observation {
-        let placement = tilers_core::env::Environment::get_placement_tokens(self).unwrap();
-        let obj_0 = tilers_core::env::Environment::get_objective_tokens(self, 0).unwrap();
-        let obj_1 = tilers_core::env::Environment::get_objective_tokens(self, 1).unwrap();
-        let valid_actions = tilers_core::env::Environment::valid_actions(self);
-        let p: Vec<TokenId> = placement.iter().map(|&x| x as TokenId).collect();
-        let o0: Vec<TokenId> = obj_0.iter().map(|&x| x as TokenId).collect();
-        let o1: Vec<TokenId> = obj_1.iter().map(|&x| x as TokenId).collect();
-        let va: Vec<Action> = valid_actions.iter().map(|&x| x as Action).collect();
-        Observation::from((p, o0, o1, self.height, self.width, self.num_ancillas(), va))
-    }
-
-    fn valid_actions(&self) -> Vec<Action> {
-        tilers_core::env::Environment::valid_actions(self)
-            .into_iter()
-            .map(|a| a as u16)
-            .collect()
-    }
-
-    fn hash_state(&self) -> u64 {
-        tilers_core::env::Environment::hash_state(self)
-    }
-
-    fn render(&self) -> String {
-        tilers_core::env::Environment::render(self)
-    }
 }

@@ -1,14 +1,12 @@
 use std::fs::{File, OpenOptions};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 use memmap2::{MmapMut, MmapOptions};
 use libc::{clock_gettime, timespec, CLOCK_MONOTONIC};
 
-use crate::enums::{Action, Observation, Prior, TokenId, Value};
-use crate::enums::{GRID_MAX, MAX_BATCH, MAX_OBJ0, MAX_OBJ1, NUM_ACTIONS};
 
 pub fn now_ns() -> u64 {
     unsafe {
@@ -19,136 +17,7 @@ pub fn now_ns() -> u64 {
 }
 
 // ---------------------------------------------------------------------------------------------
-// IPC Shared Memory Slot
-// ---------------------------------------------------------------------------------------------
-/// The Slot is unused
-pub const SLOT_FREE: u32 = 0;
-/// The Slot has inputs which are ready for processing
-pub const SLOT_READY: u32 = 1;
-/// The Slot is being processed
-pub const SLOT_WAITING: u32 = 2;
-/// The Slot has completed processing and outputs are ready
-pub const SLOT_DONE: u32 = 3;
-
-/// Slots are the units of work exchanged between the MCTS process and the inference process.
-/// Each slot contains memory space of batches of inputs and outputs. The state of a slot is
-/// managed via atomic variables and ring queues.
-#[repr(C)]
-pub struct Slot {
-    // Header information
-    pub state: AtomicU32,
-    pub b: u32,
-    pub owner_id: u32,
-    pub req_id: u64,
-
-    // ----- inputs -----
-    pub h: [u8; MAX_BATCH],
-    pub w: [u8; MAX_BATCH],
-    pub num_ancillas: [u8; MAX_BATCH],
-    pub obj0_len: [u16; MAX_BATCH],
-    pub obj1_len: [u16; MAX_BATCH],
-    pub placement: [u16; MAX_BATCH * GRID_MAX],
-    pub obj0: [u16; MAX_BATCH * MAX_OBJ0],
-    pub obj1: [u16; MAX_BATCH * MAX_OBJ1],
-    pub action_mask: [u8; MAX_BATCH * NUM_ACTIONS],
-
-    // ----- outputs -----
-    pub priors: [f32; MAX_BATCH * NUM_ACTIONS],
-    pub values: [f32; MAX_BATCH],
-
-    // ----- timing -----
-    pub request_time_ns: AtomicU64,
-    pub handler_start_time_ns: AtomicU64,
-    pub response_time_ns: AtomicU64,
-}
-
-impl Slot {
-    pub fn init_free(&self) {
-        self.state.store(SLOT_FREE, Ordering::Relaxed);
-    }
-
-    /// Convert all `b` entries in this Slot into a Vec<Observation>.
-    pub fn unpack_observations(&self) -> Vec<Observation> {
-        let b = self.b as usize;
-        let mut out = Vec::with_capacity(b);
-        for i in 0..b {
-            let height = self.h[i] as usize;
-            let width = self.w[i] as usize;
-            let num_ancillas = self.num_ancillas[i] as usize;
-
-            // placement
-            let placement_len = (height * width).min(GRID_MAX);
-            let placement_offset = i * GRID_MAX;
-            let mut placement = Vec::with_capacity(placement_len);
-            for j in 0..placement_len {
-                placement.push(self.placement[placement_offset + j] as TokenId);
-            }
-
-            // objectives
-            let obj0_len = self.obj0_len[i] as usize;
-            let obj1_len = self.obj1_len[i] as usize;
-            let obj0_offset = i * MAX_OBJ0;
-            let obj1_offset = i * MAX_OBJ1;
-            let mut objectives_0 = Vec::with_capacity(obj0_len);
-            for j in 0..obj0_len {
-                objectives_0.push(self.obj0[obj0_offset + j] as TokenId);
-            }
-            let mut objectives_1 = Vec::with_capacity(obj1_len);
-            for j in 0..obj1_len {
-                objectives_1.push(self.obj1[obj1_offset + j] as TokenId);
-            }
-
-            // valid actions from action_mask
-            let mask_offset = i * NUM_ACTIONS;
-            let mut valid_actions = Vec::new();
-            for a in 0..NUM_ACTIONS {
-                if self.action_mask[mask_offset + a] != 0 {
-                    valid_actions.push(a as Action);
-                }
-            }
-
-            out.push(Observation {
-                placement,
-                objectives_0,
-                objectives_1,
-                height,
-                width,
-                num_ancillas,
-                valid_actions,
-            });
-        }
-        out
-    }
-
-    pub fn pack_priors_values(&mut self, priors: &Vec<Prior>, values: &Vec<Value>) -> Result<()> {
-        let b = self.b as usize;
-        if priors.len() != b {
-            return Err(anyhow!("priors.len()={} != slot.b={}", priors.len(), b));
-        }
-        if values.len() != b {
-            return Err(anyhow!("values.len()={} != slot.b={}", values.len(), b));
-        }
-
-        for i in 0..b {
-            self.priors.fill(0.0);
-            self.values[i] = 0.0;
-            let offset = i * NUM_ACTIONS;
-            let prior = &priors[i];
-            for (a, p) in prior.iter() {
-                self.priors[offset + (*a as usize)] = *p;
-            }
-            self.values[i] = values[i];
-        }
-        Ok(())
-    }
-}
-
-pub struct SlotRef<'a> { pub slot: &'a Slot }
-
-pub struct SlotMut<'a> { pub slot: &'a mut Slot }
-
-// ---------------------------------------------------------------------------------------------
-// Ring Queue for Slot Management
+// SpinLock
 // ---------------------------------------------------------------------------------------------
 /// Simple cross-process spinlock that lives in shared memory
 #[repr(C)]
@@ -172,7 +41,7 @@ impl SpinLock {
             } else if spins < 10_000 {
                 std::thread::yield_now();
             } else {
-                std::thread::sleep(Duration::from_micros(10));
+                std::thread::sleep(Duration::from_micros(1));
             }
         }
     }
@@ -183,7 +52,10 @@ impl SpinLock {
     }
 }
 
-pub const QCAP: usize = 2048;
+// ---------------------------------------------------------------------------------------------
+// RingQueue for Slot Management
+// ---------------------------------------------------------------------------------------------
+pub const QCAP: usize = 2048; // max capacity of the queue; must be >= max number of slots in the arena
 
 /// A simpled fixed-size ring queue that stores slot indices for IPC.
 #[repr(C)]
@@ -274,7 +146,7 @@ impl RingQueue {
 }
 
 // ---------------------------------------------------------------------------------------------
-// IPC Shared Memory Arena
+// IPC Shared Memory Arena which is generic over Slot type
 // ---------------------------------------------------------------------------------------------
 /// The maximum number of GPUs supported for handling inference requests. For a DGX this is 4.
 pub const MAX_HANDLERS: usize = 4;
@@ -296,11 +168,11 @@ pub struct ArenaHeader {
     // slots follow immediately after header in the shm regioni
 }
 
-pub struct Arena {
+pub struct Arena<S: SlotInit> {
     #[allow(dead_code)]
     mmap: MmapMut,
     hdr: *mut ArenaHeader,
-    slots: *mut Slot,
+    slots: *mut S,
     num_slots: u32,
 }
 
@@ -309,7 +181,30 @@ fn arena_file_path(name: &str) -> PathBuf {
     PathBuf::from(format!("/tmp/{}.mmap", name))
 }
 
-impl Arena {
+// ---------------------------------------------------------------------------------------------
+// Generic Slot structure for inference requests, to be stored in the Arena.
+// ---------------------------------------------------------------------------------------------
+/// The Slot is unused
+pub const SLOT_FREE: u32 = 0;
+/// The Slot has inputs which are ready for processing
+pub const SLOT_READY: u32 = 1;
+/// The Slot is being processed
+pub const SLOT_WAITING: u32 = 2;
+/// The Slot has completed processing and outputs are ready
+pub const SLOT_DONE: u32 = 3;
+
+pub struct SlotRef<'a, S> { pub slot: &'a S }
+
+pub struct SlotMut<'a, S> { pub slot: &'a mut S }
+
+/// Interface for shared-memory slot types used by the Arena. Each slot must be able to reset
+/// itself to a free state and expose its atomic state flag for lifecycle management.
+pub trait SlotInit {
+    fn init_free(&self);
+    fn state(&self) -> &AtomicU32;
+}
+
+impl<S: SlotInit> Arena<S> {
     pub fn create_or_open(name: &str, num_slots: usize, num_handlers: usize) -> Result<Self> {
         if num_slots == 0 {
             return Err(anyhow!("num_slots must be > 0"));
@@ -334,7 +229,7 @@ impl Arena {
             .open(&path)?;
 
         let total_size =
-            std::mem::size_of::<ArenaHeader>() + num_slots * std::mem::size_of::<Slot>();
+            std::mem::size_of::<ArenaHeader>() + num_slots * std::mem::size_of::<S>();
 
         file.set_len(total_size as u64)?;
 
@@ -342,7 +237,7 @@ impl Arena {
 
         let hdr = mmap.as_mut_ptr() as *mut ArenaHeader;
         let slots = unsafe {
-            (mmap.as_mut_ptr() as *mut u8).add(std::mem::size_of::<ArenaHeader>()) as *mut Slot
+            (mmap.as_mut_ptr() as *mut u8).add(std::mem::size_of::<ArenaHeader>()) as *mut S
         };
 
         // Initialize only when first created (or when magic mismatched)
@@ -430,18 +325,18 @@ impl Arena {
     }
 
     #[inline]
-    pub fn slot_ptr(&self, slot: u32) -> *mut Slot {
+    pub fn slot_ptr(&self, slot: u32) -> *mut S {
         assert!(slot < self.num_slots);
         unsafe { self.slots.add(slot as usize) }
     }
 
-    pub fn slot_mut(&self, slot: u32) -> SlotMut<'_> {
+    pub fn slot_mut(&self, slot: u32) -> SlotMut<'_, S> {
         SlotMut {
             slot: unsafe { &mut *self.slot_ptr(slot) },
         }
     }
 
-    pub fn slot(&self, slot: u32) -> SlotRef<'_> {
+    pub fn slot(&self, slot: u32) -> SlotRef<'_, S> {
         SlotRef {
             slot: unsafe { &*self.slot_ptr(slot) },
         }
@@ -463,7 +358,7 @@ impl Arena {
         let s = unsafe { &*self.slot_ptr(slot) };
         let mut spins = 0u32;
         loop {
-            let st = s.state.load(Ordering::Acquire);
+            let st = s.state().load(Ordering::Acquire);
             if st == SLOT_DONE {
                 return;
             }
@@ -471,15 +366,20 @@ impl Arena {
             if spins < 100_000 {
                 std::hint::spin_loop();
             } else {
-                std::thread::sleep(Duration::from_micros(50));
+                std::thread::sleep(Duration::from_micros(5));
             }
         }
     }
 
     pub fn release_slot(&self, slot: u32) {
         let s = unsafe { &*self.slot_ptr(slot) };
-        s.state.store(SLOT_FREE, Ordering::Release);
+        s.state().store(SLOT_FREE, Ordering::Release);
         self.header().free_q.push_blocking(slot);
+    }
+
+    pub fn mark_done(&self, slot: u32) {
+        let s = unsafe { &*self.slot_ptr(slot) };
+        s.state().store(SLOT_DONE, Ordering::Release);
     }
 
     pub fn num_slots(&self) -> u32 {
@@ -499,25 +399,6 @@ impl Arena {
         let n = self.header().num_handlers as usize;
         let h = handler % n;
         self.header().ready_q[h].try_pop()
-    }
-
-    pub fn mark_done(&self, slot: u32) {
-        let s = unsafe { &*self.slot_ptr(slot) };
-        s.state.store(SLOT_DONE, Ordering::Release);
-    }
-
-    pub fn mark_ready(&self, slot: u32, b: usize, owner_id: u32, req_id: u64) {
-        let sm = unsafe { &mut *self.slot_ptr(slot) };
-        sm.b = b as u32;
-        sm.owner_id = owner_id;
-        sm.req_id = req_id;
-        sm.state.store(SLOT_READY, Ordering::Release);
-    }
-
-    pub fn clear_outputs(&self, slot: u32) {
-        let sm = unsafe { &mut *self.slot_ptr(slot) };
-        sm.priors.fill(0.0);
-        sm.values.fill(0.0);
     }
 }
 

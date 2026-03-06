@@ -1,19 +1,9 @@
 [package]
 name = "mcts-core"
 version = "0.2.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
-tilers-core = { path = "/pscratch/sd/m/mtweiden/tile_mcts/tilers/tilers-core" }
-rand = "0.9"
-serde = { version = "1.0.228", features = ["derive"] }
 anyhow = "1.0.100"
-json = "0.12.4"
-rand_distr = "0.5.1"
-num_cpus = "1.17.0"
-pyo3 = { version = "0.27.2", features = ["extension-module","auto-initialize"] }
 memmap2 = "0.9.9"
 libc = "0.2.178"
-
-[build-dependencies]
-maturin = "1.2" # optional; for building the Python wheel locally
