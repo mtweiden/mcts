@@ -13,6 +13,14 @@ use mcts_core::ipc_core::{now_ns, Arena};
 use crate::constants::*;
 use crate::slot::TilersSlot;
 
+#[cfg(feature = "test-helpers")]
+use tilers::env::Environment as TilersEnvInner;
+#[cfg(feature = "test-helpers")]
+use mcts_core::{Environment, InferenceClient};
+#[cfg(feature = "test-helpers")]
+use crate::client::TilersIpcClient;
+#[cfg(feature = "test-helpers")]
+use crate::environment::TilersEnv;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PyArena
@@ -20,6 +28,8 @@ use crate::slot::TilersSlot;
 #[pyclass(unsendable)]
 pub struct PyArena {
     arena: Arena<TilersSlot>,
+    arena_name: String,
+    num_handlers: usize,
 }
 
 #[pymethods]
@@ -28,11 +38,19 @@ impl PyArena {
     pub fn new(name: String, num_slots: usize, num_handlers: usize) -> PyResult<Self> {
         let arena = Arena::create_or_open(&name, num_slots, num_handlers)
             .map_err(|e| PyRuntimeError::new_err(format!("{e:?}")))?;
-        Ok(Self { arena })
+        Ok( Self { arena, arena_name: name, num_handlers } )
     }
 
     pub fn num_slots(&self) -> u32 {
         self.arena.num_slots()
+    }
+
+    pub fn num_handlers(&self) -> usize {
+        self.num_handlers
+    }
+
+    pub fn arena_name(&self) -> &str {
+        &self.arena_name
     }
 
     pub fn pop_ready(&self, handler: usize) -> u32 {
@@ -91,6 +109,51 @@ impl PyArena {
         } else {
             Ok(None)
         }
+    }
+
+    /// Temp test helper: create an env, pack obs, submit to handler, wait, return results.
+    #[cfg(feature = "test-helpers")]
+    fn submit_and_collect(
+        &self,
+        h: usize,
+        w: usize,
+        num_blanks: usize,
+        num_objectives: usize,
+        seed: u64,
+    ) -> PyResult<(Vec<Vec<f32>>, Vec<f32>)> {
+        let mut env = TilersEnvInner::new(h, w, num_blanks);
+        env.set_seed(Some(seed));
+        env.random_objectives(num_objectives, false);
+        let tilers_env = TilersEnv::new(env, 2);
+
+        let obs = tilers_env.observation();
+        let observations = vec![obs];
+
+        // Open a second handle to the same shared memory arena
+        let arena2 = Arena::<TilersSlot>::create_or_open(
+            &self.arena_name,
+            self.num_slots() as usize,
+            self.num_handlers,
+        )
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+        let client = TilersIpcClient::new(arena2, 9999);
+        println!("[rust] about to call infer");
+        let (priors, values) = client
+            .infer(&observations)
+            .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+        println!("[rust] finished calling infer");
+
+        let priors_vecs: Vec<Vec<f32>> = priors
+            .iter()
+            .map(|a| {
+                (0..NUM_ACTIONS)
+                    .map(|a_idx| *a.get(&(a_idx as Action)).unwrap_or(&0.0))
+                    .collect()
+            })
+            .collect();
+
+        Ok((priors_vecs, values))
     }
 }
 
