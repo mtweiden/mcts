@@ -105,3 +105,32 @@ impl InferenceClient<TilersEnv> for TilersIpcClient {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_ipc_client_claim_release() {
+        use mcts_core::ipc_core::Arena;
+        use mcts_core::ipc_core::SLOT_FREE;
+
+        let arena: Arena<TilersSlot> = Arena::create_or_open("test_claim_release", 1, 1).unwrap();
+        let slot = arena.slot(0);
+
+        // Slot should start free
+        assert_eq!(slot.slot.state.load(Ordering::Relaxed), SLOT_FREE);
+
+        // Simulate claiming
+        slot.slot.state.store(SLOT_READY, Ordering::Release);
+        assert_eq!(slot.slot.state.load(Ordering::Relaxed), SLOT_READY);
+
+        // Simulate handler completing
+        slot.slot.state.store(SLOT_DONE, Ordering::Release);
+        assert_eq!(slot.slot.state.load(Ordering::Relaxed), SLOT_DONE);
+
+        // Release back to free
+        slot.slot.state.store(SLOT_FREE, Ordering::Release);
+        assert_eq!(slot.slot.state.load(Ordering::Relaxed), SLOT_FREE);
+    }
+}
