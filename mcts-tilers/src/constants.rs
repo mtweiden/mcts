@@ -13,8 +13,8 @@ pub const MAX_BATCH: usize = 8;
 
 /// Packed qubit size: 4 bytes i32 id + 1 byte orientation
 pub const QUBIT_SIZE: usize = 5;
-/// Packed objective size: 1 opcode + 4 arg0 + 4 arg1 + 1 duration + 1 direction
-pub const OBJECTIVE_SIZE: usize = 11;
+/// Packed objective size: 1 opcode + 4 arg0 + 4 arg1
+pub const OBJECTIVE_SIZE: usize = 9;
 /// Max bytes for placement per observation
 pub const PLACEMENT_MAX: usize = GRID_MAX * QUBIT_SIZE;
 /// Max bytes for one layer of objectives
