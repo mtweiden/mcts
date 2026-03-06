@@ -43,6 +43,14 @@ class PyArena:
     def try_pop_ready_view(
         self, *, handler: int, clear_outputs: bool = True,
     ) -> PySlotView | None: ...
+    def submit_and_collect(
+        self,
+        h: int,
+        w: int,
+        num_blanks: int,
+        num_objectives: int,
+        seed: int,
+    ) -> tuple[list[list[float]], list[float]]: ...
 
 # ------------------------------------------------------------------------------
 # MCTS types
