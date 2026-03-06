@@ -78,7 +78,7 @@ impl SpinLock {
 // ---------------------------------------------------------------------------------------------
 // RingQueue for Slot Management
 // ---------------------------------------------------------------------------------------------
-pub const QCAP: usize = 2048; // max capacity of the queue; must be >= max number of slots in the arena
+pub const QCAP: usize = 4096; // max capacity of the queue; must be >= max number of slots in the arena
 
 /// A simpled fixed-size ring queue that stores slot indices for IPC.
 #[repr(C)]
@@ -232,9 +232,9 @@ impl<S: SlotInit> Arena<S> {
         if num_slots == 0 {
             return Err(anyhow!("num_slots must be > 0"));
         }
-        if num_slots > QCAP {
+        if num_slots >= QCAP {
             return Err(anyhow!(
-                "num_slots={} exceeds queue capacity QCAP={}",
+                "num_slots={} must be less than QCAP={}",
                 num_slots,
                 QCAP
             ));
