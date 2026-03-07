@@ -293,10 +293,12 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             obj_layers = unpack_objectives_batch(objectives_raw, nl_all, no_all)
 
             # Build board representation for the model
-            print(f"[DEBUG] nl_all = {nl_all}, max={nl_all.max()}")
             boards_np = build_boards(
                 qubit_ids, qubit_oris, nq_all, obj_layers, nl_all, no_all,
             )
+            print(f"[DEBUG] nl_all max={nl_all.max()}, boards_np.shape={boards_np.shape}")
+            assert boards_np.shape[1] == MODEL.lookahead + 1, \
+                f"build_boards returned shape {boards_np.shape}, expected num_layers={MODEL.lookahead + 1}"
 
             # Build tensors
             boards_t = torch.from_numpy(np.ascontiguousarray(boards_np)).to(device)
