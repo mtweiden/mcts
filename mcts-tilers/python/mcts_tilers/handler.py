@@ -293,6 +293,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             obj_layers = unpack_objectives_batch(objectives_raw, nl_all, no_all)
 
             # Build board representation for the model
+            print(f"[DEBUG] nl_all = {nl_all}, max={nl_all.max()}")
             boards_np = build_boards(
                 qubit_ids, qubit_oris, nq_all, obj_layers, nl_all, no_all,
             )
