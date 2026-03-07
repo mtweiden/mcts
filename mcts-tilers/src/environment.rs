@@ -41,6 +41,7 @@ impl TilersEnv {
     pub fn build_obs(&self) -> TilersObs {
         let placement: Vec<Qubit> = self.inner.get_placement();
         let objectives: Vec<Vec<Objective>> = self.inner.get_objectives(self.num_objective_layers);
+        assert_eq!(objectives.len(), self.num_objective_layers);
 
         let height = self.inner.height;
         let width = self.inner.width;
