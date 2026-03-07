@@ -217,7 +217,9 @@ def build_boards(
 # Inference loop
 # ------------------------------------------------------------------------------
 def do_work(arena: PyArena, handler_id: int, device: str) -> None:
+    iteration = 0
     while True:
+        print(f"[handler {handler_id}] loop iteration {iteration}, {len(slot_views)} slots pending", flush=True)
         try:
             print(f"[handler {handler_id}] waiting for ready slot...")
             first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
@@ -225,6 +227,8 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             first_sv.set_handler_start_time()
         except KeyboardInterrupt:
             break
+
+        iteration += 1
 
         slot_views = [first_sv]
         start = time.monotonic()
