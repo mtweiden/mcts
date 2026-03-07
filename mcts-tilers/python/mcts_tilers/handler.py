@@ -85,7 +85,6 @@ def unpack_objectives_batch(
     """
     total = raw.shape[0]
     max_nl = max(1, int(num_layers.max()))
-    print(f"[DEBUG3] unpack_objectives_batch: num_layers.max()={num_layers.max()}, max_nl={max_nl}")
 
     layers = []
     for l in range(max_nl):
@@ -221,9 +220,9 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
     while True:
         print(f"[handler {handler_id}] loop iteration {iteration}, {len(slot_views)} slots pending", flush=True)
         try:
-            print(f"[handler {handler_id}] waiting for ready slot...")
+            # print(f"[handler {handler_id}] waiting for ready slot...")
             first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
-            print(f"[handler {handler_id}] got slot {first_sv.slot}")
+            # print(f"[handler {handler_id}] got slot {first_sv.slot}")
             first_sv.set_handler_start_time()
         except KeyboardInterrupt:
             break
