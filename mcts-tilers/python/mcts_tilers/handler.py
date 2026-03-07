@@ -218,7 +218,6 @@ def build_boards(
 def do_work(arena: PyArena, handler_id: int, device: str) -> None:
     while True:
         try:
-            first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
             print(f"[handler {handler_id}] waiting for ready slot...")
             first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
             print(f"[handler {handler_id}] got slot {first_sv.slot}, b={first_sv.b()}")
