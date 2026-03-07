@@ -257,22 +257,22 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 slot_batch_sizes.append(b_i)
                 valid_slot_views.append(sv)
 
-                placement_list.append(np.asarray(sv.placement()[:b_i]))
-                objectives_list.append(np.asarray(sv.objectives()[:b_i]))
-                mask_list.append(np.asarray(sv.action_mask()[:b_i]))
-                h_list.append(np.asarray(sv.h()[:b_i]))
-                w_list.append(np.asarray(sv.w()[:b_i]))
-                ancillas_list.append(np.asarray(sv.num_ancillas()[:b_i]))
-                nq_list.append(np.asarray(sv.num_qubits()[:b_i]))
+                placement_list.append(np.asarray(sv.placement()[:b_i], copy=True))
+                objectives_list.append(np.asarray(sv.objectives()[:b_i], copy=True))
+                mask_list.append(np.asarray(sv.action_mask()[:b_i], copy=True))
+                h_list.append(np.asarray(sv.h()[:b_i], copy=True))
+                w_list.append(np.asarray(sv.w()[:b_i], copy=True))
+                ancillas_list.append(np.asarray(sv.num_ancillas()[:b_i], copy=True))
+                nq_list.append(np.asarray(sv.num_qubits()[:b_i], copy=True))
                 # num_layers must be the same for all instances
-                nl_list.append(np.asarray(sv.num_layers()[:b_i]))
+                nl_list.append(np.asarray(sv.num_layers()[:b_i], copy=True))
                 if not all((sv.num_layers() == nl_list[0]).all() for sv in valid_slot_views):
                     base_size = nl_list[0].shape[0]
                     for sv in valid_slot_views:
                         if not (sv.num_layers() == nl_list[0]).all():
                             print(f"[DEBUG] Slot {sv.slot} has inconsistent num_layers: {sv.num_layers()} vs {base_size}")
                     raise ValueError("Inconsistent num_layers across slots in the same batch")
-                no_list.append(np.asarray(sv.num_objectives()[:b_i]))
+                no_list.append(np.asarray(sv.num_objectives()[:b_i], copy=True))
             
             if not valid_slot_views:
                 continue  # No valid slots to process
