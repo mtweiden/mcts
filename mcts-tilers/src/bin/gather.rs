@@ -66,7 +66,10 @@ impl Gatherer {
         let mut solved_env = env.clone();
         let solver = Solver::new();
         let _ = solver.solve(&mut solved_env, true).unwrap();
-        solved_env.depth(true, true)
+        println!("[SOLVING ENVIRONMENT]");
+        let depth = solved_env.depth(true, true);
+        println!("[ENVIRONMENT SOLVED] depth = {}", depth);
+        depth
     }
 
     /// Directly sampling from Dirichlet distribution requires num_actions to be known at
