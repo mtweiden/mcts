@@ -1,7 +1,6 @@
 use std::env;
 use std::collections::HashMap;
 use std::io::Write;
-use std::iter::zip;
 
 use serde_json::{Value, json, Map};
 use rand_distr::{Gamma, Distribution};
@@ -135,110 +134,6 @@ impl Gatherer {
         valid_actions[dist.sample(rng)] as Action
     }
 
-    /// For each action taken, compare the agent's score to the heuristic's along every step of
-    /// the trajectory.
-    pub fn score_transitions(
-        &self,
-        base_env: &Environment,
-        agent_actions: &[usize],
-    ) -> Vec<f32> {
-        // Plus 1 for the terminal state at the end
-        let mut scores: Vec<f32> = Vec::with_capacity(agent_actions.len() + 1);
-
-        let mut env = base_env.clone();
-
-        // If the agent is better than the heuristic from the start, reward immediately.
-        let initial_ref_depth = self.solve_with_heuristic(&env);
-        let initial_agent_depth = {
-            let mut temp_env = env.clone();
-            for ac in agent_actions {
-                let _ = temp_env.step(*ac);
-                temp_env.finish_cultivating(None, None);
-            }
-            temp_env.depth(true, true)
-        };
-        if initial_agent_depth < initial_ref_depth {
-            return vec![1.0; agent_actions.len()];
-        }
-
-        // For each action in the agent trajectory, produce a value target for the
-        // current state (before taking that action).
-        for i in 0..agent_actions.len() {
-            // Starting at environment state after action i-1
-            env.executed_objectives.clear();
-
-            // Heuristic reference depth from this state (clear cultivated resources
-            // when necessary so heuristic can move).
-            let valid_actions = env.valid_actions();
-            let ref_depth = if !valid_actions.contains(&0)
-                && !valid_actions.iter().any(|&a| a > env.num_ancillas())
-            {
-                let mut tmp = env.clone();
-                tmp.clear_cultivated_resources();
-                self.solve_with_heuristic(&tmp)
-            } else {
-                self.solve_with_heuristic(&env)
-            };
-
-            // Depth if the agent follows its remaining actions from this state
-            let mut temp_env = env.clone();
-            let remaining_actions = &agent_actions[i..];
-            for ac in remaining_actions {
-                let _ = temp_env.step(*ac);
-                temp_env.finish_cultivating(None, None);
-            }
-            let agent_depth = temp_env.depth(true, true);
-
-            // Check whether the immediate action finishes the game (score = +1.0).
-            let ac = agent_actions[i];
-            let mut next_env = env.clone();
-            let _ = next_env.step(ac);
-            next_env.finish_cultivating(None, None);
-
-            let score = if next_env.done() {
-                1.0f32
-            } else {
-                // Small bias so recreating the heuristic's actions is not neutral but
-                // slightly rewarded.
-                ((0.1 + ref_depth - agent_depth) / 2.0).tanh()
-            };
-            scores.push(score);
-
-            // Advance the working environment by the chosen action
-            let _ = env.step(ac);
-            env.finish_cultivating(None, None);
-        }
-        scores
-    }
-
-    pub fn supervised_edge_visits(
-        &self,
-        selected_action: Action,
-        valid_actions: &[Action],
-        weight_on_selected: f32,
-    ) -> HashMap<Action, usize> {
-        assert!(
-            (0.0..=1.0).contains(&weight_on_selected),
-            "weight_on_selected must be in [0, 1]"
-        );
-        let num_actions = valid_actions.len();
-        let weight_on_unselected = if num_actions > 1 {
-            (1.0 - weight_on_selected) / (num_actions as f32 - 1.0)
-        } else {
-            0.0
-        };
-        let mut edge_visits: HashMap<Action, usize> = HashMap::new();
-        for &action in valid_actions {
-            let visits = if action == selected_action {
-                (weight_on_selected * 1000.0) as usize
-            } else {
-                (weight_on_unselected * 1000.0) as usize
-            };
-            edge_visits.insert(action, visits);
-        }
-        edge_visits
-    }
-
     fn serialize_placement(placement: &[Qubit]) -> Value {
         Value::Array(
             placement
@@ -259,18 +154,16 @@ impl Gatherer {
                         layer
                             .iter()
                             .map(|o| {
-                                json!([
-                                    o.opcode as u8,
-                                    o.arg_0.as_i32(),
-                                    o.arg_1.as_i32(),
-                                    o.duration,
-                                    o.direction as u8
-                                ])
+                                if o.opcode.is_single_qubit() {
+                                    json!([o.opcode as u8, o.arg_0.as_i32()])
+                                } else {
+                                    json!([o.opcode as u8, o.arg_0.as_i32(), o.arg_1.as_i32()])
+                                }
                             })
-                            .collect(),
+                            .collect::<Vec<Value>>(),
                     )
                 })
-                .collect(),
+                .collect::<Vec<Value>>(),
         )
     }
 
@@ -333,54 +226,8 @@ impl Gatherer {
             mcts.advance_root(action);
         }
 
-        // If not solved, bootstrap using a heuristic solution from the final state so that
-        // some supervised learning can be done.
-        let solution_depth = if !tilers_env.inner.done() {
-            let solver = Solver::new();
-            let bootstrap_actions = solver.solve(&mut tilers_env.inner, false).unwrap();
-            for ac in bootstrap_actions {
-                let placement = tilers_env.inner.get_placement();
-                let objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
-                let valid_actions: Vec<Action> = tilers_env
-                    .inner
-                    .valid_actions()
-                    .iter()
-                    .map(|&a| a as Action)
-                    .collect();
-                // Construct a plausible visit count distribution that heavily favors the next
-                // action in the heuristic solution, but still has some mass on other valid actions.
-                let edge_visits =
-                    self.supervised_edge_visits(ac as Action, &valid_actions, 0.7);
-                temp_data.push(((placement, objectives), valid_actions, edge_visits));
-                // Advance to next state
-                let _ = tilers_env.inner.step(ac);
-                tilers_env.inner.finish_cultivating(None, None);
-                // Record heuristic action
-                taken_actions.push(ac);
-            }
-            tilers_env.inner.depth(true, true)
-        } else {
-            // If solved add the terminal state with a value of +1.0
-            tilers_env.inner.depth(true, true)
-        };
-        assert!(
-            tilers_env.inner.done(),
-            "Heuristic failed to solve the environment"
-        );
-
-        // Append final terminal state so we train on the done state itself.
-        // Build a terminal record matching temp_data shape with empty visits.
-        let final_placement = tilers_env.inner.get_placement();
-        let final_objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
-        let final_valid: Vec<Action> = vec![];
-        let final_visits: HashMap<Action, usize> = HashMap::new();
-        temp_data.push(((final_placement, final_objectives), final_valid, final_visits));
-
-        // Determine scores for all transitions
-        let mut scoring_game = env.clone();
-        scoring_game.set_cultivation_time(10);
-        let mut scores = self.score_transitions(&scoring_game, &taken_actions);
-        scores.push(self.terminal_value);
+        tilers_env.inner.set_cultivation_time(10);
+        let solution_depth = tilers_env.inner.depth(true, true);
 
         // Save data to output_path in NDJSON format
         let mut file = std::fs::OpenOptions::new()
@@ -389,7 +236,12 @@ impl Gatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        for (((p, o), va, ev), score) in zip(temp_data, scores) {
+        let score = if tilers_env.inner.done() && reference_depth >= solution_depth {
+            1.0
+        } else {
+            -1.0
+        };
+        for ((p, o), va, ev) in temp_data {
             // Convert to JSON-serializable format
             let placement_json = Self::serialize_placement(&p);
             let objectives_json = Self::serialize_objectives(&o);
