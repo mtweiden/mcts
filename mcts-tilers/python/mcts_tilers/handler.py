@@ -267,12 +267,6 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 nq_list.append(np.asarray(sv.num_qubits()[:b_i], copy=True))
                 # num_layers must be the same for all instances
                 nl_list.append(np.asarray(sv.num_layers()[:b_i], copy=True))
-                if not all((sv.num_layers() == nl_list[0]).all() for sv in valid_slot_views):
-                    base_size = nl_list[0].shape[0]
-                    for sv in valid_slot_views:
-                        if not (sv.num_layers() == nl_list[0]).all():
-                            print(f"[DEBUG] Slot {sv.slot} has inconsistent num_layers: {sv.num_layers()} vs {base_size}")
-                    raise ValueError("Inconsistent num_layers across slots in the same batch")
                 no_list.append(np.asarray(sv.num_objectives()[:b_i], copy=True))
             
             if not valid_slot_views:
@@ -291,17 +285,12 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
             # Unpack structured data
             qubit_ids, qubit_oris = unpack_placement_batch(placement_raw, nq_all)
-            print(f"[DEBUG2] objectives_raw.shape={objectives_raw.shape}, "
-                f"nl_all={nl_all}, no_all={no_all}, "
-                f"OBJECTIVES_LAYER_MAX={OBJECTIVES_LAYER_MAX}, "
-                f"OBJECTIVE_SIZE={OBJECTIVE_SIZE}")
             obj_layers = unpack_objectives_batch(objectives_raw, nl_all, no_all)
 
             # Build board representation for the model
             boards_np = build_boards(
                 qubit_ids, qubit_oris, nq_all, obj_layers, nl_all, no_all,
             )
-            print(f"[DEBUG] nl_all max={nl_all.max()}, boards_np.shape={boards_np.shape}")
             assert boards_np.shape[1] == MODEL.lookahead + 1, \
                 f"build_boards returned shape {boards_np.shape}, expected num_layers={MODEL.lookahead + 1}"
 

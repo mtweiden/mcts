@@ -37,8 +37,6 @@ impl InferenceClient<TilersEnv> for TilersIpcClient {
         let slot_idx = arena.acquire_slot();
         eprintln!("[rust client {}] acquired slot {}", self.inner.owner_id, slot_idx);
         let req_id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
-
-        eprintln!("[rust client {}] packing b={}, acquiring slot...", self.inner.owner_id, b);
         // Write request
         {
             let sm = arena.slot_mut(slot_idx);
