@@ -85,6 +85,7 @@ def unpack_objectives_batch(
     """
     total = raw.shape[0]
     max_nl = max(1, int(num_layers.max()))
+    print(f"[DEBUG3] unpack_objectives_batch: num_layers.max()={num_layers.max()}, max_nl={max_nl}")
 
     layers = []
     for l in range(max_nl):
@@ -291,7 +292,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             # Unpack structured data
             qubit_ids, qubit_oris = unpack_placement_batch(placement_raw, nq_all)
             print(f"[DEBUG2] objectives_raw.shape={objectives_raw.shape}, "
-                f"nl_all={nl_all}, no_all={no_all[:3]}, "
+                f"nl_all={nl_all}, no_all={no_all}, "
                 f"OBJECTIVES_LAYER_MAX={OBJECTIVES_LAYER_MAX}, "
                 f"OBJECTIVE_SIZE={OBJECTIVE_SIZE}")
             obj_layers = unpack_objectives_batch(objectives_raw, nl_all, no_all)
