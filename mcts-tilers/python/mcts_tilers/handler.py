@@ -220,7 +220,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
         try:
             print(f"[handler {handler_id}] waiting for ready slot...")
             first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
-            print(f"[handler {handler_id}] got slot {first_sv.slot}, b={first_sv.b()}")
+            print(f"[handler {handler_id}] got slot {first_sv.slot}")
             first_sv.set_handler_start_time()
         except KeyboardInterrupt:
             break
@@ -290,6 +290,10 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
             # Unpack structured data
             qubit_ids, qubit_oris = unpack_placement_batch(placement_raw, nq_all)
+            print(f"[DEBUG2] objectives_raw.shape={objectives_raw.shape}, "
+                f"nl_all={nl_all}, no_all={no_all[:3]}, "
+                f"OBJECTIVES_LAYER_MAX={OBJECTIVES_LAYER_MAX}, "
+                f"OBJECTIVE_SIZE={OBJECTIVE_SIZE}")
             obj_layers = unpack_objectives_batch(objectives_raw, nl_all, no_all)
 
             # Build board representation for the model
