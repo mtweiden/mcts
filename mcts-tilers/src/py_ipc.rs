@@ -139,11 +139,9 @@ impl PyArena {
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
 
         let client = TilersIpcClient::new(arena2, 9999);
-        println!("[rust] about to call infer");
         let (priors, values) = client
             .infer(&observations)
             .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-        println!("[rust] finished calling infer");
 
         let priors_vecs: Vec<Vec<f32>> = priors
             .iter()

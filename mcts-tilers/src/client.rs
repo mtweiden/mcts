@@ -35,7 +35,7 @@ impl InferenceClient<TilersEnv> for TilersIpcClient {
 
         let arena = &self.inner.arena;
         let slot_idx = arena.acquire_slot();
-        eprintln!("[rust client {}] acquired slot {}", self.inner.owner_id, slot_idx);
+        // eprintln!("[rust client {}] acquired slot {}", self.inner.owner_id, slot_idx);
         let req_id = self.inner.next_req_id.fetch_add(1, Ordering::Relaxed);
         // Write request
         {
@@ -47,13 +47,13 @@ impl InferenceClient<TilersEnv> for TilersIpcClient {
             sm.slot.pack_observations(observations)?;
             sm.slot.state.store(SLOT_READY, Ordering::Release);
         }
-        eprintln!("[rust client {}] slot {} marked READY, submitting to handler...", self.inner.owner_id, slot_idx);
+        // eprintln!("[rust client {}] slot {} marked READY, submitting to handler...", self.inner.owner_id, slot_idx);
 
         // Submit and wait
         arena.submit_to_handler(slot_idx);
-        eprintln!("[rust client {}] slot {} submitted, waiting for DONE...", self.inner.owner_id, slot_idx);
+        // eprintln!("[rust client {}] slot {} submitted, waiting for DONE...", self.inner.owner_id, slot_idx);
         arena.wait_done(slot_idx);
-        eprintln!("[rust client {}] slot {} DONE", self.inner.owner_id, slot_idx);
+        // eprintln!("[rust client {}] slot {} DONE", self.inner.owner_id, slot_idx);
 
         // Read response
         let result = {

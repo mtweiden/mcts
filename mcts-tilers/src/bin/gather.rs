@@ -37,6 +37,7 @@ struct Gatherer {
     terminal_value: f32,
     noise_strength: f64,
     num_objective_layers: usize,
+    gather_id: usize,
 }
 
 impl Gatherer {
@@ -47,6 +48,7 @@ impl Gatherer {
         output_path: String,
         noise_strength: f64,
         num_objective_layers: usize,
+        gather_id: usize,
     ) -> Self {
         let terminal_value: f32 = 1.0;
         Self {
@@ -57,6 +59,7 @@ impl Gatherer {
             terminal_value,
             noise_strength,
             num_objective_layers,
+            gather_id,
         }
     }
 
@@ -65,9 +68,7 @@ impl Gatherer {
         let mut solved_env = env.clone();
         let solver = Solver::new();
         let _ = solver.solve(&mut solved_env, true).unwrap();
-        println!("[SOLVING ENVIRONMENT]");
         let depth = solved_env.depth(true, true);
-        println!("[ENVIRONMENT SOLVED] depth = {}", depth);
         depth
     }
 
@@ -209,7 +210,7 @@ impl Gatherer {
                 .iter()
                 .map(|&a| a as Action)
                 .collect();
-            temp_data.push(((placement, objectives), valid_actions, edge_visits));
+            temp_data.push(((placement, objectives), valid_actions, edge_visits.clone()));
 
             // Select action and step the environment
             // Add noise if we're very close to the root to encourage exploration
@@ -221,6 +222,8 @@ impl Gatherer {
             if tilers_env.inner.done() {
                 break;
             }
+
+            println!("[Gatherer {}][step {}]\nSelected action: {}\n{:?}", self.gather_id, step, action, edge_visits);
 
             // Advance the root
             mcts.advance_root(action);
@@ -330,6 +333,7 @@ fn main() {
         output_path,
         0.20,      // noise strength
         num_objective_layers,
+        worker_id as usize,
     );
 
     loop {
@@ -378,7 +382,7 @@ fn main() {
             );
         } else {
             println!(
-                "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): (bootstrapped) depth = {}, reference depth = {}",
+                "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): (unfinished) depth = {}, reference depth = {}",
                 worker_id, h, w, nb, no, sol_depth, ref_depth
             );
         }
