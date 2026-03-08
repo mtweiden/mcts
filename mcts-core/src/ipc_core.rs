@@ -33,7 +33,7 @@ impl<S: SlotInit> IpcClient<S> {
             arena,
             owner_id,
             next_req_id: AtomicU64::new(0),
-            print_timing: true,
+            print_timing: false,
         }
     }
 }
