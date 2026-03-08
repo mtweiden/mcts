@@ -36,6 +36,16 @@ fn mcts_tilers(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<py_mcts::PyMcts>()?;
     m.add_class::<py_mcts::MctsAgent>()?;
     m.add_class::<py_mcts::MctsNode>()?;
+
+    // tilers classes
+    m.add_class::<tilers::enums::PyOrientation>()?;
+    m.add_class::<tilers::enums::PyDirection>()?;
+    m.add_class::<tilers::enums::PyOperation>()?;
+    m.add_class::<tilers::enums::PyPosition>()?;
+    m.add_class::<tilers::qubit::PyQubit>()?;
+    m.add_class::<tilers::objective::PyObjective>()?;
+    m.add_class::<tilers::env::PyEnvironment>()?;
+
     Ok(())
 }
 
