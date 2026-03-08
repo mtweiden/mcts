@@ -76,7 +76,7 @@ impl Gatherer {
     /// compile time, so we sample using Gamma distributions instead.
     fn _dirichlet_noise(&self, num_actions: usize, rng: &mut impl Rng) -> Vec<f64> {
         let alpha = 10f64 / (num_actions as f64);  // Rule of thumb for Dirichlet noise
-        let alphas = vec![alpha; num_actions];
+        let alphas = vec![alpha.min(0.5); num_actions];
         let mut xs: Vec<f64> = alphas
             .iter()
             .map(|&a| {
@@ -91,22 +91,41 @@ impl Gatherer {
         xs
     }
 
-    fn _action_probabilities(&self, visit_counts: &[usize]) -> Vec<f64> {
+    fn _action_probabilities(&self, visit_counts: &[usize], temperature: f64) -> Vec<f64> {
         let total_visits: usize = visit_counts.iter().sum();
         if total_visits == 0 {
             return vec![1.0 / (visit_counts.len() as f64); visit_counts.len()];
         }
-        visit_counts
+
+        if temperature < 1e-8 {
+            // Greedy: put all weight on the most-visited action (break ties uniformly)
+            let max_count = *visit_counts.iter().max().unwrap();
+            let num_max = visit_counts.iter().filter(|&&c| c == max_count).count();
+            return visit_counts
+                .iter()
+                .map(|&c| if c == max_count { 1.0 / num_max as f64 } else { 0.0 })
+                .collect();
+        }
+
+        let inv_temp = 1.0 / temperature;
+        let log_counts: Vec<f64> = visit_counts
             .iter()
-            .map(|&count| count as f64 / total_visits as f64)
-            .collect()
+            .map(|&c| if c > 0 { (c as f64).ln() * inv_temp } else { f64::NEG_INFINITY })
+            .collect();
+
+        // Subtract max for numerical stability before exponentiating
+        let max_log = log_counts.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+        let exps: Vec<f64> = log_counts.iter().map(|&l| (l - max_log).exp()).collect();
+        let sum_exps: f64 = exps.iter().sum();
+
+        exps.iter().map(|&e| e / sum_exps).collect()
     }
 
     pub fn select_action(
         &self,
         node: &Node<Action>,
         env: &Environment,
-        noiseless: bool,
+        step: usize,
         rng: &mut impl Rng,
     ) -> Action {
         let valid_actions = env.valid_actions();
@@ -114,23 +133,32 @@ impl Gatherer {
         if num_actions == 0 {
             panic!("No valid actions available");
         }
+
+        // High temperature early (exploration), low temperature later (exploitation)
+        let temperature = 0.1 + 0.9 * (-0.5 * step as f64).exp();
+        let noise_strength = self.noise_strength * (-0.5 * step as f64).exp();
+
         let probs = self._action_probabilities(
             &valid_actions
                 .iter()
                 .map(|&a| *node.edge_visits.get(&(a as Action)).unwrap_or(&0))
                 .collect::<Vec<_>>(),
+            temperature,
         );
-        let noise = if !noiseless {
+
+        let noise = if noise_strength > 0.0 {
             self._dirichlet_noise(num_actions, rng)
         } else {
             vec![0.0; num_actions]
         };
+
         let mixed_probs: Vec<f64> = probs
             .iter()
             .zip(noise.iter())
-            .map(|(&p, &n)| (1.0 - self.noise_strength) * p + self.noise_strength * n)
-            .map(|x| x.max(0.0)) // prevent tiny negatives
+            .map(|(&p, &n)| (1.0 - noise_strength) * p + noise_strength * n)
+            .map(|x| x.max(0.0))
             .collect();
+
         let dist = WeightedIndex::new(&mixed_probs).unwrap();
         valid_actions[dist.sample(rng)] as Action
     }
@@ -213,9 +241,8 @@ impl Gatherer {
             temp_data.push(((placement, objectives), valid_actions, edge_visits.clone()));
 
             // Select action and step the environment
-            // Add noise if we're very close to the root to encourage exploration
-            let noiseless = step > 2;
-            let action = self.select_action(&root, &tilers_env.inner, noiseless, rng);
+            // Add more noise if we're very close to the root to encourage exploration
+            let action = self.select_action(&root, &tilers_env.inner, step, rng);
             let _ = tilers_env.inner.step(action as usize);
             tilers_env.inner.finish_cultivating(None, None); // Cultivate resources in a single step
             taken_actions.push(action as usize);
