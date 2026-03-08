@@ -223,7 +223,7 @@ impl Gatherer {
                 break;
             }
 
-            println!("[Gatherer {}][step {}]\nSelected action: {}\n{:?}", self.gather_id, step, action, edge_visits);
+            println!("[Gatherer {}][step {}] Selected action: {} from {:?}", self.gather_id, step, action, edge_visits);
 
             // Advance the root
             mcts.advance_root(action);
@@ -239,8 +239,10 @@ impl Gatherer {
             .open(&self.output_path)
             .expect("Unable to open output file");
 
-        let score = if tilers_env.inner.done() && reference_depth >= solution_depth {
+        let score = if tilers_env.inner.done() && reference_depth > solution_depth {
             1.0
+        } else if reference_depth == solution_depth {
+            0.1
         } else {
             -1.0
         };
