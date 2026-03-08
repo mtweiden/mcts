@@ -3,12 +3,14 @@ use std::collections::HashMap;
 
 use mcts_core::InferenceClient;
 use pyo3::prelude::*;
-use pyo3::types::{PyDict, PyTuple};
+use pyo3::Py;
+use pyo3::types::{PyAny, PyDict, PyTuple};
 
 use mcts_core::mcts::MCTS;
 use mcts_core::node::Node;
 
 use tilers::env::PyEnvironment;
+use tilers::env::Environment as TilersEnvInner;
 
 use crate::constants::*;
 use crate::environment::{TilersObs, TilersEnv};
@@ -27,21 +29,25 @@ fn obs_to_pydict<'py>(py: Python<'py>, obs: &TilersObs) -> PyResult<Bound<'py, P
         .collect();
     dict.set_item("placement", &placement)?;
 
-    // objectives: list of list of (u8, i32, i32, usize, u8) tuples
-    let objectives: Vec<Vec<(u8, i32, i32, usize, u8)>> = obs
+    // objectives: list of list of (i32, i32, i32) or (i32, i32) tuples
+    let objectives: Vec<Vec<Py<PyAny>>> = obs
         .objectives
         .iter()
         .map(|layer| {
             layer
                 .iter()
                 .map(|o| {
-                    (
-                        o.opcode as u8,
-                        o.arg_0.as_i32(),
-                        o.arg_1.as_i32(),
-                        o.duration,
-                        o.direction as u8,
-                    )
+                    if o.opcode.is_single_qubit() {
+                        PyTuple::new(py, &[o.opcode as i32, o.arg_0.as_i32()])
+                            .unwrap()
+                            .into_any()
+                            .unbind()
+                    } else {
+                        PyTuple::new(py, &[o.opcode as i32, o.arg_0.as_i32(), o.arg_1.as_i32()])
+                            .unwrap()
+                            .into_any()
+                            .unbind()
+                    }
                 })
                 .collect()
         })
@@ -113,6 +119,7 @@ impl MctsAgent {
     }
 }
 
+/// MctsAgent needs to implement infer_from_obs on the Python side.
 impl InferenceClient<TilersEnv> for MctsAgent {
     fn infer(&self, observations: &[TilersObs]) -> Result<(Vec<Prior>, Vec<Value>)> {
         Python::attach(|py| {
@@ -125,7 +132,7 @@ impl InferenceClient<TilersEnv> for MctsAgent {
             let out = self
                 .agent
                 .as_ref()
-                .call_method1(py, "infer", (obs_dicts,))
+                .call_method1(py, "infer_from_obs", (obs_dicts,))
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
             let tup = out.as_ref().cast_bound::<PyTuple>(py)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
@@ -170,7 +177,8 @@ impl PyMcts {
     ) -> PyResult<MctsNode> {
         // Note that because of this copy, we probably don't want to run MCTS on huge environments.
         // We should chunk them before sending them off to MCTS.
-        let env = TilersEnv::new(env.to_inner(), DEFAULT_LOOKAHEAD);
+        let inner: TilersEnvInner = env.to_inner();
+        let env = TilersEnv::new(inner, DEFAULT_LOOKAHEAD);
         let node = self.inner.run(&env, agent, num_steps);
         Ok(MctsNode { inner: node })
     }
