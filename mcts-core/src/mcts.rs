@@ -170,7 +170,7 @@ impl<E: Environment> MCTS<E> {
         let node = if env.done() {
             Node::new_terminal(node_id, self.terminal_value, repr)
         } else {
-            Node::new(priors, value, node_id, repr)
+            Node::new(priors, value.clamp(-1.0, 1.0), node_id, repr)
         };
         self.insert_node(node_id, node);
         node_id
