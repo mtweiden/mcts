@@ -83,14 +83,14 @@ impl<E: Environment> MCTS<E> {
                 let (parent_opt, action, game) = &parent_batch[i];
                 if let Some(parent_id) = parent_opt {
                     if repeat_batch[i] {
-                        let leaf_hash = self.get_hash(&game) as NodeId;
-                        self.backpropagate(&path_batch[i], true, leaf_hash);
+                        // Just backpropagate with a penalty for repeats, no expansion
+                        self.backpropagate(&path_batch[i], true);
                     } else {
                         let priors = prior_batch[i].clone();
                         let value = value_batch[i];
-                        // expand and then backpropagate
-                        let leaf = self.expand(*parent_id, *action, game.clone(), priors, value);
-                        self.backpropagate(&path_batch[i], false, leaf);
+                        // Expand and then backpropagate
+                        let _leaf = self.expand(*parent_id, *action, game.clone(), priors, value);
+                        self.backpropagate(&path_batch[i], false);
                     }
                 }
             }
@@ -203,7 +203,7 @@ impl<E: Environment> MCTS<E> {
     /// Recompute the cached value of a node based on its children's values.
     pub fn recompute_value(&mut self, node_id: NodeId) {
         // Snapshot parent data immutably to avoid overlapping mutable borrows.
-        let (virtual_loss_counts, edge_visits, children, node_value_estimate) = {
+        let (virtual_loss_counts, edge_visits, children, edge_penalties, node_value_estimate) = {
             let parent = match self.get_node_immut(node_id) {
                 Some(p) => p,
                 None => return,
@@ -211,7 +211,8 @@ impl<E: Environment> MCTS<E> {
             let vl: usize = parent.virtual_losses.values().copied().sum();
             let ev = parent.edge_visits.clone();
             let ch = parent.children.clone();
-            (vl, ev, ch, parent.value_estimate)
+            let ep = parent.edge_penalties.clone();
+            (vl, ev, ch, ep, parent.value_estimate)
         };
         let edge_visit_count: usize = edge_visits.values().copied().sum::<usize>();
         let total_edge_visits = edge_visit_count + virtual_loss_counts;
@@ -231,7 +232,8 @@ impl<E: Environment> MCTS<E> {
                 if ev == 0 {
                     continue;
                 }
-                acc += (ev as f32) * child.value;
+                let penalty = edge_penalties.get(&a).copied().unwrap_or(0.0);
+                acc += (ev as f32) * (child.value + penalty);
             }
         }
 
@@ -425,7 +427,7 @@ impl<E: Environment> MCTS<E> {
         leaf_id
     }
 
-    pub fn backpropagate(&mut self, search_path: &[(NodeId, E::Act)], repeat_detected: bool, leaf_hash: NodeId) {
+    pub fn backpropagate(&mut self, search_path: &[(NodeId, E::Act)], repeat_detected: bool) {
         if search_path.is_empty() {
             return;
         }
@@ -437,18 +439,13 @@ impl<E: Environment> MCTS<E> {
         }
 
         if repeat_detected {
-            // Add a bogus penalty node that is uniquely determined by the leaf hash and the last parent hash.
-            // This allows the search to learn to avoid this path in the future without risking hash collisions
-            // with real game states.
             if let Some(&(last_parent_hash, last_action)) = search_path.last() {
-                let penalty_hash = leaf_hash.wrapping_mul(2654435761).wrapping_add(last_parent_hash);
-                if !self.node_exists(penalty_hash) {
-                    let penalty_node = Node::new_terminal(penalty_hash, -self.terminal_value, None);
-                    self.insert_node(penalty_hash, penalty_node);
+                if let Some(parent) = self.get_node_mut(last_parent_hash) {
+                    parent.apply_penalty(last_action);
                 }
-                self.add_child(last_parent_hash, last_action, penalty_hash);
             }
         }
+
         // Backpropagate visits and recompute values in both cases
         for &(node_hash, action) in search_path.iter().rev() {
             if let Some(node) = self.get_node_mut(node_hash) {
