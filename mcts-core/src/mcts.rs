@@ -82,11 +82,16 @@ impl<E: Environment> MCTS<E> {
             for i in 0..n {
                 let (parent_opt, action, game) = &parent_batch[i];
                 if let Some(parent_id) = parent_opt {
-                    let priors = prior_batch[i].clone();
-                    let value = value_batch[i];
-                    // expand and then backpropagate
-                    let _leaf = self.expand(*parent_id, *action, game.clone(), priors, value);
-                    self.backpropagate(&path_batch[i], repeat_batch[i]);
+                    if repeat_batch[i] {
+                        let leaf_hash = self.get_hash(&game) as NodeId;
+                        self.backpropagate(&path_batch[i], true, leaf_hash);
+                    } else {
+                        let priors = prior_batch[i].clone();
+                        let value = value_batch[i];
+                        // expand and then backpropagate
+                        let leaf = self.expand(*parent_id, *action, game.clone(), priors, value);
+                        self.backpropagate(&path_batch[i], false, leaf);
+                    }
                 }
             }
         }
@@ -420,7 +425,7 @@ impl<E: Environment> MCTS<E> {
         leaf_id
     }
 
-    pub fn backpropagate(&mut self, search_path: &[(NodeId, E::Act)], repeat_detected: bool) {
+    pub fn backpropagate(&mut self, search_path: &[(NodeId, E::Act)], repeat_detected: bool, leaf_hash: NodeId) {
         if search_path.is_empty() {
             return;
         }
@@ -430,23 +435,26 @@ impl<E: Environment> MCTS<E> {
                 node.revert_virtual_loss(action);
             }
         }
-        // Handle the outcome of the path.
+
         if repeat_detected {
-            // If a repeat was detected, just apply the penalty and stop. We don't have a new value
-            // to propagate, and we don't want to reward this path with a visit.
-            if let Some((last_parent_hash, last_action)) = search_path.last() {
-                if let Some(last_parent) = self.get_node_mut(*last_parent_hash) {
-                    last_parent.apply_penalty(*last_action);
+            // Add a bogus penalty node that is uniquely determined by the leaf hash and the last parent hash.
+            // This allows the search to learn to avoid this path in the future without risking hash collisions
+            // with real game states.
+            if let Some(&(last_parent_hash, last_action)) = search_path.last() {
+                let penalty_hash = leaf_hash.wrapping_mul(2654435761).wrapping_add(last_parent_hash);
+                if !self.node_exists(penalty_hash) {
+                    let penalty_node = Node::new_terminal(penalty_hash, -self.terminal_value, None);
+                    self.insert_node(penalty_hash, penalty_node);
                 }
+                self.add_child(last_parent_hash, last_action, penalty_hash);
             }
-        } else {
-            // If it was a successful expansion, increment visits and recompute values.
-            for &(node_hash, action) in search_path.iter().rev() {
-                if let Some(node) = self.get_node_mut(node_hash) {
-                    *node.edge_visits.entry(action).or_insert(0) += 1;
-                }
-                self.recompute_value(node_hash);
+        }
+        // Backpropagate visits and recompute values in both cases
+        for &(node_hash, action) in search_path.iter().rev() {
+            if let Some(node) = self.get_node_mut(node_hash) {
+                *node.edge_visits.entry(action).or_insert(0) += 1;
             }
+            self.recompute_value(node_hash);
         }
     }
 
