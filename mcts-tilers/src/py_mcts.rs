@@ -11,6 +11,7 @@ use mcts_core::node::Node;
 
 use tilers::env::PyEnvironment;
 use tilers::env::Environment as TilersEnvInner;
+use tilers::solver::Solver as TilersSolver;
 
 use crate::constants::*;
 use crate::environment::{TilersObs, TilersEnv};
@@ -162,9 +163,9 @@ pub struct PyMcts {
 #[pymethods]
 impl PyMcts {
     #[new]
-    #[pyo3(signature = (terminal_value = 1.0, batch_size = 8))]
-    fn new(terminal_value: f32, batch_size: usize) -> Self {
-        let mcts = MCTS::new(terminal_value, batch_size);
+    #[pyo3(signature = (batch_size = 8))]
+    fn new(batch_size: usize) -> Self {
+        let mcts = MCTS::new(batch_size);
         PyMcts { inner: mcts }
     }
 
@@ -175,11 +176,26 @@ impl PyMcts {
         agent: &MctsAgent,
         num_steps: usize,
     ) -> PyResult<MctsNode> {
-        // Note that because of this copy, we probably don't want to run MCTS on huge environments.
-        // We should chunk them before sending them off to MCTS.
         let inner: TilersEnvInner = env.to_inner();
+        // We're using a terminal evaluator that compares against the heuristic solver. This
+        // may need to be changed in the future if we want to support training against a
+        // different reward signal.
+        let ref_depth = {
+            let mut e = inner.clone();
+            let solver = TilersSolver::new();
+            let _ = solver.solve(&mut e, true);
+            e.depth(true, true) as f32
+        };
+        let terminal_evaluator = |e: &TilersEnv| -> f32 {
+            if !e.inner.done() { -1.0 } else {
+                let d = e.inner.depth(true, true) as f32;
+                if d < ref_depth { 1.0 }
+                else if d == ref_depth { 0.0 }
+                else { -1.0 }
+            }
+        };
         let env = TilersEnv::new(inner, DEFAULT_LOOKAHEAD);
-        let node = self.inner.run(&env, agent, num_steps);
+        let node = self.inner.run(&env, agent, num_steps, &terminal_evaluator);
         Ok(MctsNode { inner: node })
     }
 

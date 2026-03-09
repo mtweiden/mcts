@@ -34,7 +34,6 @@ struct Gatherer {
     mcts_steps: usize,
     max_actions: usize,
     output_path: String,
-    terminal_value: f32,
     noise_strength: f64,
     num_objective_layers: usize,
     gather_id: usize,
@@ -50,13 +49,11 @@ impl Gatherer {
         num_objective_layers: usize,
         gather_id: usize,
     ) -> Self {
-        let terminal_value: f32 = 1.0;
         Self {
             batch_size,
             mcts_steps,
             max_actions,
             output_path,
-            terminal_value,
             noise_strength,
             num_objective_layers,
             gather_id,
@@ -207,7 +204,7 @@ impl Gatherer {
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
         // Set up MCTS and Agent and copy the Environment
-        let mut mcts: MCTS<TilersEnv> = MCTS::new(self.terminal_value, self.batch_size);
+        let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
         // Only consider the first N layers of gates
         let mut game = env.clone();
@@ -228,11 +225,24 @@ impl Gatherer {
         // Wrap in TilersEnv for MCTS
         let mut tilers_env = TilersEnv::new(game.clone(), self.num_objective_layers);
 
-        let max_actions = reference_actions.len() * 1.3 as usize; // Allow some extra steps beyond the heuristic solution
+        let max_actions = reference_actions.len() * 2.5 as usize; // Allow some extra steps beyond the heuristic solution
+
+        let terminal_evaluator = |e: &TilersEnv| -> f32 {
+            if !e.inner.done() { -1.0 } else {
+                let d = e.inner.depth(true, true) as f32;
+                if d < reference_depth {
+                    1.0
+                } else if (d - reference_depth).abs() < 1e-3 {
+                    0.0
+                } else {
+                    -1.0
+                }
+            }
+        };
 
         for step in 0..max_actions {
             // Run MCTS
-            let root = mcts.run(&tilers_env, client, self.mcts_steps);
+            let root = mcts.run(&tilers_env, client, self.mcts_steps, &terminal_evaluator);
 
             // Store the data
             let placement = tilers_env.inner.get_placement();
