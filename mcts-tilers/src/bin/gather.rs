@@ -64,12 +64,16 @@ impl Gatherer {
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
-    pub fn solve_with_heuristic(&self, env: &Environment) -> f32 {
+    pub fn solve_with_heuristic(&self, env: &Environment) -> (f32, Vec<Action>) {
         let mut solved_env = env.clone();
         let solver = Solver::new();
-        let _ = solver.solve(&mut solved_env, true).unwrap();
+        let actions = solver.solve(&mut solved_env, true)
+            .unwrap()
+            .into_iter()
+            .map(|a| a as Action)
+            .collect();
         let depth = solved_env.depth(true, true);
-        depth
+        (depth, actions)
     }
 
     /// Directly sampling from Dirichlet distribution requires num_actions to be known at
@@ -209,7 +213,7 @@ impl Gatherer {
         let mut game = env.clone();
         game.drop_objectives_beyond_nth_layer(self.num_objective_layers);
         game.set_cultivation_time(10);
-        let reference_depth = self.solve_with_heuristic(&game);
+        let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
 
         // Set up data storage
         // Format: ((placement, objectives), valid_actions, visit_counts)
@@ -224,7 +228,9 @@ impl Gatherer {
         // Wrap in TilersEnv for MCTS
         let mut tilers_env = TilersEnv::new(game.clone(), self.num_objective_layers);
 
-        for step in 0..self.max_actions {
+        let max_actions = reference_actions.len() * 1.3 as usize; // Allow some extra steps beyond the heuristic solution
+
+        for step in 0..max_actions {
             // Run MCTS
             let root = mcts.run(&tilers_env, client, self.mcts_steps);
 
