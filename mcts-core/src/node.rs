@@ -1,3 +1,4 @@
+use core::num;
 use std::collections::HashMap;
 
 use crate::environment::Act;
@@ -82,7 +83,10 @@ impl<A: Act> Node<A> {
     }
 
     pub fn apply_penalty(&mut self, action: A) {
-        *self.edge_penalties.entry(action).or_insert(0.0) -= 1.0;
+        // Scale the penalty amount by the number of actions that can be taken
+        let num_actions = self.prior_probs.len() as f32;
+        let penalty_amount = -1.0 / num_actions;
+        *self.edge_penalties.entry(action).or_insert(0.0) += penalty_amount;
     }
 
     pub fn revert_penalty(&mut self, action: A) {
