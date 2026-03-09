@@ -24,42 +24,52 @@ pub struct MCTS<E: Environment> {
     // Arena style storage for all nodes.
     pub transposition_table: HashMap<NodeId, usize>,
     pub nodes: Vec<Node<E::Act>>,
-    pub terminal_value: f32,
     pub batch_size: usize,
 }
 
 impl<E: Environment> MCTS<E> {
-    pub fn new(terminal_value: f32, batch_size: usize) -> Self {
+    pub fn new(batch_size: usize) -> Self {
         Self {
             root_id: None,
             transposition_table: HashMap::new(),
             nodes: Vec::new(),
-            terminal_value,
             batch_size,
         }
     }
 
-    pub fn default() -> Self { Self::new(1.0, 8) }
+    pub fn default() -> Self { Self::new(8) }
 
-    /// Run MCTS for a given number of steps from the current environment state. `env` is borrowed
-    /// immutably; select_leaf clones it internally as needed. The `client` is an inference client
-    /// that provides value and prior estimates for leaf nodes.
-    pub fn run(
+    /// Run MCTS for a given number of steps from the current environment state. 
+    /// 
+    /// Args:
+    ///   env (&E): a reference to the current environment state. This is not mutated by MCTS,
+    ///     as all simulations are done on cloned environments.
+    ///   client (dyn InferenceClient<E>): an inference client.
+    ///   num_steps (usize): the number of MCTS iterations to run. More steps means a stronger
+    ///     search but longer runtime.
+    ///   terminal_evaluator (&F): a function that takes an environment and returns a value
+    ///     estimate for terminal states.
+    pub fn run<F>(
         &mut self,
         env: &E,
         client: &dyn InferenceClient<E>,
-        num_steps: usize
-    ) -> Node<E::Act> {
+        num_steps: usize,
+        terminal_evaluator: &F,
+    ) -> Node<E::Act> 
+        where F: Fn(&E) -> f32
+    {
         // Set the current root for the search session
         let root_hash = self.get_hash(env);
         self.root_id = Some(root_hash);
         // Check if the current root node exists
         if !self.node_exists(root_hash) {
-            let obs = env.observation();
-            let (p, v) = self.blocking_infer(&vec![obs], client);
-            let value = v[0];
-            let mut priors = p[0].clone();
-            priors = self.normalize_prior(priors, &env.valid_actions());
+            let (priors, value) = if env.done() {
+                (HashMap::new(), terminal_evaluator(env))
+            } else {
+                let obs = env.observation();
+                let (p, v) = self.blocking_infer(&vec![obs], client);
+                (self.normalize_prior(p[0].clone(), &env.valid_actions()), v[0])
+            };
             self.create_node(env, priors, value);
         }
 
@@ -92,22 +102,15 @@ impl<E: Environment> MCTS<E> {
                 if repeat || final_env.done() {
                     // A terminal state, expand with terminal value and empty priors
                     if !repeat {
-                        self.expand(
-                            parent_id,
-                            action,
-                            final_env,
-                            HashMap::new(),
-                            self.terminal_value  // TODO: Change this to env.reward()
-                        );
+                        let terminal_value = terminal_evaluator(&final_env);
+                        self.expand(parent_id, action, final_env, HashMap::new(), terminal_value);
                     }
                     // Do backprop immediately
                     self.backpropagate(&path, repeat);
                     continue;
                 }
                 leaf_batch.push(obs);
-                pending_inferences.push(PendingInference {
-                    path, parent_id, action, env: final_env
-                });
+                pending_inferences.push(PendingInference { path, parent_id, action, env: final_env });
             }
 
             if leaf_batch.is_empty() { continue; }
@@ -199,7 +202,7 @@ impl<E: Environment> MCTS<E> {
         // let repr = Some(env.render());
         let repr = None;
         let node = if env.done() {
-            Node::new_terminal(node_id, self.terminal_value, repr)
+            Node::new_terminal(node_id, value, repr)
         } else {
             Node::new(priors, value.clamp(-1.0, 1.0), node_id, repr)
         };
@@ -600,14 +603,13 @@ mod tests {
 
     #[test]
     fn test_mcts_creation() {
-        let mcts: MCTS<NumberLineEnv> = MCTS::new(1.0, 4);
-        assert_eq!(mcts.terminal_value, 1.0);
+        let mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         assert_eq!(mcts.batch_size, 4);
     }
 
     #[test]
     fn test_insert_and_get_node() {
-        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(0.0, 4);
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let priors = HashMap::from([(0u8, 0.5), (1u8, 0.5)]);
         let node = Node::new(priors, 0.42, 1, None);
         mcts.insert_node(1, node);
@@ -619,15 +621,16 @@ mod tests {
     fn test_run_expands_tree() {
         let env = NumberLineEnv::new(3);
         let client = UniformClient;
-        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(1.0, 4);
-        let root = mcts.run(&env, &client, 100);
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let evaluator = |e: &NumberLineEnv| if e.done() { 1.0 } else { 0.0 };
+        let root = mcts.run(&env, &client, 100, &evaluator);
         assert!(mcts.node_exists(root.id));
         assert!(mcts.nodes.len() > 1);
     }
 
     #[test]
     fn test_normalize_prior() {
-        let mcts: MCTS<NumberLineEnv> = MCTS::new(0.0, 4);
+        let mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let priors = HashMap::from([(0u8, 0.2), (1u8, 0.3), (2u8, 0.5)]);
         let normalized = mcts.normalize_prior(priors, &[0, 1]);
         let total: f32 = normalized.values().sum();
