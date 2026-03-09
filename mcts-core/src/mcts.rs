@@ -5,6 +5,17 @@ use std::collections::HashMap;
 
 
 /// ----------------------------------------------------------------------------
+/// A pending inference payload
+/// ----------------------------------------------------------------------------
+struct PendingInference<E: Environment> {
+    path: Vec<(NodeId, E::Act)>,
+    parent_id: NodeId,
+    action: E::Act,
+    env: E,
+}
+
+
+/// ----------------------------------------------------------------------------
 /// Monte Carlo Tree Search
 /// ----------------------------------------------------------------------------
 pub struct MCTS<E: Environment> {
@@ -54,22 +65,49 @@ impl<E: Environment> MCTS<E> {
 
         if env.done() { return self.get_node_mut(root_hash).unwrap().clone(); }
 
-        let num_batches = num_steps / self.batch_size.max(1);
+        // Do ceiling division to determine the number of batches
+        let num_batches = (num_steps + self.batch_size - 1) / self.batch_size.max(1);
         for _ in 0..num_batches {
             // Selection: collect a batch of leaf observations / metadata
             let mut leaf_batch: Vec<E::Obs> = Vec::with_capacity(self.batch_size);
-            let mut path_batch: Vec<Vec<(NodeId, E::Act)>> = Vec::with_capacity(self.batch_size);
-            let mut parent_batch: Vec<(Option<NodeId>, E::Act, E)> =Vec::with_capacity(self.batch_size);
-            let mut repeat_batch: Vec<bool> = Vec::with_capacity(self.batch_size);
+            let mut pending_inferences = Vec::with_capacity(self.batch_size);
 
             for _ in 0..self.batch_size {
                 // select_leaf clones the environment internally and returns the reached env
                 let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env);
                 let obs = final_env.observation();
+                // Continue so we don't add leaf nodes to the batch if no action was selected
+                // (e.g. terminal state or no valid actions)
+                let action = match action {
+                    Some(a) => a,
+                    None => continue,
+                };
+                // Continue if the parent is missing, which can happen if the root is not fully expanded
+                let parent_id = match parent {
+                    Some(p) => p,
+                    None => continue,
+                };
+
+                // Handle repeats immediately
+                if repeat || final_env.done() {
+                    // A terminal state, expand with terminal value and empty priors
+                    if !repeat {
+                        self.expand(
+                            parent_id,
+                            action,
+                            final_env,
+                            HashMap::new(),
+                            self.terminal_value  // TODO: Change this to env.reward()
+                        );
+                    }
+                    // Do backprop immediately
+                    self.backpropagate(&path, repeat);
+                    continue;
+                }
                 leaf_batch.push(obs);
-                path_batch.push(path);
-                parent_batch.push((parent, action, final_env));
-                repeat_batch.push(repeat);
+                pending_inferences.push(PendingInference {
+                    path, parent_id, action, env: final_env
+                });
             }
 
             if leaf_batch.is_empty() { continue; }
@@ -78,21 +116,14 @@ impl<E: Environment> MCTS<E> {
             let (prior_batch, value_batch) = self.blocking_infer(&leaf_batch, client);
 
             // Expansion & Backpropagation
-            let n = prior_batch.len().min(value_batch.len()).min(parent_batch.len());
+            let n = prior_batch.len().min(value_batch.len()).min(pending_inferences.len());
             for i in 0..n {
-                let (parent_opt, action, game) = &parent_batch[i];
-                if let Some(parent_id) = parent_opt {
-                    if repeat_batch[i] {
-                        // Just backpropagate with a penalty for repeats, no expansion
-                        self.backpropagate(&path_batch[i], true);
-                    } else {
-                        let priors = prior_batch[i].clone();
-                        let value = value_batch[i];
-                        // Expand and then backpropagate
-                        let _leaf = self.expand(*parent_id, *action, game.clone(), priors, value);
-                        self.backpropagate(&path_batch[i], false);
-                    }
-                }
+                let pending = &pending_inferences[i];
+                let priors = prior_batch[i].clone();
+                let value = value_batch[i];
+
+                self.expand(pending.parent_id, pending.action, pending.env.clone(), priors, value);
+                self.backpropagate(&pending.path, false);
             }
         }
         self.get_node_mut(root_hash).unwrap().clone()
@@ -202,21 +233,26 @@ impl<E: Environment> MCTS<E> {
 
     /// Recompute the cached value of a node based on its children's values.
     pub fn recompute_value(&mut self, node_id: NodeId) {
-        // Snapshot parent data immutably to avoid overlapping mutable borrows.
-        let (virtual_loss_counts, edge_visits, children, edge_penalties, node_value_estimate) = {
+        // 1. Snapshot parent data immutably and extract the data we need
+        let (virtual_loss_counts, node_value_estimate, child_data) = {
             let parent = match self.get_node_immut(node_id) {
                 Some(p) => p,
                 None => return,
             };
             let vl: usize = parent.virtual_losses.values().copied().sum();
-            let ev = parent.edge_visits.clone();
-            let ch = parent.children.clone();
-            let ep = parent.edge_penalties.clone();
-            (vl, ev, ch, ep, parent.value_estimate)
-        };
-        let edge_visit_count: usize = edge_visits.values().copied().sum::<usize>();
+            let data: Vec<(NodeId, usize, f32)> = parent.children.iter().map(|(&a, &child_id)| {
+                let ev = parent.edge_visits.get(&a).copied().unwrap_or(0);
+                let ep = parent.edge_penalties.get(&a).copied().unwrap_or(0.0);
+                (child_id, ev, ep)
+            }).collect();
+            (vl, parent.value_estimate, data)
+        };  // Immutable borrows end here
+
+        let edge_visit_count: usize = child_data.iter().map(|(_, ev, _)| *ev).sum();
         let total_edge_visits = edge_visit_count + virtual_loss_counts;
+
         if total_edge_visits == 0 {
+            // No visits yet, keep the parent's value estimate
             if let Some(node) = self.get_node_mut(node_id) {
                 node.node_visits = 1;
                 node.value = node_value_estimate;
@@ -224,24 +260,21 @@ impl<E: Environment> MCTS<E> {
             return;
         }
 
-        // Accumulate weighted child values using immutable borrows for children.
+        // 2. Accumulate weighted child values
         let mut acc: f32 = 0.0;
-        for (a, child_id) in children {
+        for (child_id, ev, ep) in child_data {
+            if ev == 0 { continue; }
+
             if let Some(child) = self.get_node_immut(child_id) {
-                let ev = edge_visits.get(&a).copied().unwrap_or(0);
-                if ev == 0 {
-                    continue;
-                }
-                let penalty = edge_penalties.get(&a).copied().unwrap_or(0.0);
-                acc += (ev as f32) * (child.value + penalty);
+                acc += (ev as f32) * (child.value + ep);
             }
         }
-
-        // Single mutable borrow to update the node.
+        // 3. Single mutable borrow to update the parent node
         if let Some(node) = self.get_node_mut(node_id) {
             node.node_visits = 1 + total_edge_visits;
-            node.value = (node.value_estimate + acc) / (node.node_visits as f32);
+            node.value = (node_value_estimate + acc) / (node.node_visits as f32);
         }
+
     }
 
     /// Compute PUCT scores for all actions from this node.
@@ -329,13 +362,7 @@ impl<E: Environment> MCTS<E> {
         &mut self,
         root_id: NodeId,
         env: &E,
-    ) -> (
-        Vec<(NodeId, E::Act)>,
-        Option<NodeId>,
-        E::Act,
-        E,
-        bool,
-    ) {
+    ) -> (Vec<(NodeId, E::Act)>, Option<NodeId>, Option<E::Act>, E, bool) {
         let mut path: Vec<(NodeId, E::Act)> = Vec::new();
         let mut node_id = root_id;
         let mut parent: Option<NodeId> = None;
@@ -387,7 +414,7 @@ impl<E: Environment> MCTS<E> {
             }
         }
 
-        (path, parent, action.unwrap(), game, repeat_detected)
+        (path, parent, action, game, repeat_detected)
     }
 
     pub fn check_state_repeat(&self, state_hash: NodeId, path: &[(NodeId, E::Act)]) -> bool {
