@@ -201,6 +201,7 @@ impl Gatherer {
         &self,
         env: &Environment,
         client: &TilersIpcClient,
+        c_puct: f32,
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
         // Set up MCTS and Agent and copy the Environment
@@ -242,7 +243,7 @@ impl Gatherer {
 
         for step in 0..max_actions {
             // Run MCTS
-            let root = mcts.run(&tilers_env, client, self.mcts_steps, &terminal_evaluator);
+            let root = mcts.run(&tilers_env, client, self.mcts_steps, c_puct, &terminal_evaluator);
 
             // Store the data
             let placement = tilers_env.inner.get_placement();
@@ -335,6 +336,7 @@ fn main() {
     let num_slots = 2048;
     let num_objective_layers = DEFAULT_LOOKAHEAD;
     let mut max_generated_depth = 10_000;
+    let mut c_puct = 1.4;
 
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -365,6 +367,9 @@ fn main() {
         }
         if args[i] == "--max_generated_depth" && i + 1 < args.len() {
             max_generated_depth = args[i + 1].parse().unwrap_or(10_000);
+        }
+        if args[i] == "--c_puct" && i + 1 < args.len() {
+            c_puct = args[i + 1].parse().unwrap_or(1.4);
         }
     }
 
@@ -430,7 +435,7 @@ fn main() {
         }
         env.shuffle(num_shuffles);
         let mut game_rng = StdRng::from_rng(&mut rand::rng());
-        let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client, &mut game_rng);
+        let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client, c_puct, &mut game_rng);
         if done {
             println!(
                 "[Gatherer {}] Env(h={}, w={}, nb={}, no={}): solution depth = {}, reference depth = {}",

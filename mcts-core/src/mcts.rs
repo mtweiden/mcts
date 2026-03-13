@@ -54,6 +54,7 @@ impl<E: Environment> MCTS<E> {
         env: &E,
         client: &dyn InferenceClient<E>,
         num_steps: usize,
+        c_puct: f32,
         terminal_evaluator: &F,
     ) -> Node<E::Act> 
         where F: Fn(&E) -> f32
@@ -84,7 +85,7 @@ impl<E: Environment> MCTS<E> {
 
             for _ in 0..self.batch_size {
                 // select_leaf clones the environment internally and returns the reached env
-                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env);
+                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env, c_puct);
                 let obs = final_env.observation();
                 // Continue so we don't add leaf nodes to the batch if no action was selected
                 // (e.g. terminal state or no valid actions)
@@ -365,6 +366,7 @@ impl<E: Environment> MCTS<E> {
         &mut self,
         root_id: NodeId,
         env: &E,
+        c_puct: f32,
     ) -> (Vec<(NodeId, E::Act)>, Option<NodeId>, Option<E::Act>, E, bool) {
         let mut path: Vec<(NodeId, E::Act)> = Vec::new();
         let mut node_id = root_id;
@@ -387,7 +389,7 @@ impl<E: Environment> MCTS<E> {
             }
 
             // choose action via PUCT
-            let chosen = match self.select_action_puct(node_id, 1.4) {
+            let chosen = match self.select_action_puct(node_id, c_puct) {
                 Some(a) => a,
                 None => break,
             };
@@ -623,7 +625,7 @@ mod tests {
         let client = UniformClient;
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let evaluator = |e: &NumberLineEnv| if e.done() { 1.0 } else { 0.0 };
-        let root = mcts.run(&env, &client, 100, &evaluator);
+        let root = mcts.run(&env, &client, 100, 1.4, &evaluator );
         assert!(mcts.node_exists(root.id));
         assert!(mcts.nodes.len() > 1);
     }
