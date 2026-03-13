@@ -334,6 +334,7 @@ fn main() {
     let mut num_shuffles = 0;
     let num_slots = 2048;
     let num_objective_layers = DEFAULT_LOOKAHEAD;
+    let mut max_generated_depth = 10_000;
 
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -361,6 +362,9 @@ fn main() {
         }
         if args[i] == "--seed" && i + 1 < args.len() {
             seed = args[i + 1].parse().ok();
+        }
+        if args[i] == "--max_generated_depth" && i + 1 < args.len() {
+            max_generated_depth = args[i + 1].parse().unwrap_or(10_000);
         }
     }
 
@@ -403,6 +407,13 @@ fn main() {
             continue;
         }
         let mut env = Environment::new(h, w, nb);
+
+        // Make sure this environment isn't too hard
+        let solver = Solver::new();
+        let mut temp_env = env.clone();
+        if let Ok(solution) = solver.solve(&mut temp_env, false) {
+            if solution.len() > max_generated_depth { continue; }
+        }
 
         // Seed the environment
         if seed.is_some() {
