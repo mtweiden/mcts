@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
-/// There is a global "execute" action and 5 actions per ancilla (max 20 ancillas)
-pub const NUM_ACTIONS: usize = 101;
+/// There is a global "execute" action and 5 actions per ancilla (max 50 ancillas)
+pub const NUM_ACTIONS: usize = 251;
 /// Right now we limit to 20x20 grids
 pub const GRID_MAX: usize = 400;
 /// Maximum number of layers that can be looked ahead for
