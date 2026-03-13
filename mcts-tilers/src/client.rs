@@ -9,6 +9,8 @@ use crate::constants::*;
 use crate::environment::{TilersEnv, TilersObs};
 use crate::slot::TilersSlot;
 
+//--------------------------------------------------------------------------------
+/// For neural network inference.
 pub struct TilersIpcClient {
     inner: IpcClient<TilersSlot>,
 }
@@ -108,6 +110,31 @@ impl InferenceClient<TilersEnv> for TilersIpcClient {
         Ok(result)
     }
 }
+//--------------------------------------------------------------------------------
+
+//--------------------------------------------------------------------------------
+/// For fast non-neural uniform priors.
+pub struct TrivialTilersIpcClient { }
+
+
+impl InferenceClient<TilersEnv> for TrivialTilersIpcClient {
+    fn infer(&self, observations: &[TilersObs]) -> Result<(Vec<Prior>, Vec<Value>)> {
+        let priors = observations
+            .iter()
+            .map(|obs| {
+                obs.action_mask
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, valid)| **valid)
+                    .map(|(a, _)| (a as Action, 1.0))
+                    .collect()
+            })
+            .collect();
+        let values = vec![0.0; observations.len()];
+        Ok((priors, values))
+    }
+}
+//--------------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
