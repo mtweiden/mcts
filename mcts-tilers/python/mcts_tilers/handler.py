@@ -31,7 +31,7 @@ logging.basicConfig(
 def latest_checkpoint() -> str | None:
     ckpt_path = "/pscratch/sd/m/mtweiden/tile_mcts/checkpoints"
     files = sorted(
-        [str(x) for x in Path(ckpt_path).glob("*")],
+        [str(x) for x in Path(ckpt_path).glob("*.ckpt")],
         key= lambda x: int(x.split("_")[-1].split(".")[0])
     )
     if len(files) == 0:
