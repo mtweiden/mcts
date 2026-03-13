@@ -413,13 +413,6 @@ fn main() {
         }
         let mut env = Environment::new(h, w, nb);
 
-        // Make sure this environment isn't too hard
-        let solver = Solver::new();
-        let mut temp_env = env.clone();
-        if let Ok(solution) = solver.solve(&mut temp_env, false) {
-            if solution.len() > max_generated_depth { continue; }
-        }
-
         // Seed the environment
         if seed.is_some() {
             env.set_seed(Some(seed.unwrap() as u64));
@@ -434,6 +427,14 @@ fn main() {
             }
         }
         env.shuffle(num_shuffles);
+
+        // Make sure this environment isn't too hard
+        let solver = Solver::new();
+        let mut temp_env = env.clone();
+        if let Ok(solution) = solver.solve(&mut temp_env, false) {
+            if solution.len() > max_generated_depth { continue; }
+        }
+
         let mut game_rng = StdRng::from_rng(&mut rand::rng());
         let (sol_depth, ref_depth, done) = gatherer.gather(&env, &client, c_puct, &mut game_rng);
         if done {
