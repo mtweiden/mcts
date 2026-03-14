@@ -39,6 +39,8 @@ pub struct TilersSlot {
 
     pub action_mask: [u8; MAX_BATCH * NUM_ACTIONS],
 
+    pub last_dir_vertical: [u8; MAX_BATCH * MAX_ANCILLAS],  // bool for each ancilla in each batch
+
     // Outputs
     pub priors: [f32; MAX_BATCH * NUM_ACTIONS],
     pub values: [f32; MAX_BATCH],
@@ -65,6 +67,7 @@ impl Default for TilersSlot {
             placement: [[0; PLACEMENT_MAX]; MAX_BATCH],
             objectives: [[0; OBJECTIVES_MAX]; MAX_BATCH],
             action_mask: [0; MAX_BATCH * NUM_ACTIONS],
+            last_dir_vertical: [0; MAX_BATCH * MAX_ANCILLAS],
             priors: [0.0; MAX_BATCH * NUM_ACTIONS],
             values: [0.0; MAX_BATCH],
             request_time_ns: AtomicU64::new(0),
@@ -133,6 +136,16 @@ impl TilersSlot {
             for (a, &m) in obs.action_mask.iter().enumerate() {
                 if a < NUM_ACTIONS && m {
                     mask_slice[a] = 1;
+                }
+            }
+
+            // Pack last direction information
+            let last_dir_offset = i * MAX_ANCILLAS;
+            let last_dir_slice = &mut self.last_dir_vertical[last_dir_offset..last_dir_offset + MAX_ANCILLAS];
+            last_dir_slice.fill(0);
+            for (a, &m) in obs.last_dir_vertical.iter().enumerate() {
+                if a < MAX_ANCILLAS && m {
+                    last_dir_slice[a] = 1;
                 }
             }
         }
@@ -208,6 +221,13 @@ impl TilersSlot {
                 .map(|&m| m != 0)
                 .collect();
 
+            // Unpack last direction information
+            let last_dir_offset = i * MAX_ANCILLAS;
+            let last_dir_vertical: Vec<bool> = self.last_dir_vertical[last_dir_offset..last_dir_offset + MAX_ANCILLAS]
+                .iter()
+                .map(|&m| m != 0)
+                .collect();
+
             out.push(TilersObs {
                 placement,
                 objectives,
@@ -215,6 +235,7 @@ impl TilersSlot {
                 width,
                 num_ancillas,
                 action_mask,
+                last_dir_vertical,
             });
         }
         out
@@ -244,6 +265,7 @@ mod tests {
             width: 4,
             num_ancillas: 1,
             action_mask: vec![true, false, true, false],
+            last_dir_vertical: vec![false; MAX_ANCILLAS],
         };
 
         let mut slot = TilersSlot::default();
@@ -299,6 +321,7 @@ mod tests {
             width: 5,
             num_ancillas: 2,
             action_mask: vec![false; NUM_ACTIONS],
+            last_dir_vertical: vec![false; MAX_ANCILLAS],
         };
 
         let mut slot = TilersSlot::default();
@@ -334,6 +357,7 @@ mod tests {
             width: 3,
             num_ancillas: 0,
             action_mask: vec![true; NUM_ACTIONS],
+            last_dir_vertical: vec![false; MAX_ANCILLAS],
         };
 
         let mut slot = TilersSlot::default();
@@ -360,6 +384,7 @@ mod tests {
             width: 3,
             num_ancillas: 0,
             action_mask: vec![true; NUM_ACTIONS],
+            last_dir_vertical: vec![false; MAX_ANCILLAS],
         };
 
         let obs2 = TilersObs {
@@ -374,6 +399,7 @@ mod tests {
             width: 4,
             num_ancillas: 1,
             action_mask: vec![false; NUM_ACTIONS],
+            last_dir_vertical: vec![false; MAX_ANCILLAS],
         };
 
         let mut slot = TilersSlot::default();
@@ -409,6 +435,7 @@ mod tests {
             width: 2,
             num_ancillas: 0,
             action_mask: mask.clone(),
+            last_dir_vertical: vec![false; MAX_ANCILLAS],
         };
 
         let mut slot = TilersSlot::default();

@@ -1,9 +1,10 @@
 use mcts_core::environment::{Environment, Obs};
 
 // Re-export the tilers Environment under an unambiguous name
-use tilers::env::Environment as TilersInner;
+use tilers::{enums::QubitId, env::Environment as TilersInner};
 use tilers::qubit::Qubit;
 use tilers::objective::Objective;
+use tilers::enums::Direction::{Up, Down};
 
 use crate::constants::{Action, NUM_ACTIONS};
 
@@ -20,6 +21,7 @@ pub struct TilersObs {
     pub width: usize,
     pub num_ancillas: usize,
     pub action_mask: Vec<bool>,
+    pub last_dir_vertical: Vec<bool>,  // bool for each ancilla
 }
 
 impl Obs for TilersObs {}
@@ -51,6 +53,17 @@ impl TilersEnv {
         let mut action_mask = vec![false; NUM_ACTIONS];
         for &a in &valid { if a < num_actions { action_mask[a] = true; } }
 
+        let last_dirs = &self.inner.last_dirs;
+        let mut last_dir_vertical = vec![false; num_ancillas];
+        for a in 0..num_ancillas {
+            let qid = QubitId(-((a + 1) as i32));
+            if let Some(&dir) = last_dirs.get(&qid) {
+                if dir == Up || dir == Down {
+                    last_dir_vertical[a] = true;
+                }
+            }
+        }
+
         TilersObs {
             placement,
             objectives,
@@ -58,6 +71,7 @@ impl TilersEnv {
             width,
             num_ancillas,
             action_mask,
+            last_dir_vertical,
         }
     }
 }
