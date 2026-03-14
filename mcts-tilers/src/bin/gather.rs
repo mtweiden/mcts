@@ -23,6 +23,7 @@ use tilers::env::Environment;
 use tilers::objective::Objective;
 use tilers::qubit::Qubit;
 use tilers::solver::Solver;
+use tilers::enums::{Direction, QubitId};
 
 /// ----------------------------------------------------------------------------
 /// Gatherer
@@ -219,6 +220,7 @@ impl Gatherer {
             (Vec<Qubit>, Vec<Vec<Objective>>),
             Vec<Action>,
             HashMap<Action, usize>,
+            HashMap<QubitId, Direction>,
         )> = Vec::new();
 
         let mut taken_actions = vec![];
@@ -248,6 +250,7 @@ impl Gatherer {
             // Store the data
             let placement = tilers_env.inner.get_placement();
             let objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
+            let last_dirs = tilers_env.inner.last_dirs.clone();
             let edge_visits = root.edge_visits.clone();
             let valid_actions: Vec<Action> = tilers_env
                 .inner
@@ -255,7 +258,7 @@ impl Gatherer {
                 .iter()
                 .map(|&a| a as Action)
                 .collect();
-            temp_data.push(((placement, objectives), valid_actions, edge_visits.clone()));
+            temp_data.push(((placement, objectives), valid_actions, edge_visits.clone(), last_dirs));
 
             // Select action and step the environment
             // Add more noise if we're very close to the root to encourage exploration
@@ -290,7 +293,10 @@ impl Gatherer {
         } else {
             -1.0
         };
-        for ((p, o), va, ev) in temp_data {
+
+        for ((p, o), va, ev, last_dirs) in temp_data {
+            // Count the number of ancillas from the placement
+            let num_ancillas = p.iter().filter(|q| q.id.as_i32() < 0).count();
             // Convert to JSON-serializable format
             let placement_json = Self::serialize_placement(&p);
             let objectives_json = Self::serialize_objectives(&o);
@@ -301,15 +307,25 @@ impl Gatherer {
             }
             let visits_json = Value::Object(visits_map);
 
+            let mut last_dir_verts = vec![false; num_ancillas as usize];
+            for (qid, dir) in last_dirs {
+                let idx = (-(qid.as_i32() + 1)) as usize;
+                let is_vert = dir == Direction::Up || dir == Direction::Down;
+                last_dir_verts[idx] = is_vert;
+            }
+            let last_dir_vert_json = Value::Array(last_dir_verts.iter().map(|&b| Value::from(b)).collect());
+
+
             let record = json!({
                 "height": tilers_env.inner.height,
                 "width": tilers_env.inner.width,
-                "num_ancillas": tilers_env.inner.num_ancillas(),
+                "num_ancillas": num_ancillas,
                 "placement": placement_json,
                 "objectives": objectives_json,
                 "valid_actions": valid_actions_json,
                 "edge_visits": visits_json,
-                "reward": score
+                "reward": score,
+                "last_dir_vertical": last_dir_vert_json,
             });
 
             let line = record.to_string(); // compact JSON
