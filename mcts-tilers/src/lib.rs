@@ -18,6 +18,7 @@ use pyo3::prelude::*;
 #[pymodule]
 fn mcts_tilers(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Constants
+    m.add("MAX_ANCILLAS", crate::constants::MAX_ANCILLAS)?;
     m.add("MAX_BATCH", crate::constants::MAX_BATCH)?;
     m.add("NUM_ACTIONS", crate::constants::NUM_ACTIONS)?;
     m.add("GRID_MAX", crate::constants::GRID_MAX)?;
