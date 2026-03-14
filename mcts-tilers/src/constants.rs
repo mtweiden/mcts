@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+/// Maximum number of ancillas that can be handled (limited by action space and packing)
+pub const MAX_ANCILLAS: usize = 50;
 /// There is a global "execute" action and 5 actions per ancilla (max 50 ancillas)
 pub const NUM_ACTIONS: usize = 251;
 /// Right now we limit to 20x20 grids
