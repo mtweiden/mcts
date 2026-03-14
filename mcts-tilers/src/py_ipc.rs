@@ -287,6 +287,13 @@ impl PySlotView {
         Ok(unsafe { copy_to_array2(py, s.action_mask.as_ptr(), b, NUM_ACTIONS) })
     }
 
+    /// Returns shape (b, MAX_ANCILLAS)
+    pub fn last_dir_vertical<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<u8>>> {
+        let s = self.slot_ref()?;
+        let b = self.batch_len()?;
+        Ok(unsafe { copy_to_array2(py, s.last_dir_vertical.as_ptr(), b, MAX_ANCILLAS) })
+    }
+
     // ── outputs ──────────────────────────────────────────────────────────
 
     pub fn priors<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<f32>>> {
