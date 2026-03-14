@@ -307,13 +307,16 @@ impl Gatherer {
             }
             let visits_json = Value::Object(visits_map);
 
-            let mut last_dir_verts = vec![false; num_ancillas as usize];
+            let mut last_dirs_jsonable = Vec::with_capacity(num_ancillas);
             for (qid, dir) in last_dirs {
-                let idx = (-(qid.as_i32() + 1)) as usize;
-                let is_vert = dir == Direction::Up || dir == Direction::Down;
-                last_dir_verts[idx] = is_vert;
+                last_dirs_jsonable.push((qid.as_i32(), dir.to_string()));
             }
-            let last_dir_vert_json = Value::Array(last_dir_verts.iter().map(|&b| Value::from(b)).collect());
+            let last_dirs_json = Value::Array(
+                last_dirs_jsonable
+                    .into_iter()
+                    .map(|(qid, dir)| json!([qid, dir]))
+                    .collect(),
+            );
 
 
             let record = json!({
@@ -325,7 +328,7 @@ impl Gatherer {
                 "valid_actions": valid_actions_json,
                 "edge_visits": visits_json,
                 "reward": score,
-                "last_dir_vertical": last_dir_vert_json,
+                "last_dirs": last_dirs_json,
             });
 
             let line = record.to_string(); // compact JSON
