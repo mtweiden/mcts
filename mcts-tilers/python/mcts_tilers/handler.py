@@ -135,8 +135,13 @@ _RAW_OPCODE_TO_TOKEN: dict[int, int] = {
     17: 10,  # RESET
 }
 
-_CX_OPCODE = 8
-_CZ_OPCODE = 9
+# opcodes from tilers
+_RAW_CX_OPCODE = 10
+_RAW_CZ_OPCODE = 11
+
+# opcodes for board token mapping
+_TOKEN_CX_CONTROL = 8  # also used for CZ qubits
+_TOKEN_CX_TARGET = 9
 
 _RAW_ORI_TO_TOKEN: dict[int, int] = {
     0: 2,   # Vertical
@@ -144,6 +149,7 @@ _RAW_ORI_TO_TOKEN: dict[int, int] = {
     2: 4,   # Ancilla
     3: 5,   # Cultivating
     4: 6,   # Resource
+    # -: 7  $ Ancilla that was moved vertically in the last step
 }
 
 
@@ -154,6 +160,7 @@ def build_boards(
     obj_layers: list[dict[str, np.ndarray]],
     num_layers: np.ndarray,     # (total,) u8
     num_objectives: np.ndarray, # (total, LOOKAHEAD_MAX) u16
+    last_dir_vertical: np.ndarray, # (total, MAX_ANCILLAS) bool
 ) -> np.ndarray:
     """
     Transform placements and objectives into board tensors.
@@ -170,7 +177,7 @@ def build_boards(
     for i in range(total):
         nq = int(num_qubits[i])
         nl = int(num_layers[i])
-        tag = 2
+        tag = 52
 
         for l in range(min(nl, max_nl)):
             no = int(num_objectives[i, l])
@@ -182,12 +189,12 @@ def build_boards(
                 arg0 = int(layer_data["arg0s"][i, k])
                 arg1 = int(layer_data["arg1s"][i, k])
 
-                if opcode == _CZ_OPCODE:
-                    board_map[arg0] = (8, tag)
-                    board_map[arg1] = (8, tag)
-                elif opcode == _CX_OPCODE:
-                    board_map[arg0] = (8, tag)
-                    board_map[arg1] = (9, tag)
+                if opcode == _RAW_CZ_OPCODE:
+                    board_map[arg0] = (_TOKEN_CX_CONTROL, tag)
+                    board_map[arg1] = (_TOKEN_CX_CONTROL, tag)
+                elif opcode == _RAW_CX_OPCODE:
+                    board_map[arg0] = (_TOKEN_CX_CONTROL, tag)
+                    board_map[arg1] = (_TOKEN_CX_TARGET, tag)
                 else:
                     token = _RAW_OPCODE_TO_TOKEN.get(opcode, 1)
                     board_map[arg0] = (token, tag)
@@ -204,6 +211,9 @@ def build_boards(
                     boards[i, l, j, 1] = t
                     boards[i, l, j, 2] = ori_token
                 elif qid < 0:
+                    ancilla_idx = -(qid + 1)
+                    if ancilla_idx < last_dir_vertical.shape[1] and last_dir_vertical[i, ancilla_idx]:
+                        ori_token = 7
                     boards[i, l, j, 0] = 11
                     boards[i, l, j, 1] = -(qid + 1) + 2
                     boards[i, l, j, 2] = ori_token
@@ -253,6 +263,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             nq_list = []
             nl_list = []
             no_list = []
+            ldirs_list = []
 
             slot_batch_sizes = []
             valid_slot_views = []
@@ -274,7 +285,8 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
                 # num_layers must be the same for all instances
                 nl_list.append(np.asarray(sv.num_layers()[:b_i], copy=True))
                 no_list.append(np.asarray(sv.num_objectives()[:b_i], copy=True))
-            
+                ldirs_list.append(np.asarray(sv.last_dir_vertical()[:b_i], copy=True))
+
             if not valid_slot_views:
                 continue  # No valid slots to process
 
@@ -288,6 +300,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
             nq_all = np.concatenate(nq_list)
             nl_all = np.concatenate(nl_list)
             no_all = np.concatenate(no_list, axis=0)
+            last_dir_vertical_all = np.concatenate(ldirs_list, axis=0)
 
             # Unpack structured data
             qubit_ids, qubit_oris = unpack_placement_batch(placement_raw, nq_all)
@@ -295,7 +308,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
             # Build board representation for the model
             boards_np = build_boards(
-                qubit_ids, qubit_oris, nq_all, obj_layers, nl_all, no_all,
+                qubit_ids, qubit_oris, nq_all, obj_layers, nl_all, no_all, last_dir_vertical_all,
             )
             assert boards_np.shape[1] == MODEL.lookahead + 1, \
                 f"build_boards returned shape {boards_np.shape}, expected num_layers={MODEL.lookahead + 1}"
