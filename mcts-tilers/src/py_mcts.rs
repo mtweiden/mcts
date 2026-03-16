@@ -67,8 +67,14 @@ fn obs_to_pydict<'py>(py: Python<'py>, obs: &TilersObs) -> PyResult<Bound<'py, P
         .collect();
     dict.set_item("valid_actions", &valid_actions)?;
 
-    let last_dirs = obs.last_dir_vertical.iter().map(|&d| d).collect::<Vec<bool>>();
-    dict.set_item("last_dirs_vertical", &last_dirs)?;
+    let last_dirs_vertical: HashMap<i32, bool> = obs
+        .last_dir_vertical
+        .iter()
+        .enumerate()
+        .map(|(qid, &is_vertical)| (qid as i32, is_vertical))
+        .collect();
+    dict.set_item("last_dirs_vertical", &last_dirs_vertical)?;
+
     Ok(dict)
 }
 
