@@ -71,7 +71,7 @@ fn obs_to_pydict<'py>(py: Python<'py>, obs: &TilersObs) -> PyResult<Bound<'py, P
         .last_dir_vertical
         .iter()
         .enumerate()
-        .map(|(qid, &is_vertical)| (qid as i32, is_vertical))
+        .map(|(qid, &is_vertical)| (-((qid + 1) as i32), is_vertical))
         .collect();
     dict.set_item("last_dirs_vertical", &last_dirs_vertical)?;
 
