@@ -82,6 +82,7 @@ impl Environment for TilersEnv {
 
     fn step(&mut self, action: Self::Act) {
         let _ = self.inner.step(action as usize).expect("MCTS passed an invalid action");
+        self.inner.finish_cultivating(None, None);
     }
 
     fn done(&self) -> bool {
