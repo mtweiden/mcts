@@ -120,107 +120,135 @@ def unpack_objectives_batch(
 
 
 _RAW_OPCODE_TO_TOKEN: dict[int, int] = {
-    0:  2,   # X
-    1:  2,   # Y
-    2:  2,   # Z
-    3:  3,   # H
-    4:  4,   # S
-    5:  4,   # Sdg
-    6:  5,   # SX
-    7:  5,   # SXdg
-    8:  6,   # T
-    9:  6,   # Tdg
+    0: 2,    # X
+    1: 2,    # Y
+    2: 2,    # Z
+    3: 3,    # H
+    4: 4,    # S
+    5: 4,    # Sdg
+    6: 5,    # SX
+    7: 5,    # SXdg
+    8: 6,    # T
+    9: 6,    # Tdg
     12: 2,   # RZ
-    16: 7,   # MEASURE
-    17: 10,  # RESET
+    16: 11,  # MEASURE
+    17: 12,  # RESET
 }
 
 # opcodes from tilers
 _RAW_CX_OPCODE = 10
 _RAW_CZ_OPCODE = 11
 
-# opcodes for board token mapping
-_TOKEN_CX_CONTROL = 8  # also used for CZ qubits
-_TOKEN_CX_TARGET = 9
+# board.py two-qubit tokens
+_TOKEN_CZ_CONTROL = 7
+_TOKEN_CZ_TARGET = 8
+_TOKEN_CX_CONTROL = 9
+_TOKEN_CX_TARGET = 10
 
+# raw orientation -> board.py orientation token
 _RAW_ORI_TO_TOKEN: dict[int, int] = {
-    0: 2,   # Vertical
-    1: 3,   # Horizontal
-    2: 4,   # Ancilla
-    3: 5,   # Cultivating
-    4: 6,   # Resource
-    # -: 7  $ Ancilla that was moved vertically in the last step
+    0: 2,  # Vertical
+    1: 3,  # Horizontal
+    3: 4,  # Cultivating
+    4: 5,  # Resource
+    2: 6,  # Ancilla (default / last move horizontal)
+    # 7 is derived for ancilla + last_move_vertical
 }
 
 
 def build_boards(
-    qubit_ids: np.ndarray,      # (total, max_nq) i32
-    qubit_oris: np.ndarray,     # (total, max_nq) u8
-    num_qubits: np.ndarray,     # (total,) u16
+    qubit_ids: np.ndarray,         # (total, max_nq) i32
+    qubit_oris: np.ndarray,        # (total, max_nq) u8
+    num_qubits: np.ndarray,        # (total,) u16
+    widths: np.ndarray,            # (total,) i32
     obj_layers: list[dict[str, np.ndarray]],
-    num_layers: np.ndarray,     # (total,) u8
-    num_objectives: np.ndarray, # (total, LOOKAHEAD_MAX) u16
+    num_layers: np.ndarray,        # (total,) u8
+    num_objectives: np.ndarray,    # (total, LOOKAHEAD_MAX) u16
     last_dir_vertical: np.ndarray, # (total, MAX_ANCILLAS) bool
 ) -> np.ndarray:
     """
     Transform placements and objectives into board tensors.
 
     Returns:
-        boards: (total, max_nl, max_nq, 3) int32, zero-padded
+        boards: (total, max_nl, max_nq, 4) int32
+            per-cell = (op, ori, mate_row, mate_col)
+            padded cells remain zeros.
     """
     total = qubit_ids.shape[0]
     max_nq = qubit_ids.shape[1]
     max_nl = len(obj_layers)
 
-    boards = np.zeros((total, max_nl, max_nq, 3), dtype=np.int32)
+    boards = np.zeros((total, max_nl, max_nq, 4), dtype=np.int32)
 
     for i in range(total):
         nq = int(num_qubits[i])
         nl = int(num_layers[i])
-        tag = 52
+        w = int(widths[i]) if i < widths.shape[0] else 0
+        if nq <= 0 or w <= 0:
+            continue
+
+        # qid -> (row, col)
+        pos_map: dict[int, tuple[int, int]] = {}
+        for j in range(nq):
+            qid = int(qubit_ids[i, j])
+            row, col = divmod(j, w)
+            pos_map[qid] = (row, col)
 
         for l in range(min(nl, max_nl)):
             no = int(num_objectives[i, l])
             layer_data = obj_layers[l]
 
-            board_map: dict[int, tuple[int, int]] = {}
+            # qid -> (op, mate_row, mate_col)
+            obj_map: dict[int, tuple[int, int, int]] = {}
+
             for k in range(no):
                 opcode = int(layer_data["opcodes"][i, k])
                 arg0 = int(layer_data["arg0s"][i, k])
                 arg1 = int(layer_data["arg1s"][i, k])
 
                 if opcode == _RAW_CZ_OPCODE:
-                    board_map[arg0] = (_TOKEN_CX_CONTROL, tag)
-                    board_map[arg1] = (_TOKEN_CX_CONTROL, tag)
+                    if arg0 in pos_map and arg1 in pos_map:
+                        r0, c0 = pos_map[arg0]
+                        r1, c1 = pos_map[arg1]
+                        obj_map[arg0] = (_TOKEN_CZ_CONTROL, r1, c1)
+                        obj_map[arg1] = (_TOKEN_CZ_TARGET, r0, c0)
                 elif opcode == _RAW_CX_OPCODE:
-                    board_map[arg0] = (_TOKEN_CX_CONTROL, tag)
-                    board_map[arg1] = (_TOKEN_CX_TARGET, tag)
+                    if arg0 in pos_map and arg1 in pos_map:
+                        r0, c0 = pos_map[arg0]
+                        r1, c1 = pos_map[arg1]
+                        obj_map[arg0] = (_TOKEN_CX_CONTROL, r1, c1)
+                        obj_map[arg1] = (_TOKEN_CX_TARGET, r0, c0)
                 else:
                     token = _RAW_OPCODE_TO_TOKEN.get(opcode, 1)
-                    board_map[arg0] = (token, tag)
-
-                tag += 1
+                    obj_map[arg0] = (token, -1, -1)
 
             for j in range(nq):
                 qid = int(qubit_ids[i, j])
                 ori_token = _RAW_ORI_TO_TOKEN.get(int(qubit_oris[i, j]), 1)
 
-                if qid in board_map:
-                    op, t = board_map[qid]
+                if qid in obj_map:
+                    op, mate_row, mate_col = obj_map[qid]
                     boards[i, l, j, 0] = op
-                    boards[i, l, j, 1] = t
-                    boards[i, l, j, 2] = ori_token
+                    boards[i, l, j, 1] = ori_token
+                    boards[i, l, j, 2] = mate_row
+                    boards[i, l, j, 3] = mate_col
                 elif qid < 0:
                     ancilla_idx = -(qid + 1)
-                    if ancilla_idx < last_dir_vertical.shape[1] and last_dir_vertical[i, ancilla_idx]:
+                    if (
+                        ori_token == 6
+                        and ancilla_idx < last_dir_vertical.shape[1]
+                        and last_dir_vertical[i, ancilla_idx]
+                    ):
                         ori_token = 7
-                    boards[i, l, j, 0] = 11
-                    boards[i, l, j, 1] = -(qid + 1) + 2
-                    boards[i, l, j, 2] = ori_token
+                    boards[i, l, j, 0] = 12 - qid  # -1..-50 -> 13..62
+                    boards[i, l, j, 1] = ori_token
+                    boards[i, l, j, 2] = -1
+                    boards[i, l, j, 3] = -1
                 else:
                     boards[i, l, j, 0] = 1
                     boards[i, l, j, 1] = 1
-                    boards[i, l, j, 2] = 1
+                    boards[i, l, j, 2] = -1
+                    boards[i, l, j, 3] = -1
 
     return boards
 
@@ -308,7 +336,14 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
 
             # Build board representation for the model
             boards_np = build_boards(
-                qubit_ids, qubit_oris, nq_all, obj_layers, nl_all, no_all, last_dir_vertical_all,
+                qubit_ids,
+                qubit_oris,
+                nq_all,
+                w_all,  # width needed for mate coordinates
+                obj_layers,
+                nl_all,
+                no_all,
+                last_dir_vertical_all,
             )
             assert boards_np.shape[1] == MODEL.lookahead + 1, \
                 f"build_boards returned shape {boards_np.shape}, expected num_layers={MODEL.lookahead + 1}"
