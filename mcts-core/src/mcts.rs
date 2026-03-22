@@ -159,29 +159,40 @@ impl<E: Environment> MCTS<E> {
         };
         if let Some(&new_root_id) = old_root_node.children.get(&action) {
             self.root_id = Some(new_root_id);
-            // TODO: Implement pruning here to conserve memory for long games.
-            // The goal is to remove all nodes that are no longer reachable from the `new_root_id`.
-            // This is a non-trivial garbage collection process because of the arena storage.
-            //
-            // HIGH-LEVEL ALGORITHM:
-            // 1. Perform a graph traversal (like DFS or BFS) starting from `new_root_id`.
-            //    Collect all reachable `NodeId`s into a `HashSet` for fast lookups.
-            //
-            // 2. Create a new `nodes_after_pruning: Vec<Node>` and a new
-            //    `table_after_pruning: HashMap<NodeId, usize>`.
-            //
-            // 3. Iterate through `self.nodes`. If a node's `id` is in the reachable set,
-            //    clone it and push it into `nodes_after_pruning`.
-            //
-            // 4. As you add a node, populate `table_after_pruning`, mapping the `NodeId`
-            //    to its new index in the `nodes_after_pruning` vector.
-            //
-            // 5. Finally, replace the old data structures with the pruned ones:
-            //    `self.nodes = nodes_after_pruning;`
-            //    `self.transposition_table = table_after_pruning;`
-            //
-            // This process rebuilds the arena with only the necessary nodes, keeping all
-            // indices in the transposition table valid relative to the new `nodes` vector.
+
+            // Collect all NodeIds reachable from new_root_id via a BFS.
+            // A visited HashSet is required to terminate on cycles (transposition table
+            // graphs can have cycles when states repeat, e.g. sliding-tile puzzles).
+            let mut reachable: std::collections::HashSet<NodeId> = std::collections::HashSet::new();
+            let mut queue: std::collections::VecDeque<NodeId> = std::collections::VecDeque::new();
+            queue.push_back(new_root_id);
+            while let Some(id) = queue.pop_front() {
+                if !reachable.insert(id) {
+                    continue; // already visited
+                }
+                if let Some(idx) = self.transposition_table.get(&id) {
+                    if let Some(node) = self.nodes.get(*idx) {
+                        for &child_id in node.children.values() {
+                            if !reachable.contains(&child_id) {
+                                queue.push_back(child_id);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Rebuild the arena keeping only reachable nodes, and remap indices.
+            let mut nodes_after_pruning: Vec<Node<E::Act>> = Vec::with_capacity(reachable.len());
+            let mut table_after_pruning: HashMap<NodeId, usize> = HashMap::with_capacity(reachable.len());
+            for node in self.nodes.drain(..) {
+                if reachable.contains(&node.id) {
+                    let new_idx = nodes_after_pruning.len();
+                    table_after_pruning.insert(node.id, new_idx);
+                    nodes_after_pruning.push(node);
+                }
+            }
+            self.nodes = nodes_after_pruning;
+            self.transposition_table = table_after_pruning;
         } else {
             // The action does not lead to a known child. This might happen if the search is
             // shallow and the node was never fully expanded.
@@ -637,5 +648,134 @@ mod tests {
         let normalized = mcts.normalize_prior(priors, &[0, 1]);
         let total: f32 = normalized.values().sum();
         assert!((total - 1.0).abs() < 1e-6);
+    }
+
+    // Helper: build a small tree manually.
+    //
+    //   root (id=10) --0--> child_a (id=20) --0--> grandchild (id=40)
+    //   root (id=10) --1--> child_b (id=30)
+    //
+    // child_b and root become unreachable after advancing via action 0.
+    fn build_simple_tree() -> MCTS<NumberLineEnv> {
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let (root_id, child_a_id, child_b_id, grandchild_id): (NodeId, NodeId, NodeId, NodeId) =
+            (10, 20, 30, 40);
+
+        let mut root = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
+        root.children.insert(0, child_a_id);
+        root.children.insert(1, child_b_id);
+
+        let mut child_a = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
+        child_a.children.insert(0, grandchild_id);
+
+        let child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        let grandchild = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, grandchild_id, None);
+
+        mcts.insert_node(root_id, root);
+        mcts.insert_node(child_a_id, child_a);
+        mcts.insert_node(child_b_id, child_b);
+        mcts.insert_node(grandchild_id, grandchild);
+        mcts.root_id = Some(root_id);
+        mcts
+    }
+
+    #[test]
+    fn test_advance_root_prunes_unreachable_nodes() {
+        let mut mcts = build_simple_tree();
+        assert_eq!(mcts.nodes.len(), 4);
+
+        mcts.advance_root(0u8); // move to child_a
+
+        assert_eq!(mcts.root_id, Some(20));
+        // root and child_b are no longer reachable from child_a
+        assert_eq!(mcts.nodes.len(), 2);
+        assert!(mcts.node_exists(20));
+        assert!(mcts.node_exists(40));
+        assert!(!mcts.node_exists(10));
+        assert!(!mcts.node_exists(30));
+    }
+
+    #[test]
+    fn test_advance_root_table_consistent_after_pruning() {
+        // Every entry in transposition_table must point to the node with the matching id.
+        let mut mcts = build_simple_tree();
+        mcts.advance_root(0u8);
+
+        assert_eq!(mcts.transposition_table.len(), mcts.nodes.len());
+        for (&id, &idx) in &mcts.transposition_table {
+            assert_eq!(mcts.nodes[idx].id, id);
+        }
+    }
+
+    #[test]
+    fn test_advance_root_preserves_transposition() {
+        // A node reachable from two different children of the new root must be kept.
+        //
+        //   root (id=10) --0--> child_a (id=20) --0--> shared (id=40)
+        //   root (id=10) --1--> child_b (id=30) --0--> shared (id=40)  [unreachable after advance]
+        //
+        // After advancing to child_a, shared is still reachable via child_a.
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let (root_id, child_a_id, child_b_id, shared_id): (NodeId, NodeId, NodeId, NodeId) =
+            (10, 20, 30, 40);
+
+        let mut root = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
+        root.children.insert(0, child_a_id);
+        root.children.insert(1, child_b_id);
+
+        let mut child_a = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
+        child_a.children.insert(0, shared_id);
+
+        let mut child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        child_b.children.insert(0, shared_id);
+
+        let shared = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, shared_id, None);
+
+        mcts.insert_node(root_id, root);
+        mcts.insert_node(child_a_id, child_a);
+        mcts.insert_node(child_b_id, child_b);
+        mcts.insert_node(shared_id, shared);
+        mcts.root_id = Some(root_id);
+
+        mcts.advance_root(0u8);
+
+        assert_eq!(mcts.root_id, Some(child_a_id));
+        assert_eq!(mcts.nodes.len(), 2); // child_a and shared
+        assert!(mcts.node_exists(child_a_id));
+        assert!(mcts.node_exists(shared_id));
+        assert!(!mcts.node_exists(root_id));
+        assert!(!mcts.node_exists(child_b_id));
+    }
+
+    #[test]
+    fn test_advance_root_handles_cycle() {
+        // Ensure BFS terminates when child_a and child_b point back at each other.
+        //
+        //   root (id=10) --0--> child_a (id=20) --1--> child_b (id=30)
+        //                       child_b (id=30) --0--> child_a (id=20)  [cycle]
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let (root_id, child_a_id, child_b_id): (NodeId, NodeId, NodeId) = (10, 20, 30);
+
+        let mut root = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, root_id, None);
+        root.children.insert(0, child_a_id);
+
+        let mut child_a = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, child_a_id, None);
+        child_a.children.insert(1, child_b_id);
+
+        let mut child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        child_b.children.insert(0, child_a_id); // back-edge
+
+        mcts.insert_node(root_id, root);
+        mcts.insert_node(child_a_id, child_a);
+        mcts.insert_node(child_b_id, child_b);
+        mcts.root_id = Some(root_id);
+
+        mcts.advance_root(0u8); // does not hang
+
+        assert_eq!(mcts.root_id, Some(child_a_id));
+        assert_eq!(mcts.nodes.len(), 2);
+        assert!(mcts.node_exists(child_a_id));
+        assert!(mcts.node_exists(child_b_id));
+        assert!(!mcts.node_exists(root_id));
     }
 }
