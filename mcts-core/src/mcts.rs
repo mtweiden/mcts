@@ -76,6 +76,14 @@ pub struct MCTS<E: Environment> {
     ///
     /// Default: `2.0`. Reference: [Wu 2020, §3.2].
     pub k_forced: f32,
+
+    /// Transient Dirichlet noise blended into root priors during PUCT scoring.
+    ///
+    /// Stored on the struct rather than in the node so it never permanently
+    /// contaminates the transposition table. Set via [`perturb_root_prior`]
+    /// before [`run`]; automatically cleared at the end of each [`run`] call.
+    root_noise: Option<HashMap<E::Act, f32>>,
+    root_noise_epsilon: f32,
 }
 
 impl<E: Environment> MCTS<E> {
@@ -88,6 +96,8 @@ impl<E: Environment> MCTS<E> {
             c_fpu: 0.2,
             root_softmax_temp: 1.03,
             k_forced: 2.0,
+            root_noise: None,
+            root_noise_epsilon: 0.0,
         }
     }
 
@@ -102,7 +112,8 @@ impl<E: Environment> MCTS<E> {
     /// * `num_steps`          — Number of MCTS iterations. More → stronger search.
     /// * `c_puct`             — Exploration constant in the PUCT formula.
     /// * `terminal_evaluator` — Callback returning a scalar value for terminal states.
-    /// * `forced_playouts`       — Whether this search will be recorded as a training sample.
+    /// * `forced_playouts`       — Whether to apply forced playouts during this search.
+    ///                          Enable for full training searches; disable for fast inference.
     ///                          See *Playout Cap Randomization* below.
     ///
     /// # Playout Cap Randomization \[Wu 2020, §3.1\]
@@ -205,6 +216,11 @@ impl<E: Environment> MCTS<E> {
                 self.backpropagate(&pending.path, false);
             }
         }
+        // Clear transient noise so it doesn't leak into future searches or
+        // contaminate policy_target() calculations.
+        self.root_noise = None;
+        self.root_noise_epsilon = 0.0;
+
         self.get_node_mut(root_hash).unwrap().clone()
     }
 
@@ -434,21 +450,48 @@ impl<E: Environment> MCTS<E> {
             .sum();
         let fpu_q = node.value - c_fpu_eff * p_explored.sqrt();
 
-        // --- Root softmax temperature ---
-        // P′(c) ∝ P(c)^(1/T), renormalised.  Only applied at the root.
-        // Reference: [Wu 2020, §2].
-        let effective_priors: HashMap<E::Act, f32> =
-            if is_root && (self.root_softmax_temp - 1.0).abs() > 1e-6 {
+        // --- Root softmax temperature + transient Dirichlet noise ---
+        // At the root we apply two transformations in sequence:
+        //   1. Blend in the stored noise: P′(c) = (1−ε)·P(c) + ε·noise(c)
+        //   2. Apply softmax temperature: P″(c) ∝ P′(c)^(1/T), renormalised
+        // Noise is read from `self.root_noise` (set by `perturb_root_prior`)
+        // rather than baked into `node.prior_probs`, so it never permanently
+        // alters the transposition table.  References: [Wu 2020, §2].
+        let effective_priors: HashMap<E::Act, f32> = if is_root {
+            // Step 1: blend noise if present.
+            let noisy: HashMap<E::Act, f32> = if let Some(noise) = &self.root_noise {
+                let eps = self.root_noise_epsilon;
+                let mut blended: HashMap<E::Act, f32> = node.prior_probs
+                    .iter()
+                    .map(|(&a, &p)| {
+                        let n = noise.get(&a).copied().unwrap_or(0.0);
+                        (a, (1.0 - eps) * p + eps * n)
+                    })
+                    .collect();
+                let total: f32 = blended.values().sum();
+                if total > 0.0 {
+                    for v in blended.values_mut() { *v /= total; }
+                }
+                blended
+            } else {
+                node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
+            };
+
+            // Step 2: apply softmax temperature.
+            if (self.root_softmax_temp - 1.0).abs() > 1e-6 {
                 let inv_temp = 1.0 / self.root_softmax_temp;
-                let raw: HashMap<E::Act, f32> = node.prior_probs
+                let raw: HashMap<E::Act, f32> = noisy
                     .iter()
                     .map(|(&a, &p)| (a, p.max(1e-30).powf(inv_temp)))
                     .collect();
                 let sum: f32 = raw.values().sum();
                 raw.into_iter().map(|(a, p)| (a, p / sum)).collect()
             } else {
-                node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
-            };
+                noisy
+            }
+        } else {
+            node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
+        };
 
         let mut scores = HashMap::new();
 
@@ -797,38 +840,27 @@ impl<E: Environment> MCTS<E> {
         Some(pruned.into_iter().map(|(a, v)| (a, v as f32 / total)).collect())
     }
 
-    /// Blend the root node's policy priors with a pre-computed noise distribution.
+    /// Register a pre-computed noise distribution to be blended into the root
+    /// prior **during the next [`run`] call**.
     ///
     /// `P′(c) = (1 − epsilon) × P(c) + epsilon × noise(c)`
     ///
-    /// This should be called **before** [`run`] on full-search (training) turns to
-    /// encourage exploration of moves that the neural network assigns low prior
-    /// probability. The `noise` map should already be normalised (e.g. sampled from
-    /// a Dirichlet distribution over the legal actions).
+    /// The noise is stored transiently on the MCTS struct and applied only
+    /// inside [`puct_scores`] when scoring the root node, so it never
+    /// permanently modifies `node.prior_probs` in the transposition table.
+    /// This prevents noise from one search turn contaminating future searches
+    /// or corrupting [`policy_target`] calculations (which rely on the original
+    /// network priors to compute `n_forced`).
     ///
-    /// Has no effect if the root node does not yet exist in the tree (e.g. on the
-    /// very first step before any search has been run).
+    /// Call this **before** [`run`] on full-search (training) turns. The noise
+    /// is automatically cleared at the end of [`run`].  The `noise` map should
+    /// already be normalised (e.g. sampled from a Dirichlet distribution over
+    /// the legal actions).
     ///
     /// Reference: [Wu 2020, §2].
     pub fn perturb_root_prior(&mut self, noise: &HashMap<E::Act, f32>, epsilon: f32) {
-        let root_id = match self.root_id {
-            Some(id) => id,
-            None => return,
-        };
-        if let Some(node) = self.get_node_mut(root_id) {
-            let mut total = 0.0_f32;
-            for (&action, prior) in node.prior_probs.iter_mut() {
-                let n = noise.get(&action).copied().unwrap_or(0.0);
-                *prior = (1.0 - epsilon) * *prior + epsilon * n;
-                total += *prior;
-            }
-            // Renormalise in case noise doesn't cover every action.
-            if total > 0.0 {
-                for prior in node.prior_probs.values_mut() {
-                    *prior /= total;
-                }
-            }
-        }
+        self.root_noise = Some(noise.clone());
+        self.root_noise_epsilon = epsilon;
     }
 
     /// Do inference on a batch of observations
