@@ -32,10 +32,22 @@ use tilers::enums::{Direction, QubitId};
 /// ----------------------------------------------------------------------------
 struct Gatherer {
     batch_size: usize,
+    /// Playout budget for full (recorded) searches.
     mcts_steps: usize,
+    /// Playout budget for fast (unrecorded) searches. Should be much smaller
+    /// than `mcts_steps`. Reference: [Wu 2020, §3.1].
+    fast_steps: usize,
+    /// Fraction of turns that run a full search and are recorded for training.
+    /// The remaining turns run a fast search used only for move selection.
+    /// Reference: [Wu 2020, §3.1].
+    p_full_search: f32,
     max_actions: usize,
     output_path: String,
     noise_strength: f64,
+    /// Mixing weight for Dirichlet noise injected into the MCTS root prior on
+    /// full-search turns. 0.0 disables root noise.
+    /// Reference: [Wu 2020, §2].
+    dirichlet_epsilon: f32,
     num_objective_layers: usize,
     gather_id: usize,
 }
@@ -44,18 +56,24 @@ impl Gatherer {
     pub fn new(
         batch_size: usize,
         mcts_steps: usize,
+        fast_steps: usize,
+        p_full_search: f32,
         max_actions: usize,
         output_path: String,
         noise_strength: f64,
+        dirichlet_epsilon: f32,
         num_objective_layers: usize,
         gather_id: usize,
     ) -> Self {
         Self {
             batch_size,
             mcts_steps,
+            fast_steps,
+            p_full_search,
             max_actions,
             output_path,
             noise_strength,
+            dirichlet_epsilon,
             num_objective_layers,
             gather_id,
         }
@@ -244,35 +262,58 @@ impl Gatherer {
         };
 
         for step in 0..max_actions {
+            // Playout cap randomization [Wu 2020, §3.1]:
+            // Full searches are run on a random fraction of turns and recorded
+            // for training. Fast searches use a smaller budget and are used
+            // only for move selection.
+            let is_full_search = rng.random::<f32>() < self.p_full_search;
+            let steps = if is_full_search { self.mcts_steps } else { self.fast_steps };
+
+            // Inject Dirichlet noise into the MCTS root prior before full
+            // searches to encourage exploration of low-prior moves during data
+            // generation. Has no effect if the root doesn't exist yet.
+            // Reference: [Wu 2020, §2].
+            if is_full_search && self.dirichlet_epsilon > 0.0 {
+                let valid = tilers_env.inner.valid_actions();
+                let raw_noise = self._dirichlet_noise(valid.len(), rng);
+                let noise_map: HashMap<Action, f32> = valid.iter()
+                    .zip(raw_noise.iter())
+                    .map(|(&a, &n)| (a as Action, n as f32))
+                    .collect();
+                mcts.perturb_root_prior(&noise_map, self.dirichlet_epsilon);
+            }
+
             // Run MCTS
-            let root = mcts.run(&tilers_env, client, self.mcts_steps, c_puct, &terminal_evaluator, true);
+            let root = mcts.run(&tilers_env, client, steps, c_puct, &terminal_evaluator, is_full_search);
 
-            // Store the data
-            let placement = tilers_env.inner.get_placement();
-            let objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
-            let last_dirs = tilers_env.inner.last_dirs.clone();
-            // Use the pruned policy target as the training label rather than raw
-            // edge_visits. This strips out forced-playout visits so the network
-            // is not trained to imitate exploratory noise moves.
-            // Scale the probability distribution back to visit counts so the
-            // downstream training code receives the same usize type it expects.
-            let n_total: usize = root.edge_visits.values().sum();
-            let edge_visits: HashMap<Action, usize> = mcts
-                .policy_target(c_puct)
-                .unwrap_or_default()
-                .into_iter()
-                .map(|(a, p)| (a, (p * n_total as f32).round() as usize))
-                .collect();
-            let valid_actions: Vec<Action> = tilers_env
-                .inner
-                .valid_actions()
-                .iter()
-                .map(|&a| a as Action)
-                .collect();
-            temp_data.push(((placement, objectives), valid_actions, edge_visits.clone(), last_dirs));
+            // Only record training data for full searches.
+            if is_full_search {
+                let placement = tilers_env.inner.get_placement();
+                let objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
+                let last_dirs = tilers_env.inner.last_dirs.clone();
+                // Use the pruned policy target as the training label rather than
+                // raw edge_visits. This strips out forced-playout visits so the
+                // network is not trained to imitate exploratory noise moves.
+                // Scale the probability distribution back to visit counts so the
+                // downstream training code receives the same usize type it expects.
+                let n_total: usize = root.edge_visits.values().sum();
+                let edge_visits: HashMap<Action, usize> = mcts
+                    .policy_target(c_puct)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|(a, p)| (a, (p * n_total as f32).round() as usize))
+                    .collect();
+                let valid_actions: Vec<Action> = tilers_env
+                    .inner
+                    .valid_actions()
+                    .iter()
+                    .map(|&a| a as Action)
+                    .collect();
+                temp_data.push(((placement, objectives), valid_actions, edge_visits, last_dirs));
+            }
 
-            // Select action and step the environment
-            // Add more noise if we're very close to the root to encourage exploration
+            // Select action and step the environment (always, regardless of search type).
+            // Add more noise if we're very close to the root to encourage exploration.
             let action = self.select_action(&root, &tilers_env.inner, step, rng);
             let _ = tilers_env.inner.step(action as usize);
             tilers_env.inner.finish_cultivating(None, None); // Cultivate resources in a single step
@@ -281,7 +322,11 @@ impl Gatherer {
                 break;
             }
 
-            println!("[Gatherer {}][step {}] Selected action: {} from {:?}", self.gather_id, step, action, edge_visits);
+            println!(
+                "[Gatherer {}][step {}] Selected action: {} ({})",
+                self.gather_id, step, action,
+                if is_full_search { "full search" } else { "fast search" },
+            );
 
             // Advance the root
             mcts.advance_root(action);
@@ -412,10 +457,13 @@ fn main() {
     let output_path = format!("output-{}.json", worker_id);
     let gatherer = Gatherer::new(
         8,         // inference batch size
-        10_000,    // MCTS steps
+        10_000,    // full-search MCTS steps
+        1_600,     // fast-search MCTS steps (~1/6 of full)
+        0.25,      // fraction of turns that are full searches
         80,        // max actions
         output_path,
-        0.20,      // noise strength
+        0.20,      // action-selection noise strength
+        0.25,      // Dirichlet epsilon for MCTS root noise
         num_objective_layers,
         worker_id as usize,
     );
