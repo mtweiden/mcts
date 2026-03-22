@@ -412,6 +412,10 @@ fn main() {
     let num_objective_layers = DEFAULT_LOOKAHEAD;
     let mut max_generated_depth = 10_000;
     let mut c_puct = 1.4;
+    let mut mcts_steps: usize = 10_000;
+    let mut fast_steps: usize = 1_600;
+    let mut p_full_search: f32 = 0.25;
+    let mut dirichlet_epsilon: f32 = 0.25;
 
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -446,6 +450,18 @@ fn main() {
         if args[i] == "--c_puct" && i + 1 < args.len() {
             c_puct = args[i + 1].parse().unwrap_or(1.4);
         }
+        if args[i] == "--mcts_steps" && i + 1 < args.len() {
+            mcts_steps = args[i + 1].parse().unwrap_or(10_000);
+        }
+        if args[i] == "--fast_steps" && i + 1 < args.len() {
+            fast_steps = args[i + 1].parse().unwrap_or(1_600);
+        }
+        if args[i] == "--p_full_search" && i + 1 < args.len() {
+            p_full_search = args[i + 1].parse().unwrap_or(0.25);
+        }
+        if args[i] == "--dirichlet_epsilon" && i + 1 < args.len() {
+            dirichlet_epsilon = args[i + 1].parse().unwrap_or(0.25);
+        }
     }
 
     let arena_name = format!("mcts_{}_{}", num_slots, num_handlers);
@@ -456,14 +472,14 @@ fn main() {
     // Spawn all gatherers as independent tasks
     let output_path = format!("output-{}.json", worker_id);
     let gatherer = Gatherer::new(
-        8,         // inference batch size
-        10_000,    // full-search MCTS steps
-        1_600,     // fast-search MCTS steps (~1/6 of full)
-        0.25,      // fraction of turns that are full searches
-        80,        // max actions
+        8,                  // inference batch size
+        mcts_steps,         // full-search MCTS steps
+        fast_steps,         // fast-search MCTS steps
+        p_full_search,      // fraction of turns that are full searches
+        80,                 // max actions
         output_path,
-        0.20,      // action-selection noise strength
-        0.25,      // Dirichlet epsilon for MCTS root noise
+        0.20,               // action-selection noise strength
+        dirichlet_epsilon,  // Dirichlet epsilon for MCTS root noise
         num_objective_layers,
         worker_id as usize,
     );
