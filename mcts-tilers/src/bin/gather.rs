@@ -251,7 +251,18 @@ impl Gatherer {
             let placement = tilers_env.inner.get_placement();
             let objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
             let last_dirs = tilers_env.inner.last_dirs.clone();
-            let edge_visits = root.edge_visits.clone();
+            // Use the pruned policy target as the training label rather than raw
+            // edge_visits. This strips out forced-playout visits so the network
+            // is not trained to imitate exploratory noise moves.
+            // Scale the probability distribution back to visit counts so the
+            // downstream training code receives the same usize type it expects.
+            let n_total: usize = root.edge_visits.values().sum();
+            let edge_visits: HashMap<Action, usize> = mcts
+                .policy_target(c_puct)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|(a, p)| (a, (p * n_total as f32).round() as usize))
+                .collect();
             let valid_actions: Vec<Action> = tilers_env
                 .inner
                 .valid_actions()
