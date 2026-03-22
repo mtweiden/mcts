@@ -797,6 +797,40 @@ impl<E: Environment> MCTS<E> {
         Some(pruned.into_iter().map(|(a, v)| (a, v as f32 / total)).collect())
     }
 
+    /// Blend the root node's policy priors with a pre-computed noise distribution.
+    ///
+    /// `P′(c) = (1 − epsilon) × P(c) + epsilon × noise(c)`
+    ///
+    /// This should be called **before** [`run`] on full-search (training) turns to
+    /// encourage exploration of moves that the neural network assigns low prior
+    /// probability. The `noise` map should already be normalised (e.g. sampled from
+    /// a Dirichlet distribution over the legal actions).
+    ///
+    /// Has no effect if the root node does not yet exist in the tree (e.g. on the
+    /// very first step before any search has been run).
+    ///
+    /// Reference: [Wu 2020, §2].
+    pub fn perturb_root_prior(&mut self, noise: &HashMap<E::Act, f32>, epsilon: f32) {
+        let root_id = match self.root_id {
+            Some(id) => id,
+            None => return,
+        };
+        if let Some(node) = self.get_node_mut(root_id) {
+            let mut total = 0.0_f32;
+            for (&action, prior) in node.prior_probs.iter_mut() {
+                let n = noise.get(&action).copied().unwrap_or(0.0);
+                *prior = (1.0 - epsilon) * *prior + epsilon * n;
+                total += *prior;
+            }
+            // Renormalise in case noise doesn't cover every action.
+            if total > 0.0 {
+                for prior in node.prior_probs.values_mut() {
+                    *prior /= total;
+                }
+            }
+        }
+    }
+
     /// Do inference on a batch of observations
     pub fn blocking_infer(
         &mut self,
