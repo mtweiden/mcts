@@ -196,6 +196,3 @@ node = mcts.run(env, wrapped, num_steps=10_000)
 best_action = max(node.edge_visits().items(), key=lambda kv: kv[1])[0]
 mcts.advance_root(best_action)
 ```
-
-## Notes / TODO
-- Consider pruning / GC when advancing the root for very long episodes (MCTS::advance_root).
