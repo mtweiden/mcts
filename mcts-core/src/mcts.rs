@@ -18,13 +18,64 @@ struct PendingInference<E: Environment> {
 /// ----------------------------------------------------------------------------
 /// Monte Carlo Tree Search
 /// ----------------------------------------------------------------------------
+///
+/// Several improvements from the KataGo paper are implemented here:
+///   Wu, D.J. (2020). "Accelerating Self-Play Learning in Go."
+///   arXiv:1902.10565. Referred to as [Wu 2020] throughout this file.
 pub struct MCTS<E: Environment> {
-    // Track the current root of the search tree
+    /// The NodeId of the current root of the search tree.
     pub root_id: Option<NodeId>,
-    // Arena style storage for all nodes.
+    /// Arena-style storage for all nodes.
     pub transposition_table: HashMap<NodeId, usize>,
     pub nodes: Vec<Node<E::Act>>,
     pub batch_size: usize,
+
+    /// First-play urgency (FPU) reduction coefficient for non-root nodes.
+    ///
+    /// When a child `c` of a non-root node `n` has never been visited, its
+    /// Q-value fallback is:
+    ///
+    ///   Q_fpu = V(n) − c_fpu × √P_explored
+    ///
+    /// where `P_explored` is the sum of policy priors over already-visited
+    /// children. As more of `n`'s children are explored the urgency of
+    /// revisiting the remaining unexplored ones decays, focusing search.
+    ///
+    /// At the root `c_fpu` is always overridden to `0.0` because Dirichlet
+    /// noise already ensures adequate exploration there.
+    ///
+    /// Default: `0.2`. Reference: [Wu 2020, §2, footnote 3].
+    pub c_fpu: f32,
+
+    /// Softmax temperature applied to the policy prior **at the root only**.
+    ///
+    /// Before computing PUCT scores at the root the prior is re-weighted:
+    ///
+    ///   P′(c) ∝ P(c)^(1/T),  then renormalised.
+    ///
+    /// With `T = 1.03` the effect is a very mild flattening of the prior
+    /// distribution, which [Wu 2020] reports improves policy convergence
+    /// stability during self-play training. Set to `1.0` to disable.
+    ///
+    /// Default: `1.03`. Reference: [Wu 2020, §2].
+    pub root_softmax_temp: f32,
+
+    /// Coefficient controlling the forced-playout visit floor at the root.
+    ///
+    /// For each root child `c` the minimum number of forced visits is:
+    ///
+    ///   n_forced(c) = √(k_forced × P(c) × Σ_{c′} N(c′))
+    ///
+    /// Any child below this threshold is assigned `PUCT = ∞`, guaranteeing
+    /// it will be selected on the next playout. The exponent of `1/2` ensures
+    /// forced visits decay to a zero proportion as the total visit budget
+    /// grows, so they never dominate a large search.
+    ///
+    /// This only applies during full (recorded) searches; fast searches
+    /// (`record = false` in [`run`]) skip forced playouts to maximise strength.
+    ///
+    /// Default: `2.0`. Reference: [Wu 2020, §3.2].
+    pub k_forced: f32,
 }
 
 impl<E: Environment> MCTS<E> {
@@ -34,21 +85,44 @@ impl<E: Environment> MCTS<E> {
             transposition_table: HashMap::new(),
             nodes: Vec::new(),
             batch_size,
+            c_fpu: 0.2,
+            root_softmax_temp: 1.03,
+            k_forced: 2.0,
         }
     }
 
     pub fn default() -> Self { Self::new(8) }
 
-    /// Run MCTS for a given number of steps from the current environment state. 
-    /// 
-    /// Args:
-    ///   env (&E): a reference to the current environment state. This is not mutated by MCTS,
-    ///     as all simulations are done on cloned environments.
-    ///   client (dyn InferenceClient<E>): an inference client.
-    ///   num_steps (usize): the number of MCTS iterations to run. More steps means a stronger
-    ///     search but longer runtime.
-    ///   terminal_evaluator (&F): a function that takes an environment and returns a value
-    ///     estimate for terminal states.
+    /// Run MCTS for a given number of steps from the current environment state.
+    ///
+    /// # Arguments
+    /// * `env`                — Reference to the current state. Not mutated; all
+    ///                          simulations run on internal clones.
+    /// * `client`             — Inference client supplying policy priors and values.
+    /// * `num_steps`          — Number of MCTS iterations. More → stronger search.
+    /// * `c_puct`             — Exploration constant in the PUCT formula.
+    /// * `terminal_evaluator` — Callback returning a scalar value for terminal states.
+    /// * `record`             — Whether this search will be recorded as a training sample.
+    ///                          See *Playout Cap Randomization* below.
+    ///
+    /// # Playout Cap Randomization \[Wu 2020, §3.1\]
+    ///
+    /// Value training benefits from many short games (each supplies one independent
+    /// outcome signal), while policy training requires deep search to produce
+    /// non-trivial visit distributions.  These goals conflict when using a fixed
+    /// playout budget.
+    ///
+    /// The solution is to randomly vary the budget per turn:
+    /// * On a fraction `p` of turns run a **full search** (`num_steps = N`,
+    ///   `record = true`).  The inference client **should** inject Dirichlet noise.
+    ///   Forced playouts are active.  Call [`policy_target`] after the search
+    ///   to obtain a training-ready policy distribution.
+    /// * On the remaining turns run a **fast search** (`num_steps = n ≪ N`,
+    ///   `record = false`).  The inference client **should not** inject noise.
+    ///   Forced playouts are disabled, maximising move strength.  Do **not** use the
+    ///   returned node's `edge_visits` as a training target.
+    ///
+    /// KataGo used `p = 0.25` and `(N, n) = (600, 100)` initially.
     pub fn run<F>(
         &mut self,
         env: &E,
@@ -56,7 +130,8 @@ impl<E: Environment> MCTS<E> {
         num_steps: usize,
         c_puct: f32,
         terminal_evaluator: &F,
-    ) -> Node<E::Act> 
+        record: bool,
+    ) -> Node<E::Act>
         where F: Fn(&E) -> f32
     {
         // Set the current root for the search session
@@ -85,7 +160,7 @@ impl<E: Environment> MCTS<E> {
 
             for _ in 0..self.batch_size {
                 // select_leaf clones the environment internally and returns the reached env
-                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env, c_puct);
+                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env, c_puct, record);
                 let obs = final_env.observation();
                 // Continue so we don't add leaf nodes to the batch if no action was selected
                 // (e.g. terminal state or no valid actions)
@@ -292,8 +367,53 @@ impl<E: Environment> MCTS<E> {
 
     }
 
-    /// Compute PUCT scores for all actions from this node.
-    pub fn puct_scores(&self, node_id: NodeId, c_puct: f32) -> HashMap<E::Act, f32> {
+    /// Compute PUCT scores for all actions from a given node.
+    ///
+    /// Three improvements from [Wu 2020] are applied here:
+    ///
+    /// ## First-Play Urgency (FPU) \[Wu 2020, §2, footnote 3\]
+    ///
+    /// For an action whose child is not yet in the transposition table, the
+    /// Q-value fallback is:
+    ///
+    ///   Q_fpu = V(parent) − c_fpu_eff × √P_explored
+    ///
+    /// where `P_explored` is the total prior mass of already-visited children.
+    /// As more children are explored the penalty grows, making it progressively
+    /// less attractive to keep revisiting unexplored corners of the tree.
+    ///
+    /// At the root `c_fpu_eff = 0.0` because Dirichlet noise already provides
+    /// exploration; at all other nodes `c_fpu_eff = self.c_fpu` (default `0.2`).
+    ///
+    /// ## Root Softmax Temperature \[Wu 2020, §2\]
+    ///
+    /// When `is_root` is `true` the policy prior is re-weighted before scoring:
+    ///
+    ///   P′(c) ∝ P(c)^(1/T),  renormalised  (T = `self.root_softmax_temp`, default 1.03)
+    ///
+    /// This mildly flattens the distribution, improving policy convergence
+    /// stability. The effect is negligible at T ≈ 1 but accumulates over
+    /// millions of self-play games.
+    ///
+    /// ## Forced Playouts \[Wu 2020, §3.2\]
+    ///
+    /// When both `is_root` and `apply_forced` are `true`, any root child with
+    /// fewer actual visits than
+    ///
+    ///   n_forced(c) = √(k_forced × P(c) × N_total)
+    ///
+    /// is assigned a score of `f32::INFINITY`, forcing the next playout to
+    /// visit it. This prevents a Dirichlet-noise-suggested move from being
+    /// abandoned after an initially poor evaluation before it has been given a
+    /// fair chance.  The `√` exponent ensures forced visits shrink to a zero
+    /// *proportion* of all visits as the budget grows.
+    pub fn puct_scores(
+        &self,
+        node_id: NodeId,
+        c_puct: f32,
+        is_root: bool,
+        apply_forced: bool,
+    ) -> HashMap<E::Act, f32> {
         let node = match self.get_node_immut(node_id) {
             Some(n) => n,
             None => return HashMap::new(),
@@ -302,22 +422,64 @@ impl<E: Environment> MCTS<E> {
         let total_visits: usize = node.edge_visits.values().copied().sum::<usize>();
         let sqrt_total = (total_visits as f32).sqrt() + 1e-8;
 
+        // --- FPU ---
+        // Sum the prior mass of children that have received at least one visit.
+        // At the root c_fpu is 0: Dirichlet noise handles exploration there.
+        // Reference: [Wu 2020, §2, footnote 3].
+        let c_fpu_eff: f32 = if is_root { 0.0 } else { self.c_fpu };
+        let p_explored: f32 = node.prior_probs
+            .iter()
+            .filter(|&(&a, _)| node.edge_visits.get(&a).copied().unwrap_or(0) > 0)
+            .map(|(_, &p)| p)
+            .sum();
+        let fpu_q = node.value - c_fpu_eff * p_explored.sqrt();
+
+        // --- Root softmax temperature ---
+        // P′(c) ∝ P(c)^(1/T), renormalised.  Only applied at the root.
+        // Reference: [Wu 2020, §2].
+        let effective_priors: HashMap<E::Act, f32> =
+            if is_root && (self.root_softmax_temp - 1.0).abs() > 1e-6 {
+                let inv_temp = 1.0 / self.root_softmax_temp;
+                let raw: HashMap<E::Act, f32> = node.prior_probs
+                    .iter()
+                    .map(|(&a, &p)| (a, p.max(1e-30).powf(inv_temp)))
+                    .collect();
+                let sum: f32 = raw.values().sum();
+                raw.into_iter().map(|(a, p)| (a, p / sum)).collect()
+            } else {
+                node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
+            };
+
         let mut scores = HashMap::new();
 
-        for (&action, &prior) in &node.prior_probs {
+        for (&action, &prior) in &effective_priors {
             let this_edge_visits = node.edge_visits.get(&action).copied().unwrap_or(0);
             let num_virtual_losses = node.virtual_losses.get(&action).copied().unwrap_or(0);
             let adjusted_visits = this_edge_visits + num_virtual_losses;
-
             let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
 
-            // Determine Q value: use child's value if present in table, otherwise use parent_value.
-            let q_value = match node.children.get(&action).copied() {
-                None => node.value + penalty,
-                Some(child_id) => {
-                    let child = self.get_node_immut(child_id);
-                    child.map(|c| c.value + penalty).unwrap_or(node.value + penalty)
+            // --- Forced playouts ---
+            // If this root child is under-visited, force selection by returning ∞.
+            // Only applies during full (recorded) searches to avoid wasting fast
+            // search playouts on exploratory moves.
+            // Reference: [Wu 2020, §3.2].
+            if is_root && apply_forced && total_visits > 0 {
+                let n_forced = (self.k_forced * prior * total_visits as f32).sqrt();
+                if (this_edge_visits as f32) < n_forced {
+                    scores.insert(action, f32::INFINITY);
+                    continue;
                 }
+            }
+
+            // --- Q-value ---
+            // Use the child's backed-up value when it is in the transposition table.
+            // If the child has never been reached at all, apply the FPU fallback.
+            // Reference: [Wu 2020, §2, footnote 3].
+            let q_value = match node.children.get(&action).copied() {
+                Some(child_id) => self.get_node_immut(child_id)
+                    .map(|c| c.value + penalty)
+                    .unwrap_or(fpu_q + penalty),
+                None => fpu_q + penalty,
             };
 
             let u_value = c_puct * prior * (sqrt_total / (1.0 + adjusted_visits as f32));
@@ -326,8 +488,14 @@ impl<E: Environment> MCTS<E> {
         scores
     }
 
-    pub fn select_action_puct(&self, node_id: NodeId, c_puct: f32) -> Option<E::Act> {
-        let scores = self.puct_scores(node_id, c_puct);
+    pub fn select_action_puct(
+        &self,
+        node_id: NodeId,
+        c_puct: f32,
+        is_root: bool,
+        apply_forced: bool,
+    ) -> Option<E::Act> {
+        let scores = self.puct_scores(node_id, c_puct, is_root, apply_forced);
         scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(action, _)| action)
     }
 
@@ -371,13 +539,17 @@ impl<E: Environment> MCTS<E> {
     }
 
     /// Traverse from root to a leaf. Returns:
-    /// (path, parent, action_taken, final_env, repeat_detected)
-    /// `final_env` is the environment state after taking actions along the path.
+    /// `(path, parent, action_taken, final_env, repeat_detected)`
+    ///
+    /// `final_env` is the environment state after taking all actions along the
+    /// path. `record` is forwarded to [`select_action_puct`] to enable or
+    /// disable forced playouts at the root (see [`run`] for details).
     pub fn select_leaf(
         &mut self,
         root_id: NodeId,
         env: &E,
         c_puct: f32,
+        record: bool,
     ) -> (Vec<(NodeId, E::Act)>, Option<NodeId>, Option<E::Act>, E, bool) {
         let mut path: Vec<(NodeId, E::Act)> = Vec::new();
         let mut node_id = root_id;
@@ -399,8 +571,12 @@ impl<E: Environment> MCTS<E> {
                 break;
             }
 
+            // Root-specific PUCT behaviours (FPU override, softmax temperature,
+            // forced playouts) are only applied on the first step of each playout.
+            let is_root = node_id == root_id;
+
             // choose action via PUCT
-            let chosen = match self.select_action_puct(node_id, c_puct) {
+            let chosen = match self.select_action_puct(node_id, c_puct, is_root, record) {
                 Some(a) => a,
                 None => break,
             };
@@ -496,6 +672,129 @@ impl<E: Environment> MCTS<E> {
             }
             self.recompute_value(node_hash);
         }
+    }
+
+    /// Compute the policy training target from the root's visit distribution,
+    /// with forced-playout visits subtracted.
+    ///
+    /// # Policy Target Pruning \[Wu 2020, §3.2\]
+    ///
+    /// Using raw visit counts as the training target would teach the network to
+    /// imitate forced exploratory visits — visits that were added deliberately
+    /// to evaluate noise-suggested moves, not because those moves were good.
+    /// This method removes those spurious visits before producing a training
+    /// distribution:
+    ///
+    /// 1. Identify `c*`, the root child with the most visits.
+    /// 2. For every other child `c`, compute the forced-visit floor:
+    ///    `n_forced(c) = √(k_forced × P(c) × N_total)`
+    ///    Determine the largest number of visits `s` that can be subtracted
+    ///    without making `PUCT(c, N(c) − s) ≥ PUCT(c*)` (i.e. without making
+    ///    `c` look as strong as the best move once the forced visits are gone).
+    ///    Subtract `min(n_forced, s)` visits from `c`.
+    /// 3. Children pruned down to exactly **1** visit are removed entirely.
+    /// 4. Renormalise the remaining visit counts to a probability distribution.
+    ///
+    /// This decouples the policy target from the MCTS exploration dynamics,
+    /// allowing the two to be optimised independently.
+    ///
+    /// Returns `None` if the root does not exist or has received no visits.
+    /// **Only meaningful after a full search** (`record = true` in [`run`]).
+    ///
+    /// Reference: [Wu 2020, §3.2].
+    pub fn policy_target(&self, c_puct: f32) -> Option<HashMap<E::Act, f32>> {
+        let root_id = self.root_id?;
+        let node = self.get_node_immut(root_id)?;
+
+        let n_total: usize = node.edge_visits.values().copied().sum();
+        if n_total == 0 {
+            return None;
+        }
+        let sqrt_n_total = (n_total as f32).sqrt();
+
+        // FPU at root is 0 (Dirichlet noise provides exploration).
+        let fpu_q = node.value;
+
+        // Pre-compute Q(c) for each action using the transposition table.
+        // Q(c) = backed-up child value if available, otherwise the FPU fallback.
+        let q_values: HashMap<E::Act, f32> = node.prior_probs.keys().map(|&action| {
+            let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
+            let q = match node.children.get(&action).copied() {
+                Some(child_id) => self.get_node_immut(child_id)
+                    .map(|c| c.value + penalty)
+                    .unwrap_or(fpu_q + penalty),
+                None => fpu_q + penalty,
+            };
+            (action, q)
+        }).collect();
+
+        // PUCT scores at current visit counts.
+        // apply_forced=false so we get clean finite scores for the comparison.
+        let puct_scores = self.puct_scores(root_id, c_puct, true, false);
+
+        // Step 1: find c* – the most-visited root child.
+        let (&best_action, _) = node.edge_visits.iter().max_by_key(|&(_, &v)| v)?;
+        let puct_best = puct_scores
+            .get(&best_action)
+            .copied()
+            .unwrap_or(f32::NEG_INFINITY);
+
+        // Step 2: build the pruned visit map, starting from all visited children.
+        let mut pruned: HashMap<E::Act, usize> = node.edge_visits
+            .iter()
+            .filter(|&(_, &v)| v > 0)
+            .map(|(&a, &v)| (a, v))
+            .collect();
+
+        for (&action, visits) in pruned.iter_mut() {
+            if action == best_action {
+                continue; // never modify the best child's count
+            }
+            let prior = node.prior_probs.get(&action).copied().unwrap_or(0.0);
+            if prior == 0.0 {
+                continue;
+            }
+
+            let n_forced = (self.k_forced * prior * n_total as f32).sqrt();
+            let n_forced_int = n_forced.floor() as usize;
+            if n_forced_int == 0 {
+                continue;
+            }
+
+            // Maximum visits we can subtract while keeping PUCT(c, pruned) < PUCT(c*).
+            //
+            // PUCT(c, n) = Q(c) + c_puct × P(c) × √N_total / (1 + n)
+            // Setting this equal to PUCT(c*) and solving for n:
+            //   n_boundary = c_puct × P(c) × √N_total / (PUCT(c*) − Q(c)) − 1
+            //
+            // We may subtract at most floor(N(c) − n_boundary) visits.
+            // If Q(c) ≥ PUCT(c*), c is already dominant on Q-value alone and
+            // we must not subtract anything.
+            let q_c = q_values.get(&action).copied().unwrap_or(fpu_q);
+            let puct_diff = puct_best - q_c;
+
+            let max_subtract = if puct_diff <= 0.0 {
+                0
+            } else {
+                let n_boundary = c_puct * prior * sqrt_n_total / puct_diff - 1.0;
+                (*visits as f32 - n_boundary).floor().max(0.0) as usize
+            };
+
+            let subtract = n_forced_int.min(max_subtract);
+            *visits = visits.saturating_sub(subtract);
+        }
+
+        // Step 3: remove children that have been pruned to exactly 1 visit.
+        pruned.retain(|_, &mut v| v > 1);
+
+        if pruned.is_empty() {
+            // Edge case: every child was pruned away. Keep the best action only.
+            return Some(HashMap::from([(best_action, 1.0_f32)]));
+        }
+
+        // Step 4: normalise to a probability distribution.
+        let total: f32 = pruned.values().copied().sum::<usize>() as f32;
+        Some(pruned.into_iter().map(|(a, v)| (a, v as f32 / total)).collect())
     }
 
     /// Do inference on a batch of observations
@@ -636,9 +935,145 @@ mod tests {
         let client = UniformClient;
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let evaluator = |e: &NumberLineEnv| if e.done() { 1.0 } else { 0.0 };
-        let root = mcts.run(&env, &client, 100, 1.4, &evaluator );
+        let root = mcts.run(&env, &client, 100, 1.4, &evaluator, true);
         assert!(mcts.node_exists(root.id));
         assert!(mcts.nodes.len() > 1);
+    }
+
+    // -------------------------------------------------------------------------
+    // Tests for FPU, forced playouts, softmax temperature, and policy_target
+    // -------------------------------------------------------------------------
+
+    /// Helper: build a two-action root node with one visited and one unvisited child.
+    ///
+    /// Action 0 has prior 0.6 and has been visited once.
+    /// Action 1 has prior 0.4 and has never been visited.
+    /// Parent value = 0.5.
+    fn build_fpu_node() -> MCTS<NumberLineEnv> {
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let node = Node::new(HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.5, 1, None);
+        mcts.insert_node(1, node);
+        if let Some(n) = mcts.get_node_mut(1) {
+            *n.edge_visits.entry(0).or_insert(0) = 1;
+        }
+        mcts.root_id = Some(1);
+        mcts
+    }
+
+    #[test]
+    fn test_fpu_reduces_unvisited_q_at_non_root() {
+        // With c_fpu = 0.2 and P_explored = 0.6 (action 0 visited):
+        //   fpu_q = 0.5 − 0.2 × √0.6 ≈ 0.345
+        // Disabling FPU (c_fpu = 0) gives the plain parent value 0.5.
+        // The PUCT score for the unvisited action 1 should be lower with FPU.
+        let mut mcts = build_fpu_node();
+        let scores_fpu = mcts.puct_scores(1, 1.0, false, false);
+
+        mcts.c_fpu = 0.0;
+        let scores_no_fpu = mcts.puct_scores(1, 1.0, false, false);
+
+        assert!(
+            scores_fpu[&1u8] < scores_no_fpu[&1u8],
+            "FPU should lower the Q-fallback for unvisited children: {} vs {}",
+            scores_fpu[&1u8],
+            scores_no_fpu[&1u8],
+        );
+    }
+
+    #[test]
+    fn test_fpu_is_zero_at_root() {
+        // At the root c_fpu_eff is always 0 regardless of self.c_fpu.
+        // So the score for the unvisited child should equal the no-FPU score.
+        let mut mcts = build_fpu_node();
+        let scores_root = mcts.puct_scores(1, 1.0, true, false);
+
+        mcts.c_fpu = 0.0;
+        let scores_no_fpu = mcts.puct_scores(1, 1.0, true, false);
+
+        // Scores should be identical (within float precision).
+        let diff = (scores_root[&1u8] - scores_no_fpu[&1u8]).abs();
+        assert!(diff < 1e-5, "FPU should be inactive at root: diff = {}", diff);
+    }
+
+    #[test]
+    fn test_forced_playouts_assign_infinity() {
+        // n_forced(action 1) = √(2.0 × 0.4 × 11) ≈ 2.97
+        // Action 1 has only 1 visit, so it should receive INFINITY.
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let node = Node::new(HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.0, 1, None);
+        mcts.insert_node(1, node);
+        if let Some(n) = mcts.get_node_mut(1) {
+            *n.edge_visits.entry(0).or_insert(0) = 10;
+            *n.edge_visits.entry(1).or_insert(0) = 1;
+        }
+        mcts.root_id = Some(1);
+
+        let scores = mcts.puct_scores(1, 1.0, true, true);
+        assert_eq!(scores[&1u8], f32::INFINITY, "under-visited root child should get ∞");
+
+        // With apply_forced = false, no infinity should appear.
+        let scores_no_forced = mcts.puct_scores(1, 1.0, true, false);
+        assert!(scores_no_forced[&1u8].is_finite(), "forced playouts disabled — should be finite");
+    }
+
+    #[test]
+    fn test_softmax_temp_flattens_prior_at_root() {
+        // With T = 2.0 the high-prior action should get a relatively lower PUCT
+        // U-term (flatter prior), and the low-prior action a higher one, compared
+        // to T = 1.0 (identity).
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        // Strongly skewed prior: action 0 = 0.9, action 1 = 0.1.
+        let node = Node::new(HashMap::from([(0u8, 0.9), (1u8, 0.1)]), 0.0, 1, None);
+        mcts.insert_node(1, node);
+        mcts.root_id = Some(1);
+
+        mcts.root_softmax_temp = 1.0; // identity
+        let scores_t1 = mcts.puct_scores(1, 1.0, true, false);
+
+        mcts.root_softmax_temp = 2.0; // flatten
+        let scores_t2 = mcts.puct_scores(1, 1.0, true, false);
+
+        // Flatter prior → lower score for action 0 (dominant prior shaved down).
+        assert!(
+            scores_t2[&0u8] < scores_t1[&0u8],
+            "higher temperature should reduce score for dominant action: {} vs {}",
+            scores_t2[&0u8], scores_t1[&0u8]
+        );
+        // Flatter prior → higher score for action 1 (minority prior boosted).
+        assert!(
+            scores_t2[&1u8] > scores_t1[&1u8],
+            "higher temperature should increase score for minority action: {} vs {}",
+            scores_t2[&1u8], scores_t1[&1u8]
+        );
+    }
+
+    #[test]
+    fn test_policy_target_sums_to_one() {
+        let env = NumberLineEnv::new(5);
+        let client = UniformClient;
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let evaluator = |e: &NumberLineEnv| if e.done() { 1.0 } else { 0.0 };
+        mcts.run(&env, &client, 200, 1.4, &evaluator, true);
+
+        let target = mcts.policy_target(1.4).expect("policy target should be Some after search");
+        let total: f32 = target.values().sum();
+        assert!((total - 1.0).abs() < 1e-5, "policy target must sum to 1.0, got {}", total);
+    }
+
+    #[test]
+    fn test_policy_target_no_more_actions_than_raw() {
+        let env = NumberLineEnv::new(5);
+        let client = UniformClient;
+        let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
+        let evaluator = |e: &NumberLineEnv| if e.done() { 1.0 } else { 0.0 };
+        mcts.run(&env, &client, 200, 1.4, &evaluator, true);
+
+        let root_id = mcts.root_id.unwrap();
+        let raw_actions = mcts.get_node_immut(root_id).unwrap()
+            .edge_visits.iter().filter(|&(_, &v)| v > 0).count();
+        let pruned_actions = mcts.policy_target(1.4).unwrap().len();
+        assert!(pruned_actions <= raw_actions,
+            "pruning should not add actions: {} > {}", pruned_actions, raw_actions);
     }
 
     #[test]
