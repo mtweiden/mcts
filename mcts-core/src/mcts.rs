@@ -71,8 +71,8 @@ pub struct MCTS<E: Environment> {
     /// forced visits decay to a zero proportion as the total visit budget
     /// grows, so they never dominate a large search.
     ///
-    /// This only applies during full (recorded) searches; fast searches
-    /// (`record = false` in [`run`]) skip forced playouts to maximise strength.
+    /// This only applies during full (for_training = true) searches; fast searches
+    /// (`for_training= false` in [`run`]) skip forced playouts to maximise strength.
     ///
     /// Default: `2.0`. Reference: [Wu 2020, §3.2].
     pub k_forced: f32,
@@ -102,7 +102,7 @@ impl<E: Environment> MCTS<E> {
     /// * `num_steps`          — Number of MCTS iterations. More → stronger search.
     /// * `c_puct`             — Exploration constant in the PUCT formula.
     /// * `terminal_evaluator` — Callback returning a scalar value for terminal states.
-    /// * `record`             — Whether this search will be recorded as a training sample.
+    /// * `for_training`       — Whether this search will be recorded as a training sample.
     ///                          See *Playout Cap Randomization* below.
     ///
     /// # Playout Cap Randomization \[Wu 2020, §3.1\]
@@ -114,11 +114,11 @@ impl<E: Environment> MCTS<E> {
     ///
     /// The solution is to randomly vary the budget per turn:
     /// * On a fraction `p` of turns run a **full search** (`num_steps = N`,
-    ///   `record = true`).  The inference client **should** inject Dirichlet noise.
+    ///   `for_training = true`).  The inference client **should** inject Dirichlet noise.
     ///   Forced playouts are active.  Call [`policy_target`] after the search
     ///   to obtain a training-ready policy distribution.
     /// * On the remaining turns run a **fast search** (`num_steps = n ≪ N`,
-    ///   `record = false`).  The inference client **should not** inject noise.
+    ///   `for_training = false`).  The inference client **should not** inject noise.
     ///   Forced playouts are disabled, maximising move strength.  Do **not** use the
     ///   returned node's `edge_visits` as a training target.
     ///
@@ -130,7 +130,7 @@ impl<E: Environment> MCTS<E> {
         num_steps: usize,
         c_puct: f32,
         terminal_evaluator: &F,
-        record: bool,
+        for_training: bool,
     ) -> Node<E::Act>
         where F: Fn(&E) -> f32
     {
@@ -160,7 +160,7 @@ impl<E: Environment> MCTS<E> {
 
             for _ in 0..self.batch_size {
                 // select_leaf clones the environment internally and returns the reached env
-                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env, c_puct, record);
+                let (path, parent, action, final_env, repeat) = self.select_leaf(root_hash, env, c_puct, for_training);
                 let obs = final_env.observation();
                 // Continue so we don't add leaf nodes to the batch if no action was selected
                 // (e.g. terminal state or no valid actions)
@@ -460,7 +460,7 @@ impl<E: Environment> MCTS<E> {
 
             // --- Forced playouts ---
             // If this root child is under-visited, force selection by returning ∞.
-            // Only applies during full (recorded) searches to avoid wasting fast
+            // Only applies during full (for_training = true) searches to avoid wasting fast
             // search playouts on exploratory moves.
             // Reference: [Wu 2020, §3.2].
             if is_root && apply_forced && total_visits > 0 {
@@ -542,14 +542,14 @@ impl<E: Environment> MCTS<E> {
     /// `(path, parent, action_taken, final_env, repeat_detected)`
     ///
     /// `final_env` is the environment state after taking all actions along the
-    /// path. `record` is forwarded to [`select_action_puct`] to enable or
+    /// path. `for_training` is forwarded to [`select_action_puct`] to enable or
     /// disable forced playouts at the root (see [`run`] for details).
     pub fn select_leaf(
         &mut self,
         root_id: NodeId,
         env: &E,
         c_puct: f32,
-        record: bool,
+        for_training: bool,
     ) -> (Vec<(NodeId, E::Act)>, Option<NodeId>, Option<E::Act>, E, bool) {
         let mut path: Vec<(NodeId, E::Act)> = Vec::new();
         let mut node_id = root_id;
@@ -576,7 +576,7 @@ impl<E: Environment> MCTS<E> {
             let is_root = node_id == root_id;
 
             // choose action via PUCT
-            let chosen = match self.select_action_puct(node_id, c_puct, is_root, record) {
+            let chosen = match self.select_action_puct(node_id, c_puct, is_root, for_training) {
                 Some(a) => a,
                 None => break,
             };
@@ -699,7 +699,7 @@ impl<E: Environment> MCTS<E> {
     /// allowing the two to be optimised independently.
     ///
     /// Returns `None` if the root does not exist or has received no visits.
-    /// **Only meaningful after a full search** (`record = true` in [`run`]).
+    /// **Only meaningful after a full search** (`for_training = true` in [`run`]).
     ///
     /// Reference: [Wu 2020, §3.2].
     pub fn policy_target(&self, c_puct: f32) -> Option<HashMap<E::Act, f32>> {

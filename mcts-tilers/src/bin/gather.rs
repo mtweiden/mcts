@@ -245,7 +245,7 @@ impl Gatherer {
 
         for step in 0..max_actions {
             // Run MCTS
-            let root = mcts.run(&tilers_env, client, self.mcts_steps, c_puct, &terminal_evaluator);
+            let root = mcts.run(&tilers_env, client, self.mcts_steps, c_puct, &terminal_evaluator, true);
 
             // Store the data
             let placement = tilers_env.inner.get_placement();

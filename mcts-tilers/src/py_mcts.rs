@@ -178,13 +178,14 @@ impl PyMcts {
         PyMcts { inner: mcts }
     }
 
-    #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4))]
+    #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, for_training = false))]
     fn run(
         &mut self,
         env: &PyEnvironment,
         agent: &MctsAgent,
         num_steps: usize,
         c_puct: f32,
+        for_training: bool,
     ) -> PyResult<MctsNode> {
         let inner: TilersEnvInner = env.to_inner();
         // We're using a terminal evaluator that compares against the heuristic solver. This
@@ -205,7 +206,9 @@ impl PyMcts {
             }
         };
         let env = TilersEnv::new(inner, DEFAULT_LOOKAHEAD);
-        let node = self.inner.run(&env, agent, num_steps, c_puct, &terminal_evaluator);
+        let node = self.inner.run(
+            &env, agent, num_steps, c_puct, &terminal_evaluator, for_training
+        );
         Ok(MctsNode { inner: node })
     }
 
