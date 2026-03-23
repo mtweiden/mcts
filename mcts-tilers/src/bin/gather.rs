@@ -228,7 +228,7 @@ impl Gatherer {
 
         // Only consider the first N layers of gates
         let mut game = env.clone();
-        game.drop_objectives_beyond_nth_layer(self.num_objective_layers);
+        game.drop_objectives_beyond_nth_layer(self.num_objective_layers - 1);
         game.set_cultivation_time(10);
         let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
 
