@@ -344,7 +344,7 @@ impl Gatherer {
 
         let score = if tilers_env.inner.done() && reference_depth > solution_depth {
             1.0
-        } else if reference_depth == solution_depth {
+        } else if tilers_env.inner.done() && reference_depth == solution_depth {
             0.1
         } else {
             -1.0
