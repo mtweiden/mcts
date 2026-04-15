@@ -484,7 +484,8 @@ fn main() {
     // Environment parameters
     let mut height = 4;
     let mut width = 4;
-    let mut num_objectives = 2;
+    let mut num_objectives = 4;
+    let mut min_num_objectives = 2;
     let mut num_blanks = 2;
     let mut seed: Option<i32> = None;
     // IPC parameters
@@ -511,7 +512,10 @@ fn main() {
             width = args[i + 1].parse().unwrap_or(4);
         }
         if args[i] == "--num_objectives" && i + 1 < args.len() {
-            num_objectives = args[i + 1].parse().unwrap_or(2);
+            num_objectives = args[i + 1].parse().unwrap_or(4);
+        }
+        if args[i] == "--min_num_objectives" && i + 1 < args.len() {
+            min_num_objectives = args[i + 1].parse().unwrap_or(2);
         }
         if args[i] == "--num_blanks" && i + 1 < args.len() {
             num_blanks = args[i + 1].parse().unwrap_or(2);
@@ -583,7 +587,7 @@ fn main() {
         let h = height;
         let w = width;
         let nb = num_blanks;
-        let no = rng.random_range(140..=num_objectives);
+        let no = rng.random_range(min_num_objectives..=num_objectives);
         if nb >= (h * w) - 1 || (h <= 2 && w <= 2) {
             continue;
         }
