@@ -501,6 +501,8 @@ fn main() {
     let mut p_full_search: f32 = 0.25;
     let mut dirichlet_epsilon: f32 = 0.25;
     let mut trajectory_dir: Option<String> = None;
+    let mut arena_tag = String::new();
+    let mut output_dir = String::from("/shared/staging");
 
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -553,14 +555,24 @@ fn main() {
         if args[i] == "--trajectory_dir" && i + 1 < args.len() {
             trajectory_dir = Some(args[i + 1].clone());
         }
+        if args[i] == "--arena_tag" && i + 1 < args.len() {
+            arena_tag = args[i + 1].clone();
+        }
+        if args[i] == "--output_dir" && i + 1 < args.len() {
+            output_dir = args[i + 1].clone();
+        }
     }
 
-    let arena_name = format!("mcts_{}_{}", num_slots, num_handlers);
+    let arena_name = if arena_tag.is_empty() {
+        format!("mcts_{}_{}", num_slots, num_handlers)
+    } else {
+        format!("mcts_{}_{}_{}", arena_tag, num_slots, num_handlers)
+    };
     let arena: Arena<TilersSlot> =
         Arena::create_or_open(&arena_name, num_slots, num_handlers).unwrap();
     let client = TilersIpcClient::new(arena, worker_id);
 
-    let output_path = format!("/home/mtweiden/data/output-{}.json", worker_id);
+    let output_path = format!("{}/output-{}.jsonl", output_dir, worker_id);
     let gatherer = Gatherer::new(
         8,                  // inference batch size
         mcts_steps,         // full-search MCTS steps
