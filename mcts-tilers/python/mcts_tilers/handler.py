@@ -262,7 +262,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
         # print(f"[handler {handler_id}] loop iteration {iteration}, {len(slot_views)} slots pending", flush=True)
         try:
             # print(f"[handler {handler_id}] waiting for ready slot...")
-            first_sv = arena.pop_ready_view(handler=handler_id, clear_outputs=True)
+            first_sv = arena.pop_ready_view(clear_outputs=True)
             # print(f"[handler {handler_id}] got slot {first_sv.slot}")
             first_sv.set_handler_start_time()
         except KeyboardInterrupt:
@@ -273,7 +273,7 @@ def do_work(arena: PyArena, handler_id: int, device: str) -> None:
         slot_views = [first_sv]
         start = time.monotonic()
         while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - start) < BATCH_TIMEOUT:
-            sv = arena.try_pop_ready_view(handler=handler_id, clear_outputs=True)
+            sv = arena.try_pop_ready_view(clear_outputs=True)
             if sv is None:
                 time.sleep(0.0005)
                 continue
