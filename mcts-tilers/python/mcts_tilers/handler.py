@@ -256,14 +256,11 @@ def build_boards(
 # ------------------------------------------------------------------------------
 # Inference loop
 # ------------------------------------------------------------------------------
-def do_work(arena: PyArena, handler_id: int, device: str) -> None:
+def do_work(arena: PyArena, device: str) -> None:
     iteration = 0
     while True:
-        # print(f"[handler {handler_id}] loop iteration {iteration}, {len(slot_views)} slots pending", flush=True)
         try:
-            # print(f"[handler {handler_id}] waiting for ready slot...")
             first_sv = arena.pop_ready_view(clear_outputs=True)
-            # print(f"[handler {handler_id}] got slot {first_sv.slot}")
             first_sv.set_handler_start_time()
         except KeyboardInterrupt:
             break
@@ -419,4 +416,4 @@ if __name__ == "__main__":
     # print(f"[arena] force_reset on '{arena.arena_name()}', {arena.num_slots()} slots")
     # arena.force_reset()  # Clear any stale state from previous runs
     # print(f"[arena] force_reset complete")
-    do_work(arena, args.handler_id, device)
+    do_work(arena, device)
