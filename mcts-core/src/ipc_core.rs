@@ -174,7 +174,7 @@ impl RingQueue {
 /// The maximum number of GPUs supported for handling inference requests. For a DGX this is 4.
 pub const MAX_HANDLERS: usize = 4;
 const ARENA_MAGIC: u64 = 0x4D_43_54_53_49_50_43; // "MCTSIPC"ish
-const ARENA_VERSION: u32 = 1;
+const ARENA_VERSION: u32 = 2;
 
 #[repr(C)]
 pub struct ArenaHeader {
@@ -183,9 +183,7 @@ pub struct ArenaHeader {
     num_slots: u32,
     num_handlers: u32,
     free_q: RingQueue,
-    ready_q: [RingQueue; MAX_HANDLERS],
-    // atomic round-robin counter for handlers (cross-process)
-    next_handler: AtomicU32,
+    ready_q: RingQueue, // was [RingQueue; MAX_HANDLERS]
     init_lock: AtomicU32, // 0 unlocked, 1 locked
     init_done: AtomicU32, // 0 not initialized, 1 initialized
     // slots follow immediately after header in the shm regioni
@@ -283,11 +281,7 @@ impl<S: SlotInit> Arena<S> {
                     (*hdr).num_handlers = num_handlers as u32;
 
                     (*hdr).free_q.init();
-                    for q in &(*hdr).ready_q {
-                        q.init();
-                    }
-                    // initialize round-robin counter
-                    (*hdr).next_handler.store(0, Ordering::Relaxed);
+                    (*hdr).ready_q.init();
 
                     // init slots and free list
                     for i in 0..num_slots {
@@ -352,10 +346,7 @@ impl<S: SlotInit> Arena<S> {
 
             // Drain and reinit all queues
             hdr.free_q.init();
-            for q in &hdr.ready_q {
-                q.init();
-            }
-            hdr.next_handler.store(0, Ordering::Relaxed);
+            hdr.ready_q.init();
 
             std::sync::atomic::fence(Ordering::SeqCst);
 
@@ -403,11 +394,7 @@ impl<S: SlotInit> Arena<S> {
     }
 
     pub fn submit_to_handler(&self, slot: u32) {
-        // producer should have already set state=READY after writing inputs
-        let n = self.header().num_handlers as usize;
-        // fetch-and-increment provides a simple cross-process round-robin assignment
-        let idx = (self.header().next_handler.fetch_add(1, Ordering::AcqRel) as usize) % n;
-        self.header().ready_q[idx].push_blocking(slot);
+        self.header().ready_q.push_blocking(slot);
     }
 
     pub fn wait_done(&self, slot: u32) {
@@ -445,25 +432,15 @@ impl<S: SlotInit> Arena<S> {
     // -----------------------------------------------------------------------------------------
     // Helpers for inference workers / tests
     // -----------------------------------------------------------------------------------------
-    pub fn pop_ready(&self, handler: usize) -> u32 {
-        let n = self.header().num_handlers as usize;
-        let h = handler % n;
-        let slot = self.header().ready_q[h].pop_blocking();
-        
-        // Synchronize with the producer's Release store to state.
-        // This ensures all writes (b, placement, etc.) are visible.
+    pub fn pop_ready(&self) -> u32 {
+        let slot = self.header().ready_q.pop_blocking();
         let s = unsafe { &*self.slot_ptr(slot) };
-        let st = s.state().load(Ordering::Acquire);
-        debug_assert_eq!(st, SLOT_READY);
-        
+        debug_assert_eq!(s.state().load(Ordering::Acquire), SLOT_READY);
         slot
     }
 
-    pub fn try_pop_ready(&self, handler: usize) -> Option<u32> {
-        let n = self.header().num_handlers as usize;
-        let h = handler % n;
-        let slot = self.header().ready_q[h].try_pop()?;
-        
+    pub fn try_pop_ready(&self) -> Option<u32> {
+        let slot = self.header().ready_q.try_pop()?;
         // Synchronize with the producer's Release store to state.
         let s = unsafe { &*self.slot_ptr(slot) };
         let st = s.state().load(Ordering::Acquire);

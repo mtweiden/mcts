@@ -54,12 +54,12 @@ impl PyArena {
         &self.arena_name
     }
 
-    pub fn pop_ready(&self, handler: usize) -> u32 {
-        self.arena.pop_ready(handler)
+    pub fn pop_ready(&self) -> u32 {
+        self.arena.pop_ready()
     }
 
-    pub fn try_pop_ready(&self, handler: usize) -> Option<u32> {
-        self.arena.try_pop_ready(handler)
+    pub fn try_pop_ready(&self) -> Option<u32> {
+        self.arena.try_pop_ready()
     }
 
     pub fn mark_done(&self, slot: u32) {
@@ -72,14 +72,13 @@ impl PyArena {
         sm.slot.values.fill(0.0);
     }
 
-    #[pyo3(signature = (handler, clear_outputs=false))]
+    #[pyo3(signature = (clear_outputs=false))]
     pub fn pop_ready_view<'py>(
         slf: PyRef<'py, Self>,
         py: Python<'py>,
-        handler: usize,
         clear_outputs: bool,
     ) -> PyResult<Py<PySlotView>> {
-        let slot = slf.arena.pop_ready(handler);
+        let slot = slf.arena.pop_ready();
         if clear_outputs {
             let sm = slf.arena.slot_mut(slot);
             sm.slot.priors.fill(0.0);
@@ -90,14 +89,13 @@ impl PyArena {
         Py::new(py, PySlotView { arena: arena_obj, slot, ptr })
     }
 
-    #[pyo3(signature = (handler, clear_outputs=false))]
+    #[pyo3(signature = (clear_outputs=false))]
     pub fn try_pop_ready_view<'py>(
         slf: PyRef<'py, Self>,
         py: Python<'py>,
-        handler: usize,
         clear_outputs: bool,
     ) -> PyResult<Option<Py<PySlotView>>> {
-        if let Some(slot) = slf.arena.try_pop_ready(handler) {
+        if let Some(slot) = slf.arena.try_pop_ready() {
             if clear_outputs {
                 let sm = slf.arena.slot_mut(slot);
                 sm.slot.priors.fill(0.0);
