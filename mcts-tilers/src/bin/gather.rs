@@ -50,6 +50,9 @@ struct Gatherer {
     dirichlet_epsilon: f32,
     num_objective_layers: usize,
     gather_id: usize,
+    /// The reward_ratio_limit scales and clamps the reward ratio above and below
+    /// this value when computing value targets. 1.0 means there is no scaling.
+    reward_ratio_limit: f32,
     /// If set, winning trajectories are written here as pretraining data.
     trajectory_dir: Option<String>,
 }
@@ -66,6 +69,7 @@ impl Gatherer {
         num_objective_layers: usize,
         gather_id: usize,
         trajectory_dir: Option<String>,
+        reward_ratio_limit: Option<f32>,
         max_actions: Option<usize>,
     ) -> Self {
         Self {
@@ -79,6 +83,7 @@ impl Gatherer {
             dirichlet_epsilon,
             num_objective_layers,
             gather_id,
+            reward_ratio_limit: reward_ratio_limit.unwrap_or(1.0),
             trajectory_dir,
         }
     }
@@ -271,13 +276,11 @@ impl Gatherer {
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() { -1.0 } else {
                 let d = e.inner.depth(true, true) as f32;
-                if d < reference_depth {
-                    1.0
-                } else if (d - reference_depth).abs() < 1e-3 {
-                    0.0
-                } else {
-                    -1.0
-                }
+                let mut v = (reference_depth - d) / (reference_depth + 1e-6);
+                // Scale and clamp the reward ratio.
+                v = v.max(-self.reward_ratio_limit).min(self.reward_ratio_limit);
+                v = v / self.reward_ratio_limit;  // Normalize to [-1, 1]
+                v
             }
         };
 
@@ -504,6 +507,9 @@ fn main() {
     let mut arena_tag = String::new();
     let mut output_dir = String::from("/shared/staging");
 
+    // Reward ratio limit for value target scaling/clamping. 1.0 means no scaling.
+    let mut reward_ratio_limit = 0.3f32;
+
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
     for i in 0..args.len() {
@@ -561,6 +567,9 @@ fn main() {
         if args[i] == "--output_dir" && i + 1 < args.len() {
             output_dir = args[i + 1].clone();
         }
+        if args[i] == "--reward_ratio_limit" && i + 1 < args.len() {
+            reward_ratio_limit = args[i + 1].parse().unwrap_or(0.3);
+        }
     }
 
     let arena_name = if arena_tag.is_empty() {
@@ -584,6 +593,7 @@ fn main() {
         num_objective_layers,
         worker_id as usize,
         trajectory_dir,
+        Some(reward_ratio_limit),
         None,                 // max actions
     );
 
