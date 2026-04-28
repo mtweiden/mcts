@@ -2,6 +2,7 @@ use rusqlite::{params, Connection};
 use serde_json::json;
 
 use mcts_core::ipc_core::Arena;
+use mcts_core::inference::InferenceClient;
 use mcts_core::mcts::MCTS;
 
 use tilers::env::Environment;
@@ -64,7 +65,7 @@ impl Evaluator {
     fn evaluate_single(
         &self,
         env: &Environment,
-        client: &TilersIpcClient,
+        client: &dyn InferenceClient<TilersEnv>,
     ) -> (Vec<Action>, Option<f32>) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
         let mut tilers_env = TilersEnv::new(env.clone(), NUM_OBJECTIVE_LAYERS);
@@ -142,7 +143,7 @@ impl Evaluator {
         &self,
         agent_id: i64,
         environments: &[HoldoutEnvironment],
-        client: &TilersIpcClient,
+        client: &dyn InferenceClient<TilersEnv>,
         conn: &Connection,
     ) {
         for holdout in environments {
@@ -244,8 +245,116 @@ impl Evaluator {
                 .map_err(|e| format!("Failed to open arena: {e}"))?;
         let client = TilersIpcClient::new(arena, 0);
 
-        self.evaluate_agent_with_client(agent_id, &environments, &client, &conn);
+        self.evaluate_agent_with_client(agent_id, &environments, &client as &dyn InferenceClient<TilersEnv>, &conn);
         Ok(())
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusqlite::Connection;
+    use tilers::env::Environment as TilersEnvInner;
+    use crate::client::TrivialTilersIpcClient;
+
+    fn make_db() -> Connection {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE solutions (
+                agent_id       INTEGER NOT NULL,
+                environment_id INTEGER NOT NULL,
+                actions        TEXT,
+                solution_depth REAL,
+                attempted_at   TEXT,
+                PRIMARY KEY (agent_id, environment_id)
+            );",
+        ).unwrap();
+        conn
+    }
+
+    fn make_holdout(id: i64, env: &TilersEnvInner) -> HoldoutEnvironment {
+        HoldoutEnvironment {
+            environment_id: id,
+            json: env.to_json(NUM_OBJECTIVE_LAYERS),
+            num_objectives: 1,
+        }
+    }
+
+    fn small_env() -> TilersEnvInner {
+        let mut env = TilersEnvInner::new(3, 3, 1);
+        env.set_seed(Some(7));
+        env.random_objectives(1, false);
+        env
+    }
+
+    // ─── Evaluator::new ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_stores_params() {
+        let e = Evaluator::new(50, 1.5, 0.4);
+        assert_eq!(e.mcts_steps, 50);
+        assert!((e.c_puct - 1.5).abs() < 1e-6);
+        assert!((e.reward_ratio_limit - 0.4).abs() < 1e-6);
+    }
+
+    // ─── solve_with_heuristic ────────────────────────────────────────────────
+
+    #[test]
+    fn test_solve_with_heuristic_nonnegative() {
+        let e = Evaluator::new(5, 1.4, 1.0);
+        let env = small_env();
+        let depth = e.solve_with_heuristic(&env);
+        assert!(depth >= 0.0, "depth={depth}");
+    }
+
+    // ─── skip already-attempted environments ─────────────────────────────────
+
+    #[test]
+    fn test_skips_already_attempted_environment() {
+        let conn = make_db();
+        let env = small_env();
+        let holdout = make_holdout(1, &env);
+
+        // Pre-insert a solution so this environment is marked attempted.
+        conn.execute(
+            "INSERT INTO solutions (agent_id, environment_id, actions, solution_depth, attempted_at)
+             VALUES (1, 1, '[]', NULL, '2024-01-01T00:00:00Z')",
+            [],
+        ).unwrap();
+
+        let evaluator = Evaluator::new(5, 1.4, 1.0);
+        let client = TrivialTilersIpcClient {};
+        evaluator.evaluate_agent_with_client(1, &[holdout], &client, &conn);
+
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM solutions", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 1, "should not insert a second row for an already-attempted env");
+    }
+
+    // ─── insert solution for new environment ─────────────────────────────────
+
+    #[test]
+    fn test_inserts_solution_for_new_environment() {
+        let conn = make_db();
+        let env = small_env();
+        let holdout = make_holdout(42, &env);
+
+        let evaluator = Evaluator::new(5, 1.4, 1.0);
+        let client = TrivialTilersIpcClient {};
+        evaluator.evaluate_agent_with_client(99, &[holdout], &client, &conn);
+
+        let count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM solutions WHERE agent_id = 99 AND environment_id = 42",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "should have inserted exactly one solution row");
     }
 }
 
@@ -338,7 +447,7 @@ pub fn run_evaluator(
             .map_err(|e| PyRuntimeError::new_err(format!("Failed to open arena: {e}")))?;
     let client = TilersIpcClient::new(arena, 0);
 
-    evaluator.evaluate_agent_with_client(agent_id, &environments, &client, &conn);
+    evaluator.evaluate_agent_with_client(agent_id, &environments, &client as &dyn InferenceClient<TilersEnv>, &conn);
 
     println!("[Evaluator] Evaluation complete for agent {}.", agent_id);
     Ok(())
