@@ -13,11 +13,8 @@ import json
 import os
 import sqlite3
 import subprocess
-import tempfile
-import time
 from concurrent.futures import Future
-from pathlib import Path
-from unittest.mock import MagicMock, call, patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -364,7 +361,7 @@ class TestHandlerLifecycle:
 
     def test_stop_handlers_terminates_all(self):
         procs = [MagicMock(), MagicMock()]
-        stop_handlers(procs)
+        stop_handlers(procs)  # type: ignore
         for p in procs:
             p.terminate.assert_called_once()
 
