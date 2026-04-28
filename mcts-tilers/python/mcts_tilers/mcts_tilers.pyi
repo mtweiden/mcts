@@ -32,30 +32,17 @@ class PySlotView:
     def num_layers(self) -> memoryview: ...
     def num_objectives(self) -> memoryview: ...
     def last_dir_vertical(self) -> memoryview: ...
-    def write_priors_values(
-        self, priors: Any, values: Any,
-    ) -> None: ...
+    def write_priors_values(self, priors: Any, values: Any) -> None: ...
     def set_handler_start_time(self) -> None: ...
     def mark_done(self) -> None: ...
 
 class PyArena:
-    def __init__(
-        self, name: str, num_slots: int, num_handlers: int,
-    ) -> None: ...
-    def pop_ready_view(
-        self, *, clear_outputs: bool = True,
-    ) -> PySlotView: ...
-    def try_pop_ready_view(
-        self, *, clear_outputs: bool = True,
-    ) -> PySlotView | None: ...
+    def __init__(self, name: str, num_slots: int, num_handlers: int) -> None: ...
+    def pop_ready_view(self, *, clear_outputs: bool = True) -> PySlotView: ...
+    def try_pop_ready_view(self, *, clear_outputs: bool = True) -> PySlotView | None: ...
     def force_reset(self) -> None: ...
     def submit_and_collect(
-        self,
-        h: int,
-        w: int,
-        num_blanks: int,
-        num_objectives: int,
-        seed: int,
+        self, h: int, w: int, num_blanks: int, num_objectives: int, seed: int,
     ) -> tuple[list[list[float]], list[float]]: ...
 
 # ------------------------------------------------------------------------------
@@ -82,13 +69,41 @@ class MctsNode:
     def edge_visits(self) -> dict[int, int]: ...
 
 class PyMcts:
-    def __init__(
-        self, terminal_value: float = 1.0, batch_size: int = 8,
-    ) -> None: ...
-    def run(
-        self,
-        env: MctsEnvironment,
-        agent: MctsAgent,
-        num_steps: int,
-    ) -> MctsNode: ...
+    def __init__(self, terminal_value: float = 1.0, batch_size: int = 8) -> None: ...
+    def run(self, env: MctsEnvironment, agent: MctsAgent, num_steps: int) -> MctsNode: ...
     def advance_root(self, action: int) -> None: ...
+
+# ------------------------------------------------------------------------------
+# Gather and evaluate
+# ------------------------------------------------------------------------------
+def run_gatherer(
+    worker_id: int,
+    num_handlers: int,
+    output_dir: str,
+    arena_tag: str,
+    height: int = 4,
+    width: int = 4,
+    num_objectives: int = 4,
+    min_num_objectives: int = 2,
+    num_blanks: int = 2,
+    mcts_steps: int = 800,
+    fast_steps: int = 140,
+    p_full_search: float = 0.25,
+    dirichlet_epsilon: float = 0.25,
+    reward_ratio_limit: float = 0.3,
+    c_puct: float = 1.4,
+    max_generated_depth: int = 10_000,
+    num_shuffles: int = 0,
+    trajectory_dir: str | None = None,
+    seed: int | None = None,
+) -> tuple[float, float, bool] | None: ...
+
+def run_evaluator(
+    agent_id: int,
+    db_path: str,
+    arena_tag: str = "eval",
+    num_handlers: int = 1,
+    mcts_steps: int = 10_000,
+    c_puct: float = 1.4,
+    reward_ratio_limit: float = 0.3,
+) -> dict[str, Any]: ...

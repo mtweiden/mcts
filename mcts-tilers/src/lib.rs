@@ -2,14 +2,16 @@ pub mod constants;
 pub mod environment;
 pub mod slot;
 pub mod client;
+pub mod evaluator;
+pub mod gatherer;
 
 #[cfg(feature = "python")]
 pub mod py_ipc;
 #[cfg(feature = "python")]
 pub mod py_mcts;
-
 #[cfg(feature = "python")]
 use pyo3::prelude::*;
+
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Python module
@@ -46,6 +48,10 @@ fn mcts_tilers(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<tilers::qubit::PyQubit>()?;
     m.add_class::<tilers::objective::PyObjective>()?;
     m.add_class::<tilers::env::PyEnvironment>()?;
+
+    // for gathering and evaluating
+    m.add_function(wrap_pyfunction!(gatherer::run_gatherer, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluator::run_evaluator, m)?)?;
 
     Ok(())
 }
