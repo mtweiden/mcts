@@ -10,6 +10,7 @@ use rand::SeedableRng;
 use rand::rngs::StdRng;
 
 use mcts_core::ipc_core::Arena;
+use mcts_core::inference::InferenceClient;
 use mcts_core::mcts::MCTS;
 use mcts_core::node::Node;
 
@@ -227,7 +228,7 @@ impl Gatherer {
     pub fn gather(
         &self,
         env: &Environment,
-        client: &TilersIpcClient,
+        client: &dyn InferenceClient<TilersEnv>,
         c_puct: f32,
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
@@ -604,7 +605,279 @@ pub fn run_gatherer(
     }
 
     let mut game_rng = StdRng::from_rng(&mut rand::rng());
-    let result = gatherer.gather(&env, &client, c_puct, &mut game_rng);
+    let result = gatherer.gather(&env, &client as &dyn InferenceClient<TilersEnv>, c_puct, &mut game_rng);
 
     Ok(Some(result))
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use mcts_core::node::Node;
+    use tilers::env::Environment as TilersEnvInner;
+    use crate::client::TrivialTilersIpcClient;
+
+    fn default_gatherer(output_path: &str) -> Gatherer {
+        Gatherer::new(
+            1,                    // batch_size
+            5,                    // mcts_steps
+            2,                    // fast_steps
+            1.0,                  // p_full_search (all turns are full searches)
+            output_path.to_string(),
+            0.0,                  // noise_strength
+            0.0,                  // dirichlet_epsilon
+            2,                    // num_objective_layers
+            0,                    // gather_id
+            None,                 // trajectory_dir
+            Some(1.0),            // reward_ratio_limit
+            None,                 // max_actions
+        )
+    }
+
+    // ─── Gatherer::new ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_new_sets_explicit_reward_ratio_limit() {
+        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1, None, Some(0.3), Some(100));
+        assert!((g.reward_ratio_limit - 0.3).abs() < 1e-6);
+        assert_eq!(g.mcts_steps, 10);
+        assert_eq!(g.fast_steps, 2);
+    }
+
+    #[test]
+    fn test_new_defaults_reward_ratio_limit_to_one() {
+        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0, None, None, None);
+        assert!((g.reward_ratio_limit - 1.0).abs() < 1e-6);
+    }
+
+    // ─── _dirichlet_noise ───────────────────────────────────────────────────
+
+    #[test]
+    fn test_dirichlet_noise_correct_length() {
+        let g = default_gatherer("/dev/null");
+        let mut rng = StdRng::seed_from_u64(42);
+        assert_eq!(g._dirichlet_noise(7, &mut rng).len(), 7);
+    }
+
+    #[test]
+    fn test_dirichlet_noise_non_negative() {
+        let g = default_gatherer("/dev/null");
+        let mut rng = StdRng::seed_from_u64(42);
+        assert!(g._dirichlet_noise(10, &mut rng).iter().all(|&v| v >= 0.0));
+    }
+
+    #[test]
+    fn test_dirichlet_noise_sums_to_one() {
+        let g = default_gatherer("/dev/null");
+        let mut rng = StdRng::seed_from_u64(42);
+        let sum: f64 = g._dirichlet_noise(10, &mut rng).iter().sum();
+        assert!((sum - 1.0).abs() < 1e-6, "sum={sum}");
+    }
+
+    #[test]
+    fn test_dirichlet_noise_single_action_is_one() {
+        let g = default_gatherer("/dev/null");
+        let mut rng = StdRng::seed_from_u64(0);
+        let noise = g._dirichlet_noise(1, &mut rng);
+        assert_eq!(noise.len(), 1);
+        assert!((noise[0] - 1.0).abs() < 1e-6);
+    }
+
+    // ─── _action_probabilities ───────────────────────────────────────────────
+
+    #[test]
+    fn test_action_probs_uniform_when_all_zero_visits() {
+        let g = default_gatherer("/dev/null");
+        let probs = g._action_probabilities(&[0, 0, 0, 0], 1.0);
+        assert_eq!(probs.len(), 4);
+        for p in &probs {
+            assert!((p - 0.25).abs() < 1e-9, "expected 0.25 got {p}");
+        }
+    }
+
+    #[test]
+    fn test_action_probs_greedy_picks_max_visit() {
+        let g = default_gatherer("/dev/null");
+        let probs = g._action_probabilities(&[1, 5, 2], 0.0);
+        assert!((probs[1] - 1.0).abs() < 1e-9, "probs[1]={}", probs[1]);
+        assert!(probs[0] < 1e-9);
+        assert!(probs[2] < 1e-9);
+    }
+
+    #[test]
+    fn test_action_probs_greedy_splits_ties_equally() {
+        let g = default_gatherer("/dev/null");
+        let probs = g._action_probabilities(&[5, 5, 1], 0.0);
+        assert!((probs[0] - 0.5).abs() < 1e-9);
+        assert!((probs[1] - 0.5).abs() < 1e-9);
+        assert!(probs[2] < 1e-9);
+    }
+
+    #[test]
+    fn test_action_probs_proportional_at_temperature_one() {
+        let g = default_gatherer("/dev/null");
+        let probs = g._action_probabilities(&[1, 3], 1.0);
+        assert!((probs[0] - 0.25).abs() < 1e-6, "probs[0]={}", probs[0]);
+        assert!((probs[1] - 0.75).abs() < 1e-6, "probs[1]={}", probs[1]);
+    }
+
+    #[test]
+    fn test_action_probs_high_temp_smoother_than_low_temp() {
+        let g = default_gatherer("/dev/null");
+        let visits = [1usize, 10];
+        let diff_high = {
+            let p = g._action_probabilities(&visits, 5.0);
+            (p[0] - p[1]).abs()
+        };
+        let diff_low = {
+            let p = g._action_probabilities(&visits, 0.5);
+            (p[0] - p[1]).abs()
+        };
+        assert!(diff_high < diff_low, "high_temp diff={diff_high}, low_temp diff={diff_low}");
+    }
+
+    // ─── select_action ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_select_action_returns_valid_action() {
+        let g = default_gatherer("/dev/null");
+        let env = TilersEnvInner::new(3, 3, 1);
+        let valid = env.valid_actions();
+        assert!(!valid.is_empty());
+
+        let priors: HashMap<Action, f32> = valid.iter()
+            .map(|&a| (a as Action, 1.0 / valid.len() as f32))
+            .collect();
+        let node = Node::new(priors, 0.0, 0, None);
+
+        let mut rng = StdRng::seed_from_u64(42);
+        let action = g.select_action(&node, &env, 50, &mut rng);
+        assert!(valid.contains(&(action as usize)), "action {action} not in valid_actions");
+    }
+
+    #[test]
+    fn test_select_action_picks_dominant_at_late_step() {
+        let g = default_gatherer("/dev/null");
+        let env = TilersEnvInner::new(3, 3, 1);
+        let valid = env.valid_actions();
+        assert!(valid.len() >= 2, "need ≥2 valid actions");
+
+        let priors: HashMap<Action, f32> = valid.iter()
+            .map(|&a| (a as Action, 1.0 / valid.len() as f32))
+            .collect();
+        let mut node = Node::new(priors, 0.0, 0, None);
+        let dominant = valid[0] as Action;
+        node.edge_visits.insert(dominant, 100_000);
+
+        let mut rng = StdRng::seed_from_u64(7);
+        for _ in 0..20 {
+            assert_eq!(g.select_action(&node, &env, 1_000, &mut rng), dominant);
+        }
+    }
+
+    // ─── serialize_placement ────────────────────────────────────────────────
+
+    #[test]
+    fn test_serialize_placement_empty() {
+        let v = Gatherer::serialize_placement(&[]);
+        assert!(matches!(v, serde_json::Value::Array(ref a) if a.is_empty()));
+    }
+
+    #[test]
+    fn test_serialize_placement_single_qubit() {
+        use tilers::qubit::Qubit;
+        use tilers::enums::{Orientation, QubitId};
+        let q = Qubit::new(QubitId(0), Orientation::Vertical);
+        let v = Gatherer::serialize_placement(&[q]);
+        let arr = v.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        let pair = arr[0].as_array().unwrap();
+        assert_eq!(pair.len(), 2);
+        assert_eq!(pair[0].as_i64().unwrap(), 0);  // id = 0
+        assert_eq!(pair[1].as_u64().unwrap(), 0);  // Vertical = 0
+    }
+
+    // ─── serialize_objectives ────────────────────────────────────────────────
+
+    #[test]
+    fn test_serialize_objectives_empty() {
+        let v = Gatherer::serialize_objectives(&[]);
+        assert!(matches!(v, serde_json::Value::Array(ref a) if a.is_empty()));
+    }
+
+    #[test]
+    fn test_serialize_objectives_single_qubit_op_has_two_elements() {
+        use tilers::objective::Objective;
+        use tilers::enums::{Operation, QubitId};
+        let obj = Objective::new(Operation::H, QubitId(0), vec![], QubitId(-1));
+        let v = Gatherer::serialize_objectives(&[vec![obj]]);
+        let layers = v.as_array().unwrap();
+        let entry = layers[0].as_array().unwrap()[0].as_array().unwrap();
+        assert_eq!(entry.len(), 2, "single-qubit op should produce [opcode, arg0]");
+    }
+
+    #[test]
+    fn test_serialize_objectives_two_qubit_op_has_three_elements() {
+        use tilers::objective::Objective;
+        use tilers::enums::{Operation, QubitId};
+        let obj = Objective::new(Operation::CX, QubitId(0), vec![], QubitId(1));
+        let v = Gatherer::serialize_objectives(&[vec![obj]]);
+        let layers = v.as_array().unwrap();
+        let entry = layers[0].as_array().unwrap()[0].as_array().unwrap();
+        assert_eq!(entry.len(), 3, "two-qubit op should produce [opcode, arg0, arg1]");
+    }
+
+    // ─── solve_with_heuristic ────────────────────────────────────────────────
+
+    #[test]
+    fn test_solve_with_heuristic_nonnegative_depth() {
+        let g = default_gatherer("/dev/null");
+        let mut env = TilersEnvInner::new(3, 3, 1);
+        env.set_seed(Some(1));
+        env.random_objectives(2, false);
+        let (depth, actions) = g.solve_with_heuristic(&env);
+        assert!(depth >= 0.0, "depth={depth}");
+        assert!(!actions.is_empty(), "heuristic solution should be non-empty");
+    }
+
+    // ─── gather integration ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_gather_creates_jsonl_with_expected_keys() {
+        use std::io::BufRead;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.jsonl").to_str().unwrap().to_string();
+
+        let g = Gatherer::new(1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0, None, Some(1.0), None);
+
+        let mut env = TilersEnvInner::new(3, 3, 1);
+        env.set_seed(Some(99));
+        env.random_objectives(1, false);
+
+        let client = TrivialTilersIpcClient {};
+        let mut rng = StdRng::seed_from_u64(0);
+        g.gather(&env, &client, 1.4, &mut rng);
+
+        let file = std::fs::File::open(&out).expect("output file not created");
+        let lines: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+
+        assert!(!lines.is_empty(), "no data lines written");
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
+            for key in &["height", "width", "placement", "objectives",
+                         "valid_actions", "edge_visits", "reward", "last_dirs"] {
+                assert!(v.get(key).is_some(), "missing key '{key}' in: {line}");
+            }
+        }
+    }
 }
