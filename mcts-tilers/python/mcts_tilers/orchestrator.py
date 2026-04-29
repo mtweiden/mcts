@@ -2,9 +2,9 @@
 orchestrate.py
 
 Self-play pipeline orchestrator. Drives the following loop:
-    1. GATHER  – run self-play workers until enough data has been collected.
-    2. TRAIN   – launch the trainer and wait for a new checkpoint.
-    3. EVALUATE – compare the new checkpoint against the incumbent.
+    1. GATHER  - run self-play workers until enough data has been collected.
+    2. TRAIN   - launch the trainer and wait for a new checkpoint.
+    3. EVALUATE - compare the new checkpoint against the incumbent.
     4. Repeat.
 
 Resumption: a small JSON state file records the current phase so that if the
