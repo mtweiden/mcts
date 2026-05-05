@@ -39,7 +39,7 @@ def latest_checkpoint() -> str | None:
     return files[-1]
 
 
-MODEL = Agent(embedding_dim=100, num_layers=16, lookahead=1)
+MODEL = Agent(embedding_dim=128, num_layers=10, lookahead=1)
 
 # ------------------------------------------------------------------------------
 # Unpacking helpers
@@ -66,7 +66,6 @@ def unpack_placement_batch(
         buf = raw[i, : nq * QUBIT_SIZE].reshape(nq, QUBIT_SIZE)
         ids[i, :nq] = buf[:, :4].copy().view(np.int32).reshape(nq)
         orientations[i, :nq] = buf[:, 4]
-
     return ids, orientations
 
 
@@ -89,7 +88,7 @@ def unpack_objectives_batch(
     for l in range(max_nl):
         max_no = max(1, int(num_objectives[:, l].max())) if l < num_objectives.shape[1] else 1
 
-        opcodes = np.zeros((total, max_no), dtype=np.uint8)
+        opcodes = np.zeros((total, max_no), dtype=np.int8)
         arg0s = np.zeros((total, max_no), dtype=np.int32)
         arg1s = np.zeros((total, max_no), dtype=np.int32)
 
@@ -126,20 +125,22 @@ _RAW_OPCODE_TO_TOKEN: dict[int, int] = {
     7: 5,    # SXdg
     8: 6,    # T
     9: 6,    # Tdg
-    12: 2,   # RZ
-    16: 11,  # MEASURE
-    17: 12,  # RESET
+    10: 7,   # TX
+    11: 7,   # TXdg
+    14: 2,   # RZ
+    18: 12,  # MEASURE
+    19: 13,  # RESET
 }
 
-# opcodes from tilers
-_RAW_CX_OPCODE = 10
-_RAW_CZ_OPCODE = 11
+# opcodes from tilers (verified via int(Operation.CX) / int(Operation.CZ))
+_RAW_CX_OPCODE = 12
+_RAW_CZ_OPCODE = 13
 
-# board.py two-qubit tokens
-_TOKEN_CZ_CONTROL = 7
-_TOKEN_CZ_TARGET = 8
-_TOKEN_CX_CONTROL = 9
-_TOKEN_CX_TARGET = 10
+# board.py two-qubit tokens (matching board.py construct_board / _build_layer)
+_TOKEN_CZ_CONTROL = 8
+_TOKEN_CZ_TARGET = 9
+_TOKEN_CX_CONTROL = 10
+_TOKEN_CX_TARGET = 11
 
 # raw orientation -> board.py orientation token
 _RAW_ORI_TO_TOKEN: dict[int, int] = {
@@ -236,7 +237,7 @@ def build_boards(
                         and last_dir_vertical[i, ancilla_idx]
                     ):
                         ori_token = 7
-                    boards[i, l, j, 0] = 12 - qid  # -1..-50 -> 13..62
+                    boards[i, l, j, 0] = 13 - qid  # -1..-50 -> 14..63
                     boards[i, l, j, 1] = ori_token
                     boards[i, l, j, 2] = -1
                     boards[i, l, j, 3] = -1
@@ -272,6 +273,9 @@ def do_work(arena: PyArena, device: str) -> None:
                 continue
             sv.set_handler_start_time()
             slot_views.append(sv)
+            # print(f"[handler {handler_id}] batched slot {sv.slot}")
+
+        # print(f"[handler {handler_id}] loop iteration {iteration}, {len(slot_views)} slots pending", flush=True)
 
         try:
             # Gather raw arrays from all slots
@@ -409,11 +413,16 @@ if __name__ == "__main__":
         device = "cpu"
 
     if args.weights is not None:
+        print(f"[handler {args.handler_id}] Loading weights from: {args.weights}")
         MODEL.load_state(args.weights)
+        print(f"[handler {args.handler_id}] Weights loaded.")
     else:
         ckpt = latest_checkpoint()
         if ckpt is not None:
+            print(f"[handler {args.handler_id}] No --weights given; loading latest checkpoint: {ckpt}")
             MODEL.load_state(ckpt)
+        else:
+            print(f"[handler {args.handler_id}] No --weights given and no checkpoint found; using random weights.")
     MODEL.to(device)
 
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
