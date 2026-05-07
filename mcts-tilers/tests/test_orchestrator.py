@@ -121,7 +121,7 @@ def make_args(**overrides) -> argparse.Namespace:
         fast_steps=20,
         p_full_search=0.25,
         dirichlet_epsilon=0.25,
-        reward_ratio_limit=0.3,
+        reward_saturation_temperature=0.3,
         c_puct=1.4,
         max_generated_depth=1000,
         num_shuffles=0,

@@ -50,9 +50,35 @@ pub struct Gatherer {
     dirichlet_epsilon: f32,
     num_objective_layers: usize,
     gather_id: usize,
-    /// The reward_ratio_limit scales and clamps the reward ratio above and below
-    /// this value when computing value targets. 1.0 means there is no scaling.
-    reward_ratio_limit: f32,
+    /// Saturation temperature for the terminal reward. The terminal value
+    /// target is `tanh((reference_depth - actual_depth) / (reference_depth + ε)
+    /// / reward_saturation_temperature)`. Smaller temperature → sharper
+    /// saturation toward ±1 (closer to AlphaZero's categorical signal); larger
+    /// temperature → near-linear in depth-delta with broad dynamic range. The
+    /// previous clip-and-normalize scheme corresponds to the limit of the
+    /// linear region with slope 1/temperature at the origin, but without the
+    /// hard discontinuity at the saturation boundary.
+    reward_saturation_temperature: f32,
+    /// Resignation threshold: end the episode early when the agent's
+    /// MCTS-backed Q estimate is at or below this value for
+    /// `resign_consecutive_moves` consecutive moves AND the agent's
+    /// current depth already exceeds the solver's reference depth. Both
+    /// conditions are required so we only resign when the agent is
+    /// confidently losing AND has already overshot — this avoids early
+    /// resignation on positions that look bad but are still recoverable.
+    /// Set `resign_consecutive_moves = 0` to disable resignation
+    /// entirely; values of `resign_value_threshold` above 1.0 also have
+    /// that effect (Q is bounded above by 1).
+    resign_value_threshold: f32,
+    resign_consecutive_moves: usize,
+    /// Fraction of episodes in which resignation is *disabled* and the
+    /// game is played out to its natural end. These serve as a sanity
+    /// check: if too many of the would-have-been-resigned positions
+    /// actually flip, the threshold is too aggressive. Set to 0.0 to
+    /// always allow resignation (no sanity sample) or 1.0 to never
+    /// resign (effectively disables the feature, equivalent to
+    /// `resign_consecutive_moves = 0`).
+    no_resign_rate: f32,
     /// If set, winning trajectories are written here as pretraining data.
     trajectory_dir: Option<String>,
 }
@@ -69,8 +95,11 @@ impl Gatherer {
         num_objective_layers: usize,
         gather_id: usize,
         trajectory_dir: Option<String>,
-        reward_ratio_limit: Option<f32>,
+        reward_saturation_temperature: Option<f32>,
         max_actions: Option<usize>,
+        resign_value_threshold: Option<f32>,
+        resign_consecutive_moves: Option<usize>,
+        no_resign_rate: Option<f32>,
     ) -> Self {
         Self {
             batch_size,
@@ -83,7 +112,19 @@ impl Gatherer {
             dirichlet_epsilon,
             num_objective_layers,
             gather_id,
-            reward_ratio_limit: reward_ratio_limit.unwrap_or(1.0),
+            // Default of 0.3 preserves the slope-at-origin (1/0.3 ≈ 3.33) of
+            // the previous clip-and-normalize default with reward_ratio_limit
+            // = 0.3, so behavior in the unsaturated region is unchanged on
+            // first switch. Tune up (more linear) or down (more categorical)
+            // explicitly via the constructor / Python kwarg.
+            reward_saturation_temperature: reward_saturation_temperature.unwrap_or(0.3),
+            // Resignation defaults: AZ-paper-style conservative thresholds.
+            // Q ≤ -0.9 for 5 consecutive moves while already over solver
+            // depth → resign. 10% of episodes never resign and serve as the
+            // false-positive sanity check.
+            resign_value_threshold: resign_value_threshold.unwrap_or(-0.9),
+            resign_consecutive_moves: resign_consecutive_moves.unwrap_or(5),
+            no_resign_rate: no_resign_rate.unwrap_or(0.1),
             trajectory_dir,
         }
     }
@@ -273,14 +314,29 @@ impl Gatherer {
             (reference_actions.len() as f32 * 1.2) as usize
         };
 
+        // Resignation bookkeeping. resign_allowed is decided once per
+        // episode so the no-resign sanity sample is a uniform 1 - rate
+        // fraction. Episodes that fall into the sanity sample play out
+        // to natural termination; the rest may resign once the
+        // (low-Q-streak ∧ over-solver-depth) condition is met.
+        let resignation_enabled =
+            self.resign_consecutive_moves > 0 && self.resign_value_threshold < 1.0;
+        let resign_allowed =
+            resignation_enabled && rng.random::<f32>() >= self.no_resign_rate;
+        let mut low_value_streak: usize = 0;
+
+        let temperature = self.reward_saturation_temperature;
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() { -1.0 } else {
                 let d = e.inner.depth(true, true) as f32;
-                let mut v = (reference_depth - d) / (reference_depth + 1e-6);
-                // Scale and clamp the reward ratio.
-                v = v.max(-self.reward_ratio_limit).min(self.reward_ratio_limit);
-                v = v / self.reward_ratio_limit;  // Normalize to [-1, 1]
-                v
+                let ratio = (reference_depth - d) / (reference_depth + 1e-6);
+                // tanh(ratio / temperature) replaces the previous
+                // clip-then-normalize. Smooth gradient at all input scales —
+                // a 50% improvement still contributes signal instead of being
+                // flattened to +1 the same as a 30% improvement was under
+                // the clip. Saturation behavior is governed entirely by the
+                // temperature knob.
+                (ratio / temperature).tanh()
             }
         };
 
@@ -307,6 +363,36 @@ impl Gatherer {
             }
 
             let root = mcts.run(&tilers_env, client, steps, c_puct, &terminal_evaluator, is_full_search);
+
+            // Resignation check (after the search, before recording or
+            // stepping). root.value is the visit-weighted Q estimate at
+            // the current state — the agent's best estimate of "how is
+            // this position going". We require Q ≤ threshold AND that
+            // we've already overshot the solver's depth, so the agent
+            // is both confident it's losing and has exhausted its
+            // budget. Both conditions reset the streak when violated;
+            // resignation only fires after the streak hits the
+            // configured length.
+            if resignation_enabled {
+                let q = root.value;
+                let current_depth = tilers_env.inner.depth(true, true) as f32;
+                let over_solver = current_depth > reference_depth;
+                if q <= self.resign_value_threshold && over_solver {
+                    low_value_streak += 1;
+                } else {
+                    low_value_streak = 0;
+                }
+
+                if resign_allowed && low_value_streak >= self.resign_consecutive_moves {
+                    println!(
+                        "[Gatherer {}] Resigning at step {}: Q={:.3} \
+                         depth={} ref_depth={} streak={}",
+                        self.gather_id, step, q, current_depth as i32,
+                        reference_depth as i32, low_value_streak,
+                    );
+                    break;
+                }
+            }
 
             // Snapshot state before stepping (shared between temp_data and all_steps_data).
             let placement = tilers_env.inner.get_placement();
@@ -509,12 +595,15 @@ use pyo3::exceptions::PyRuntimeError;
     fast_steps = 140,
     p_full_search = 0.25,
     dirichlet_epsilon = 0.25,
-    reward_ratio_limit = 0.3,
+    reward_saturation_temperature = 0.3,
     c_puct = 1.4,
     max_generated_depth = 10_000,
     num_shuffles = 0,
     trajectory_dir = None,
     seed = None,
+    resign_value_threshold = -0.9,
+    resign_consecutive_moves = 5,
+    no_resign_rate = 0.1,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -530,12 +619,15 @@ pub fn run_gatherer(
     fast_steps: usize,
     p_full_search: f32,
     dirichlet_epsilon: f32,
-    reward_ratio_limit: f32,
+    reward_saturation_temperature: f32,
     c_puct: f32,
     max_generated_depth: usize,
     num_shuffles: usize,
     trajectory_dir: Option<String>,
     seed: Option<i32>,
+    resign_value_threshold: f32,
+    resign_consecutive_moves: usize,
+    no_resign_rate: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let num_objective_layers = DEFAULT_LOOKAHEAD;
@@ -563,8 +655,11 @@ pub fn run_gatherer(
         num_objective_layers,
         worker_id as usize,
         trajectory_dir,
-        Some(reward_ratio_limit),
+        Some(reward_saturation_temperature),
         None,
+        Some(resign_value_threshold),
+        Some(resign_consecutive_moves),
+        Some(no_resign_rate),
     );
 
     let mut rng = if let Some(s) = seed {
@@ -635,25 +730,58 @@ mod tests {
             2,                    // num_objective_layers
             0,                    // gather_id
             None,                 // trajectory_dir
-            Some(1.0),            // reward_ratio_limit
+            Some(1.0),            // reward_saturation_temperature
             None,                 // max_actions
+            Some(2.0),            // resign_value_threshold (>1.0 disables)
+            Some(0),              // resign_consecutive_moves (0 disables)
+            Some(0.0),            // no_resign_rate
         )
     }
 
     // ─── Gatherer::new ──────────────────────────────────────────────────────
 
     #[test]
-    fn test_new_sets_explicit_reward_ratio_limit() {
-        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1, None, Some(0.3), Some(100));
-        assert!((g.reward_ratio_limit - 0.3).abs() < 1e-6);
+    fn test_new_sets_explicit_reward_saturation_temperature() {
+        let g = Gatherer::new(
+            8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1,
+            None, Some(0.3), Some(100), None, None, None,
+        );
+        assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
         assert_eq!(g.mcts_steps, 10);
         assert_eq!(g.fast_steps, 2);
     }
 
     #[test]
-    fn test_new_defaults_reward_ratio_limit_to_one() {
-        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0, None, None, None);
-        assert!((g.reward_ratio_limit - 1.0).abs() < 1e-6);
+    fn test_new_defaults_reward_saturation_temperature() {
+        // Default mirrors the slope-at-origin of the previous clip+normalize
+        // default (reward_ratio_limit = 0.3 → slope 1/0.3); see Gatherer::new.
+        let g = Gatherer::new(
+            8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
+            None, None, None, None, None, None,
+        );
+        assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_new_defaults_resignation_params() {
+        let g = Gatherer::new(
+            8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
+            None, None, None, None, None, None,
+        );
+        assert!((g.resign_value_threshold - (-0.9)).abs() < 1e-6);
+        assert_eq!(g.resign_consecutive_moves, 5);
+        assert!((g.no_resign_rate - 0.1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn test_new_sets_explicit_resignation_params() {
+        let g = Gatherer::new(
+            8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
+            None, None, None, Some(-0.5), Some(8), Some(0.2),
+        );
+        assert!((g.resign_value_threshold - (-0.5)).abs() < 1e-6);
+        assert_eq!(g.resign_consecutive_moves, 8);
+        assert!((g.no_resign_rate - 0.2).abs() < 1e-6);
     }
 
     // ─── _dirichlet_noise ───────────────────────────────────────────────────
@@ -854,7 +982,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("out.jsonl").to_str().unwrap().to_string();
 
-        let g = Gatherer::new(1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0, None, Some(1.0), None);
+        let g = Gatherer::new(
+            1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0,
+            None, Some(1.0), None,
+            Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
+        );
 
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(99));

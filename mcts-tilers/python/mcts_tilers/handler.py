@@ -15,7 +15,7 @@ from mcts_tilers import QUBIT_SIZE, OBJECTIVE_SIZE, OBJECTIVES_LAYER_MAX
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
-BATCH_TIMEOUT = 0.005
+BATCH_TIMEOUT = 0.002
 MAX_SLOTS_PER_BATCH = 64  # max slots to gather before one GPU call
 
 # ------------------------------------------------------------------------------
@@ -253,7 +253,7 @@ def build_boards(
 # ------------------------------------------------------------------------------
 # Inference loop
 # ------------------------------------------------------------------------------
-def do_work(arena: PyArena, device: str) -> None:
+def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
     iteration = 0
     while True:
         try:
@@ -265,6 +265,7 @@ def do_work(arena: PyArena, device: str) -> None:
         iteration += 1
 
         slot_views = [first_sv]
+
         start = time.monotonic()
         while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - start) < BATCH_TIMEOUT:
             sv = arena.try_pop_ready_view(clear_outputs=True)
@@ -428,4 +429,4 @@ if __name__ == "__main__":
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
     arena_name = f"{args.arena_name}{tag}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
-    do_work(arena, device)
+    do_work(arena, device, handler_id=args.handler_id)

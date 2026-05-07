@@ -28,25 +28,81 @@ pub struct HoldoutEnvironment {
     num_objectives: i64,
 }
 
+/// Load holdout environments from the database, optionally filtered to those
+/// with at most `max_num_objectives` objectives, and round-robin sliced
+/// across nodes by (node_idx, num_nodes). Single-node callers pass
+/// (0, 1) and get every row. Multi-node callers pass distinct node_idx
+/// values and ROW_NUMBER over (num_objectives ASC, environment_id ASC)
+/// distributes envs evenly across difficulty tiers — so each node gets a
+/// balanced mix of easy and hard envs rather than a contiguous block.
+fn load_holdout_environments(
+    conn: &Connection,
+    max_num_objectives: Option<i64>,
+    node_idx: i64,
+    num_nodes: i64,
+) -> Result<Vec<HoldoutEnvironment>, rusqlite::Error> {
+    let max_filter = if max_num_objectives.is_some() {
+        "WHERE num_objectives <= ?"
+    } else {
+        ""
+    };
+    // Slice via ROW_NUMBER so every node gets a balanced mix across the
+    // difficulty tiers. (rn - 1) % num_nodes = node_idx is the round-robin.
+    let sql = format!(
+        "WITH ordered AS (
+            SELECT environment_id, json, num_objectives,
+                   ROW_NUMBER() OVER (ORDER BY num_objectives ASC, environment_id ASC) AS rn
+            FROM environments
+            {}
+         )
+         SELECT environment_id, json, num_objectives
+         FROM ordered
+         WHERE (rn - 1) % ? = ?
+         ORDER BY num_objectives ASC",
+        max_filter
+    );
+
+    let mut bound: Vec<i64> = Vec::new();
+    if let Some(m) = max_num_objectives {
+        bound.push(m);
+    }
+    bound.push(num_nodes);
+    bound.push(node_idx);
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(rusqlite::params_from_iter(bound.iter()), |row| {
+        Ok(HoldoutEnvironment {
+            environment_id: row.get(0)?,
+            json: row.get(1)?,
+            num_objectives: row.get(2)?,
+        })
+    })?;
+    Ok(rows.filter_map(|r| r.ok()).collect())
+}
+
 // =============================================================================
 // Evaluator
 // =============================================================================
 pub struct Evaluator {
     mcts_steps: usize,
     c_puct: f32,
-    reward_ratio_limit: f32,
+    /// Saturation temperature for the terminal reward; see Gatherer for the
+    /// full description. Kept identical to the gatherer's value during a
+    /// given run so the evaluator's terminal scalars are comparable to the
+    /// ones the trained value head saw at gather time.
+    reward_saturation_temperature: f32,
 }
 
 impl Evaluator {
     pub fn new(
         mcts_steps: usize,
         c_puct: f32,
-        reward_ratio_limit: f32,
+        reward_saturation_temperature: f32,
     ) -> Self {
         Self {
             mcts_steps,
             c_puct,
-            reward_ratio_limit,
+            reward_saturation_temperature,
         }
     }
 
@@ -72,16 +128,19 @@ impl Evaluator {
         tilers_env.inner.set_cultivation_time(10);
 
         let reference_depth = self.solve_with_heuristic(&tilers_env.inner);
-        let reward_ratio_limit = self.reward_ratio_limit;
+        let temperature = self.reward_saturation_temperature;
 
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() {
                 -1.0
             } else {
                 let d = e.inner.depth(true, true) as f32;
-                let mut v = (reference_depth - d) / (reference_depth + 1e-6);
-                v = v.max(-reward_ratio_limit).min(reward_ratio_limit);
-                v / reward_ratio_limit
+                let ratio = (reference_depth - d) / (reference_depth + 1e-6);
+                // tanh saturation; same formulation as Gatherer's terminal
+                // evaluator. Eval and gather must agree on temperature so
+                // the value-head's terminal targets at training time match
+                // the scalars MCTS sees at eval time.
+                (ratio / temperature).tanh()
             }
         };
 
@@ -214,30 +273,17 @@ impl Evaluator {
         db_path: &str,
         arena_tag: &str,
         num_handlers: usize,
+        max_num_objectives: Option<i64>,
+        node_idx: i64,
+        num_nodes: i64,
     ) -> Result<(), String> {
         let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
         conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
             .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
 
-        let environments: Vec<HoldoutEnvironment> = {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT environment_id, json, num_objectives \
-                     FROM environments ORDER BY num_objectives ASC",
-                )
-                .map_err(|e| format!("Failed to prepare query: {e}"))?;
-
-            stmt.query_map([], |row| {
-                Ok(HoldoutEnvironment {
-                    environment_id: row.get(0)?,
-                    json: row.get(1)?,
-                    num_objectives: row.get(2)?,
-                })
-            })
-            .map_err(|e| format!("Failed to query environments: {e}"))?
-            .filter_map(|r| r.ok())
-            .collect()
-        };
+        let environments = load_holdout_environments(
+            &conn, max_num_objectives, node_idx, num_nodes,
+        ).map_err(|e| format!("Failed to query environments: {e}"))?;
 
         let arena_name = format!("mcts_{}_{}_{}", arena_tag, NUM_SLOTS, num_handlers);
         let arena: Arena<TilersSlot> =
@@ -297,7 +343,7 @@ mod tests {
         let e = Evaluator::new(50, 1.5, 0.4);
         assert_eq!(e.mcts_steps, 50);
         assert!((e.c_puct - 1.5).abs() < 1e-6);
-        assert!((e.reward_ratio_limit - 0.4).abs() < 1e-6);
+        assert!((e.reward_saturation_temperature - 0.4).abs() < 1e-6);
     }
 
     // ─── solve_with_heuristic ────────────────────────────────────────────────
@@ -379,7 +425,22 @@ use pyo3::exceptions::PyRuntimeError;
 ///     num_handlers:       Number of handler processes Python started.
 ///     mcts_steps:         Number of MCTS iterations per action.
 ///     c_puct:             Exploration constant.
-///     reward_ratio_limit: Clips the terminal reward to [-limit, limit].
+///     reward_saturation_temperature: Tanh saturation knob for the terminal
+///                         reward. Smaller → more categorical (±1); larger
+///                         → more linear in depth-delta. Must match the
+///                         value used by the gatherer that produced this
+///                         agent's training data, otherwise the value head's
+///                         outputs are calibrated to a different scale.
+///     max_num_objectives: If set, skip holdout environments whose
+///                         num_objectives exceeds this value. Defaults to
+///                         None (evaluate every environment).
+///     node_idx:           This node's 0-based index in the gather/eval
+///                         allocation. Defaults to 0.
+///     num_nodes:          Total number of nodes that will collectively
+///                         evaluate this agent. Each node sees a
+///                         round-robin slice of the holdout, balanced by
+///                         difficulty tier. Defaults to 1 (this node
+///                         evaluates everything).
 #[cfg(feature = "python")]
 #[pyfunction]
 #[pyo3(signature = (
@@ -389,7 +450,10 @@ use pyo3::exceptions::PyRuntimeError;
     num_handlers = 1,
     mcts_steps = 10_000,
     c_puct = 1.4,
-    reward_ratio_limit = 0.3,
+    reward_saturation_temperature = 0.3,
+    max_num_objectives = None,
+    node_idx = 0,
+    num_nodes = 1,
 ))]
 pub fn run_evaluator(
     agent_id: i64,
@@ -398,12 +462,15 @@ pub fn run_evaluator(
     num_handlers: usize,
     mcts_steps: usize,
     c_puct: f32,
-    reward_ratio_limit: f32,
+    reward_saturation_temperature: f32,
+    max_num_objectives: Option<i64>,
+    node_idx: i64,
+    num_nodes: i64,
 ) -> PyResult<()> {
     let evaluator = Evaluator::new(
         mcts_steps,
         c_puct,
-        reward_ratio_limit,
+        reward_saturation_temperature,
     );
 
     let conn = Connection::open(&db_path)
@@ -411,31 +478,22 @@ pub fn run_evaluator(
     conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to set PRAGMAs: {e}")))?;
 
-    // Load all holdout environments ordered by difficulty.
-    let environments: Vec<HoldoutEnvironment> = {
-        let mut stmt = conn
-            .prepare(
-                "SELECT environment_id, json, num_objectives \
-                 FROM environments ORDER BY num_objectives ASC",
-            )
-            .map_err(|e| PyRuntimeError::new_err(format!("Failed to prepare query: {e}")))?;
+    let environments = load_holdout_environments(
+        &conn, max_num_objectives, node_idx, num_nodes,
+    ).map_err(|e| PyRuntimeError::new_err(format!("Failed to query environments: {e}")))?;
 
-        stmt.query_map([], |row| {
-            Ok(HoldoutEnvironment {
-                environment_id: row.get(0)?,
-                json: row.get(1)?,
-                num_objectives: row.get(2)?,
-            })
-        })
-        .map_err(|e| PyRuntimeError::new_err(format!("Failed to query environments: {e}")))?
-        .filter_map(|r| r.ok())
-        .collect()
+    let max_filter_msg = match max_num_objectives {
+        Some(m) => format!(" (num_objectives <= {})", m),
+        None => String::new(),
     };
-
+    let slice_msg = if num_nodes > 1 {
+        format!(" [node {}/{} round-robin slice]", node_idx, num_nodes)
+    } else {
+        String::new()
+    };
     println!(
-        "[Evaluator] Loaded {} holdout environments for agent {}.",
-        environments.len(),
-        agent_id,
+        "[Evaluator] Loaded {} holdout environments{}{} for agent {}.",
+        environments.len(), max_filter_msg, slice_msg, agent_id,
     );
 
     // Handlers are already running. Open the arena and connect a client.
