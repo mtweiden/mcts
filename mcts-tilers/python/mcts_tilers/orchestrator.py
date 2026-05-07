@@ -377,7 +377,7 @@ def run_gather_phase(
         fast_steps=args.fast_steps,
         p_full_search=args.p_full_search,
         dirichlet_epsilon=args.dirichlet_epsilon,
-        reward_ratio_limit=args.reward_ratio_limit,
+        reward_saturation_temperature=args.reward_saturation_temperature,
         c_puct=args.c_puct,
         max_generated_depth=args.max_generated_depth,
         num_shuffles=args.num_shuffles,
@@ -524,7 +524,7 @@ def run_evaluate_phase(
         num_handlers=args.num_eval_handlers,
         mcts_steps=args.mcts_steps,
         c_puct=args.c_puct,
-        reward_ratio_limit=args.reward_ratio_limit,
+        reward_saturation_temperature=args.reward_saturation_temperature,
     )
 
     # --- Evaluate candidate --------------------------------------------------
@@ -623,7 +623,9 @@ def main() -> None:
     parser.add_argument("--fast_steps", type=int, default=1_600)
     parser.add_argument("--p_full_search", type=float, default=0.25)
     parser.add_argument("--dirichlet_epsilon", type=float, default=0.25)
-    parser.add_argument("--reward_ratio_limit", type=float, default=0.3)
+    parser.add_argument("--reward_saturation_temperature", type=float, default=0.3,
+        help="Tanh saturation temperature for the terminal reward target. "
+             "Replaces the old --reward_ratio_limit clip+normalize.")
     parser.add_argument("--c_puct", type=float, default=1.4)
     parser.add_argument("--max_generated_depth", type=int, default=10_000)
     parser.add_argument("--num_shuffles", type=int, default=0)
