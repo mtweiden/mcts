@@ -171,8 +171,8 @@ impl RingQueue {
 // ---------------------------------------------------------------------------------------------
 // IPC Shared Memory Arena which is generic over Slot type
 // ---------------------------------------------------------------------------------------------
-/// The maximum number of GPUs supported for handling inference requests. For a DGX this is 4.
-pub const MAX_HANDLERS: usize = 4;
+/// The maximum number of handlers supported. Raised to 16 to allow multiple handlers per GPU.
+pub const MAX_HANDLERS: usize = 16;
 const ARENA_MAGIC: u64 = 0x4D_43_54_53_49_50_43; // "MCTSIPC"ish
 const ARENA_VERSION: u32 = 2;
 
