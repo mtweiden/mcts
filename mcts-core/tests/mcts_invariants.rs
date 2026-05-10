@@ -480,12 +480,12 @@ fn test_perturb_root_prior_mixes_correctly_in_puct_scores() {
     //   p′[2] = 0.75 × 0.2 + 0.25 × 0.3 = 0.225
     // So U[0] > U[1] > U[2].
     let scores = mcts.puct_scores(1, 1.0, true, false);
-    assert!(scores[&0] > scores[&1],
+    assert!(scores[0] > scores[1],
         "blended prior for action 0 ({}) should be higher than for action 1 ({})",
-        scores[&0], scores[&1]);
-    assert!(scores[&1] > scores[&2],
+        scores[0], scores[1]);
+    assert!(scores[1] > scores[2],
         "blended prior for action 1 ({}) should be higher than for action 2 ({})",
-        scores[&1], scores[&2]);
+        scores[1], scores[2]);
 }
 
 // ============================================================================
@@ -728,13 +728,16 @@ fn test_each_node_action_set_matches_its_state_in_shrinking_env() {
 
 #[test]
 fn test_puct_scores_finite_for_visited_actions_at_branching_50() {
-    // After a search, every visited action at the root must have a
-    // finite PUCT score. NaN/-inf would indicate a divide-by-zero or
-    // missing-entry bug after refactor.
+    // After a search, every VALID action at the root must have a finite
+    // PUCT score. Invalid action slots in the dense Vec are NEG_INFINITY
+    // by construction and skipped here. NaN at a valid slot would
+    // indicate a divide-by-zero or missing-entry bug after refactor.
     let mcts = run_search(50, 6, 500, false);
     let root = mcts.root_id.unwrap();
     let scores = mcts.puct_scores(root, 1.4, true, false);
-    for (&a, &s) in &scores {
+    let n = mcts.get_node_immut(root).unwrap();
+    for &a in &n.valid_actions {
+        let s = scores[a as usize];
         assert!(s.is_finite(),
             "root action {} has non-finite PUCT score {} after search", a, s);
     }
@@ -742,10 +745,20 @@ fn test_puct_scores_finite_for_visited_actions_at_branching_50() {
 
 #[test]
 fn test_puct_scores_only_for_valid_actions_at_branching_50() {
+    // Dense scores Vec has length num_actions. Slots at indices NOT
+    // in valid_actions must be NEG_INFINITY (the unscored sentinel) so
+    // a downstream argmax cannot pick an invalid action.
     let mcts = run_search(50, 6, 500, false);
     let root = mcts.root_id.unwrap();
     let scores = mcts.puct_scores(root, 1.4, true, false);
-    for &a in scores.keys() {
-        assert!(a < 50, "puct_scores produced score for invalid action {}", a);
+    let n = mcts.get_node_immut(root).unwrap();
+    assert_eq!(scores.len(), 50,
+        "scores Vec length must equal num_actions");
+    let valid_set: std::collections::HashSet<u32> = n.valid_actions.iter().copied().collect();
+    for (idx, &s) in scores.iter().enumerate() {
+        if !valid_set.contains(&(idx as u32)) {
+            assert_eq!(s, f32::NEG_INFINITY,
+                "invalid action slot {} has non-NEG_INFINITY score {}", idx, s);
+        }
     }
 }

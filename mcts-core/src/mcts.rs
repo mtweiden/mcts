@@ -453,10 +453,10 @@ impl<E: Environment> MCTS<E> {
         c_puct: f32,
         is_root: bool,
         apply_forced: bool,
-    ) -> HashMap<E::Act, f32> {
+    ) -> Vec<f32> {
         let node = match self.get_node_immut(node_id) {
             Some(n) => n,
-            None => return HashMap::new(),
+            None => return Vec::new(),
         };
 
         let total_visits: usize = node.edge_visits.iter().sum();
@@ -467,9 +467,6 @@ impl<E: Environment> MCTS<E> {
         // At the root c_fpu is 0: Dirichlet noise handles exploration there.
         // Reference: [Wu 2020, §2, footnote 3].
         let c_fpu_eff: f32 = if is_root { 0.0 } else { self.c_fpu };
-        // Iterate valid_actions (the small list) and index into the dense
-        // prior_probs Vec. Invalid action slots in prior_probs are zero
-        // and never read.
         let p_explored: f32 = node.valid_actions
             .iter()
             .filter(|&&a| node.edge_visits[a.to_action_index()] > 0)
@@ -478,74 +475,79 @@ impl<E: Environment> MCTS<E> {
         let fpu_q = node.value - c_fpu_eff * p_explored.sqrt();
 
         // --- Root softmax temperature + transient Dirichlet noise ---
-        // At the root we apply two transformations in sequence:
-        //   1. Blend in the stored noise: P′(c) = (1−ε)·P(c) + ε·noise(c)
-        //   2. Apply softmax temperature: P″(c) ∝ P′(c)^(1/T), renormalised
-        // Noise is read from `self.root_noise` (set by `perturb_root_prior`)
-        // rather than baked into `node.prior_probs`, so it never permanently
-        // alters the transposition table.  References: [Wu 2020, §2].
-        // effective_priors is kept as a HashMap because the loop below iterates
-        // it; step 6 of the refactor will swap this transient HashMap for a
-        // reused Vec<f32>.
-        let effective_priors: HashMap<E::Act, f32> = if is_root {
-            // Step 1: blend noise if present.
-            let noisy: HashMap<E::Act, f32> = if let Some(noise) = &self.root_noise {
-                let eps = self.root_noise_epsilon;
-                let mut blended: HashMap<E::Act, f32> = node.valid_actions
-                    .iter()
-                    .map(|&a| {
-                        let p = node.prior_probs[a.to_action_index()];
-                        let n = noise.get(&a).copied().unwrap_or(0.0);
-                        (a, (1.0 - eps) * p + eps * n)
-                    })
-                    .collect();
-                let total: f32 = blended.values().sum();
-                if total > 0.0 {
-                    for v in blended.values_mut() { *v /= total; }
-                }
-                blended
-            } else {
-                node.valid_actions.iter()
-                    .map(|&a| (a, node.prior_probs[a.to_action_index()]))
-                    .collect()
-            };
+        // For root nodes that need either Dirichlet noise blending or a
+        // softmax temperature != 1, allocate ONE owned buffer indexed by
+        // action.to_action_index() and apply both transforms in place.
+        // For all other nodes, read priors directly from
+        // `node.prior_probs` — no allocation needed.
+        // Reference: [Wu 2020, §2].
+        let needs_noise = is_root && self.root_noise.is_some();
+        let needs_softmax = is_root && (self.root_softmax_temp - 1.0).abs() > 1e-6;
+        let effective_buf: Option<Vec<f32>> = if needs_noise || needs_softmax {
+            let mut buf = node.prior_probs.clone();
 
-            // Step 2: apply softmax temperature.
-            if (self.root_softmax_temp - 1.0).abs() > 1e-6 {
-                let inv_temp = 1.0 / self.root_softmax_temp;
-                let raw: HashMap<E::Act, f32> = noisy
-                    .iter()
-                    .map(|(&a, &p)| (a, p.max(1e-30).powf(inv_temp)))
-                    .collect();
-                let sum: f32 = raw.values().sum();
-                raw.into_iter().map(|(a, p)| (a, p / sum)).collect()
-            } else {
-                noisy
+            if let Some(noise) = &self.root_noise {
+                let eps = self.root_noise_epsilon;
+                for &a in &node.valid_actions {
+                    let idx = a.to_action_index();
+                    let n = noise.get(&a).copied().unwrap_or(0.0);
+                    buf[idx] = (1.0 - eps) * node.prior_probs[idx] + eps * n;
+                }
+                let total: f32 = node.valid_actions.iter()
+                    .map(|&a| buf[a.to_action_index()])
+                    .sum();
+                if total > 0.0 {
+                    for &a in &node.valid_actions {
+                        buf[a.to_action_index()] /= total;
+                    }
+                }
             }
+
+            if needs_softmax {
+                let inv_temp = 1.0 / self.root_softmax_temp;
+                for &a in &node.valid_actions {
+                    let idx = a.to_action_index();
+                    buf[idx] = buf[idx].max(1e-30).powf(inv_temp);
+                }
+                let sum: f32 = node.valid_actions.iter()
+                    .map(|&a| buf[a.to_action_index()])
+                    .sum();
+                if sum > 0.0 {
+                    for &a in &node.valid_actions {
+                        buf[a.to_action_index()] /= sum;
+                    }
+                }
+            }
+            Some(buf)
         } else {
-            node.valid_actions.iter()
-                .map(|&a| (a, node.prior_probs[a.to_action_index()]))
-                .collect()
+            None
         };
 
-        let mut scores = HashMap::new();
+        // Score Vec indexed by action.to_action_index(). Invalid action
+        // slots stay at NEG_INFINITY so a downstream argmax over the
+        // dense Vec can never pick an invalid action.
+        let mut scores = vec![f32::NEG_INFINITY; node.num_actions];
 
-        for (&action, &prior) in &effective_priors {
+        for &action in &node.valid_actions {
             let idx = action.to_action_index();
-            let this_edge_visits = node.edge_visits.get(idx).copied().unwrap_or(0);
-            let num_virtual_losses = node.virtual_losses.get(idx).copied().unwrap_or(0);
+            let this_edge_visits = node.edge_visits[idx];
+            let num_virtual_losses = node.virtual_losses[idx];
             let adjusted_visits = this_edge_visits + num_virtual_losses;
-            let penalty = node.edge_penalties.get(idx).copied().unwrap_or(0.0);
+            let penalty = node.edge_penalties[idx];
+            let prior = match &effective_buf {
+                Some(buf) => buf[idx],
+                None => node.prior_probs[idx],
+            };
 
             // --- Forced playouts ---
             // If this root child is under-visited, force selection by returning ∞.
-            // Only applies during full (forced_playouts = true) searches to avoid wasting fast
-            // search playouts on exploratory moves.
+            // Only applies during full (forced_playouts = true) searches to avoid
+            // wasting fast search playouts on exploratory moves.
             // Reference: [Wu 2020, §3.2].
             if is_root && apply_forced && total_visits > 0 {
                 let n_forced = (self.k_forced * prior * total_visits as f32).sqrt();
                 if (this_edge_visits as f32) < n_forced {
-                    scores.insert(action, f32::INFINITY);
+                    scores[idx] = f32::INFINITY;
                     continue;
                 }
             }
@@ -562,7 +564,7 @@ impl<E: Environment> MCTS<E> {
             };
 
             let u_value = c_puct * prior * (sqrt_total / (1.0 + adjusted_visits as f32));
-            scores.insert(action, q_value + u_value);
+            scores[idx] = q_value + u_value;
         }
         scores
     }
@@ -575,7 +577,21 @@ impl<E: Environment> MCTS<E> {
         apply_forced: bool,
     ) -> Option<E::Act> {
         let scores = self.puct_scores(node_id, c_puct, is_root, apply_forced);
-        scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(action, _)| action)
+        if scores.is_empty() {
+            return None;
+        }
+        // Iterate valid_actions and look up dense scores. Invalid action
+        // slots are NEG_INFINITY, so a global argmax over the Vec would
+        // also work — but iterating valid_actions is cheaper at branching
+        // factor 251 with typically all-valid actions.
+        let node = self.get_node_immut(node_id)?;
+        node.valid_actions.iter()
+            .copied()
+            .max_by(|&a, &b| {
+                let sa = scores[a.to_action_index()];
+                let sb = scores[b.to_action_index()];
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     pub fn select_action(&self, node: &Node<E::Act>) -> Option<E::Act> {
@@ -845,7 +861,7 @@ impl<E: Environment> MCTS<E> {
             best.map(|(a, _)| a)?
         };
         let puct_best = puct_scores
-            .get(&best_action)
+            .get(best_action.to_action_index())
             .copied()
             .unwrap_or(f32::NEG_INFINITY);
 
@@ -1112,10 +1128,10 @@ mod tests {
         let scores_no_fpu = mcts.puct_scores(1, 1.0, false, false);
 
         assert!(
-            scores_fpu[&1u8] < scores_no_fpu[&1u8],
+            scores_fpu[1] < scores_no_fpu[1],
             "FPU should lower the Q-fallback for unvisited children: {} vs {}",
-            scores_fpu[&1u8],
-            scores_no_fpu[&1u8],
+            scores_fpu[1],
+            scores_no_fpu[1],
         );
     }
 
@@ -1130,7 +1146,7 @@ mod tests {
         let scores_no_fpu = mcts.puct_scores(1, 1.0, true, false);
 
         // Scores should be identical (within float precision).
-        let diff = (scores_root[&1u8] - scores_no_fpu[&1u8]).abs();
+        let diff = (scores_root[1] - scores_no_fpu[1]).abs();
         assert!(diff < 1e-5, "FPU should be inactive at root: diff = {}", diff);
     }
 
@@ -1148,11 +1164,11 @@ mod tests {
         mcts.root_id = Some(1);
 
         let scores = mcts.puct_scores(1, 1.0, true, true);
-        assert_eq!(scores[&1u8], f32::INFINITY, "under-visited root child should get ∞");
+        assert_eq!(scores[1], f32::INFINITY, "under-visited root child should get ∞");
 
         // With apply_forced = false, no infinity should appear.
         let scores_no_forced = mcts.puct_scores(1, 1.0, true, false);
-        assert!(scores_no_forced[&1u8].is_finite(), "forced playouts disabled — should be finite");
+        assert!(scores_no_forced[1].is_finite(), "forced playouts disabled — should be finite");
     }
 
     #[test]
@@ -1174,15 +1190,15 @@ mod tests {
 
         // Flatter prior → lower score for action 0 (dominant prior shaved down).
         assert!(
-            scores_t2[&0u8] < scores_t1[&0u8],
+            scores_t2[0] < scores_t1[0],
             "higher temperature should reduce score for dominant action: {} vs {}",
-            scores_t2[&0u8], scores_t1[&0u8]
+            scores_t2[0], scores_t1[0]
         );
         // Flatter prior → higher score for action 1 (minority prior boosted).
         assert!(
-            scores_t2[&1u8] > scores_t1[&1u8],
+            scores_t2[1] > scores_t1[1],
             "higher temperature should increase score for minority action: {} vs {}",
-            scores_t2[&1u8], scores_t1[&1u8]
+            scores_t2[1], scores_t1[1]
         );
     }
 
