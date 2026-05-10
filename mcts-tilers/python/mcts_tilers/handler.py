@@ -154,6 +154,24 @@ _RAW_ORI_TO_TOKEN: dict[int, int] = {
 }
 
 
+# Orientation token lookup table; built once at module import. Maps the raw
+# orientation byte (0..255) to its board-vocabulary token. Default for
+# unrecognised values is 1 (matches the dict.get default in the original).
+_ORI_LUT = np.full(256, 1, dtype=np.int32)
+for _raw, _tok in _RAW_ORI_TO_TOKEN.items():
+    _ORI_LUT[_raw] = _tok
+
+# Single-qubit opcode → board-vocabulary token. Default 1 for unmapped.
+_OPCODE_LUT_SIZE = max(
+    max(_RAW_OPCODE_TO_TOKEN.keys()),
+    _RAW_CX_OPCODE,
+    _RAW_CZ_OPCODE,
+) + 1
+_OPCODE_LUT = np.full(_OPCODE_LUT_SIZE, 1, dtype=np.int32)
+for _raw, _tok in _RAW_OPCODE_TO_TOKEN.items():
+    _OPCODE_LUT[_raw] = _tok
+
+
 def build_boards(
     qubit_ids: np.ndarray,         # (total, max_nq) i32
     qubit_oris: np.ndarray,        # (total, max_nq) u8
@@ -171,12 +189,23 @@ def build_boards(
         boards: (total, max_nl, max_nq, 4) int32
             per-cell = (op, ori, mate_row, mate_col)
             padded cells remain zeros.
+
+    Behavior pinned by tests/test_build_boards.py — the reference there is
+    the literal pre-vectorization implementation. Any change to this
+    function must keep that test green on every random seed. The hot loops
+    (per-qubit board writes, orientation lookup) are vectorised; the
+    per-objective obj_map dict build remains scalar because of the
+    last-write-wins collision semantics on duplicate arg0 keys.
     """
     total = qubit_ids.shape[0]
     max_nq = qubit_ids.shape[1]
     max_nl = len(obj_layers)
+    ldv_max = last_dir_vertical.shape[1]
 
     boards = np.zeros((total, max_nl, max_nq, 4), dtype=np.int32)
+
+    # Vectorised orientation token lookup for the whole batch at once.
+    ori_tokens_all = _ORI_LUT[qubit_oris]  # (total, max_nq) i32
 
     for i in range(total):
         nq = int(num_qubits[i])
@@ -185,68 +214,97 @@ def build_boards(
         if nq <= 0 or w <= 0:
             continue
 
-        # qid -> (row, col)
+        active_qids = qubit_ids[i, :nq]
+        ori_active = ori_tokens_all[i, :nq]
+
+        # qid → (row, col). Dict (not array) because qids can be negative
+        # and unbounded; iteration order is preserved so collisions resolve
+        # to the last position (matches reference).
         pos_map: dict[int, tuple[int, int]] = {}
         for j in range(nq):
-            qid = int(qubit_ids[i, j])
-            row, col = divmod(j, w)
-            pos_map[qid] = (row, col)
+            pos_map[int(active_qids[j])] = (j // w, j % w)
+
+        # Precompute the ancilla mask + indices for this instance, used by
+        # every layer below.
+        neg_mask = active_qids < 0
+        ancilla_idx_all = -(active_qids.astype(np.int64) + 1)
 
         for l in range(min(nl, max_nl)):
             no = int(num_objectives[i, l])
-            layer_data = obj_layers[l]
 
-            # qid -> (op, mate_row, mate_col)
+            # Build obj_map dict. This is the per-objective scalar loop;
+            # it's small (no <= ~250) and last-write-wins semantics on
+            # duplicate arg0 require ordered scalar writes.
             obj_map: dict[int, tuple[int, int, int]] = {}
+            if no > 0:
+                layer_data = obj_layers[l]
+                op_arr = layer_data["opcodes"][i]
+                a0_arr = layer_data["arg0s"][i]
+                a1_arr = layer_data["arg1s"][i]
+                for k in range(no):
+                    opcode = int(op_arr[k])
+                    arg0 = int(a0_arr[k])
+                    arg1 = int(a1_arr[k])
 
-            for k in range(no):
-                opcode = int(layer_data["opcodes"][i, k])
-                arg0 = int(layer_data["arg0s"][i, k])
-                arg1 = int(layer_data["arg1s"][i, k])
+                    if opcode == _RAW_CZ_OPCODE:
+                        if arg0 in pos_map and arg1 in pos_map:
+                            r0, c0 = pos_map[arg0]
+                            r1, c1 = pos_map[arg1]
+                            obj_map[arg0] = (_TOKEN_CZ_CONTROL, r1, c1)
+                            obj_map[arg1] = (_TOKEN_CZ_TARGET, r0, c0)
+                    elif opcode == _RAW_CX_OPCODE:
+                        if arg0 in pos_map and arg1 in pos_map:
+                            r0, c0 = pos_map[arg0]
+                            r1, c1 = pos_map[arg1]
+                            obj_map[arg0] = (_TOKEN_CX_CONTROL, r1, c1)
+                            obj_map[arg1] = (_TOKEN_CX_TARGET, r0, c0)
+                    else:
+                        token = _OPCODE_LUT[opcode] if 0 <= opcode < _OPCODE_LUT_SIZE else 1
+                        obj_map[arg0] = (int(token), -1, -1)
 
-                if opcode == _RAW_CZ_OPCODE:
-                    if arg0 in pos_map and arg1 in pos_map:
-                        r0, c0 = pos_map[arg0]
-                        r1, c1 = pos_map[arg1]
-                        obj_map[arg0] = (_TOKEN_CZ_CONTROL, r1, c1)
-                        obj_map[arg1] = (_TOKEN_CZ_TARGET, r0, c0)
-                elif opcode == _RAW_CX_OPCODE:
-                    if arg0 in pos_map and arg1 in pos_map:
-                        r0, c0 = pos_map[arg0]
-                        r1, c1 = pos_map[arg1]
-                        obj_map[arg0] = (_TOKEN_CX_CONTROL, r1, c1)
-                        obj_map[arg1] = (_TOKEN_CX_TARGET, r0, c0)
-                else:
-                    token = _RAW_OPCODE_TO_TOKEN.get(opcode, 1)
-                    obj_map[arg0] = (token, -1, -1)
+            # Vectorised per-qubit write. Three branches by priority:
+            #   1. qid in obj_map → (op, looked-up-ori, mate_row, mate_col)
+            #   2. qid < 0 (ancilla) and not in obj_map → (13-qid, ori w/ 6→7, -1, -1)
+            #   3. else → (1, 1, -1, -1)  [hardcoded ori=1 in default branch]
+            ops = np.ones(nq, dtype=np.int32)
+            oris_out = np.ones(nq, dtype=np.int32)  # default branch ori=1
+            mate_rows = np.full(nq, -1, dtype=np.int32)
+            mate_cols = np.full(nq, -1, dtype=np.int32)
+            obj_mask = np.zeros(nq, dtype=bool)
 
-            for j in range(nq):
-                qid = int(qubit_ids[i, j])
-                ori_token = _RAW_ORI_TO_TOKEN.get(int(qubit_oris[i, j]), 1)
+            if obj_map:
+                for qid, (op_v, mr_v, mc_v) in obj_map.items():
+                    js = np.where(active_qids == qid)[0]
+                    if js.size > 0:
+                        ops[js] = op_v
+                        oris_out[js] = ori_active[js]  # looked-up ori for obj branch
+                        mate_rows[js] = mr_v
+                        mate_cols[js] = mc_v
+                        obj_mask[js] = True
 
-                if qid in obj_map:
-                    op, mate_row, mate_col = obj_map[qid]
-                    boards[i, l, j, 0] = op
-                    boards[i, l, j, 1] = ori_token
-                    boards[i, l, j, 2] = mate_row
-                    boards[i, l, j, 3] = mate_col
-                elif qid < 0:
-                    ancilla_idx = -(qid + 1)
-                    if (
-                        ori_token == 6
-                        and ancilla_idx < last_dir_vertical.shape[1]
-                        and last_dir_vertical[i, ancilla_idx]
-                    ):
-                        ori_token = 7
-                    boards[i, l, j, 0] = 13 - qid  # -1..-50 -> 14..63
-                    boards[i, l, j, 1] = ori_token
-                    boards[i, l, j, 2] = -1
-                    boards[i, l, j, 3] = -1
-                else:
-                    boards[i, l, j, 0] = 1
-                    boards[i, l, j, 1] = 1
-                    boards[i, l, j, 2] = -1
-                    boards[i, l, j, 3] = -1
+            anc_mask = neg_mask & ~obj_mask
+            if anc_mask.any():
+                anc_qids = active_qids[anc_mask]
+                ops[anc_mask] = 13 - anc_qids  # -1→14, etc
+                # Ancilla branch keeps the looked-up ori, with possible 6→7
+                # transition when the corresponding last_dir_vertical bit is set.
+                anc_ori = ori_active[anc_mask].copy()
+                anc_idx = ancilla_idx_all[anc_mask]
+                # The transition only fires when ori==6 AND ancilla_idx is in
+                # range AND the ldv bit at that index is True.
+                cand = (anc_ori == 6) & (anc_idx >= 0) & (anc_idx < ldv_max)
+                if cand.any():
+                    cand_idx = anc_idx[cand].astype(np.intp)
+                    ldv_bits = last_dir_vertical[i, cand_idx]
+                    fires = np.zeros_like(cand)
+                    fires[cand] = ldv_bits
+                    anc_ori[fires] = 7
+                oris_out[anc_mask] = anc_ori
+
+            boards[i, l, :nq, 0] = ops
+            boards[i, l, :nq, 1] = oris_out
+            boards[i, l, :nq, 2] = mate_rows
+            boards[i, l, :nq, 3] = mate_cols
 
     return boards
 
