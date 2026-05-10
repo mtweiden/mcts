@@ -2,6 +2,7 @@ use crate::node::{Node, NodeId};
 use crate::environment::Environment;
 use crate::inference::InferenceClient;
 use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 
 /// ----------------------------------------------------------------------------
@@ -26,7 +27,12 @@ pub struct MCTS<E: Environment> {
     /// The NodeId of the current root of the search tree.
     pub root_id: Option<NodeId>,
     /// Arena-style storage for all nodes.
-    pub transposition_table: HashMap<NodeId, usize>,
+    /// FxHashMap (linear-probing, FxHash) instead of std HashMap (SipHash)
+    /// because NodeId is already a hash (random 64-bit u64) — running it
+    /// through SipHash a second time is wasted work. Profiling showed
+    /// transposition_table lookups in `puct_scores` and `select_leaf` were
+    /// a meaningful fraction of MCTS step time at branching factor ≥ 100.
+    pub transposition_table: FxHashMap<NodeId, usize>,
     pub nodes: Vec<Node<E::Act>>,
     pub batch_size: usize,
 
@@ -90,7 +96,7 @@ impl<E: Environment> MCTS<E> {
     pub fn new(batch_size: usize) -> Self {
         Self {
             root_id: None,
-            transposition_table: HashMap::new(),
+            transposition_table: FxHashMap::default(),
             nodes: Vec::new(),
             batch_size,
             c_fpu: 0.2,
@@ -274,7 +280,8 @@ impl<E: Environment> MCTS<E> {
 
             // Rebuild the arena keeping only reachable nodes, and remap indices.
             let mut nodes_after_pruning: Vec<Node<E::Act>> = Vec::with_capacity(reachable.len());
-            let mut table_after_pruning: HashMap<NodeId, usize> = HashMap::with_capacity(reachable.len());
+            let mut table_after_pruning: FxHashMap<NodeId, usize> =
+                FxHashMap::with_capacity_and_hasher(reachable.len(), Default::default());
             for node in self.nodes.drain(..) {
                 if reachable.contains(&node.id) {
                     let new_idx = nodes_after_pruning.len();
