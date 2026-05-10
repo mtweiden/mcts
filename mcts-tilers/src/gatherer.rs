@@ -81,6 +81,13 @@ pub struct Gatherer {
     no_resign_rate: f32,
     /// If set, winning trajectories are written here as pretraining data.
     trajectory_dir: Option<String>,
+    /// If set, the gatherer writes one JSON line per episode summarising
+    /// the per-step root-Q trace plus the final outcome. This is the data
+    /// needed to calibrate `resign_value_threshold` AGZ-style: pick the
+    /// threshold T such that on the no-resign sanity sample (where
+    /// `resign_allowed = false`), no more than 5% of episodes that would
+    /// have resigned at T actually went on to win.
+    resignation_log_dir: Option<String>,
 }
 
 impl Gatherer {
@@ -100,6 +107,7 @@ impl Gatherer {
         resign_value_threshold: Option<f32>,
         resign_consecutive_moves: Option<usize>,
         no_resign_rate: Option<f32>,
+        resignation_log_dir: Option<String>,
     ) -> Self {
         Self {
             batch_size,
@@ -126,6 +134,7 @@ impl Gatherer {
             resign_consecutive_moves: resign_consecutive_moves.unwrap_or(5),
             no_resign_rate: no_resign_rate.unwrap_or(0.1),
             trajectory_dir,
+            resignation_log_dir,
         }
     }
 
@@ -325,6 +334,14 @@ impl Gatherer {
             resignation_enabled && rng.random::<f32>() >= self.no_resign_rate;
         let mut low_value_streak: usize = 0;
 
+        // Per-step traces for resignation-threshold calibration. Only
+        // collected when `resignation_log_dir` is set; size is bounded by
+        // max_actions which is O(reference_actions × 1.2). Cleared at the
+        // start of every episode.
+        let mut q_trace: Vec<f32> = Vec::new();
+        let mut over_solver_trace: Vec<bool> = Vec::new();
+        let mut resigned: bool = false;
+
         let temperature = self.reward_saturation_temperature;
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() { -1.0 } else {
@@ -373,10 +390,18 @@ impl Gatherer {
             // budget. Both conditions reset the streak when violated;
             // resignation only fires after the streak hits the
             // configured length.
+            // Always capture root.value + over-solver state (cheap), even
+            // when resignation_enabled is false, so the calibration log
+            // can compute counterfactuals across any threshold.
+            let q = root.value;
+            let current_depth = tilers_env.inner.depth(true, true) as f32;
+            let over_solver = current_depth > reference_depth;
+            if self.resignation_log_dir.is_some() {
+                q_trace.push(q);
+                over_solver_trace.push(over_solver);
+            }
+
             if resignation_enabled {
-                let q = root.value;
-                let current_depth = tilers_env.inner.depth(true, true) as f32;
-                let over_solver = current_depth > reference_depth;
                 if q <= self.resign_value_threshold && over_solver {
                     low_value_streak += 1;
                 } else {
@@ -390,6 +415,7 @@ impl Gatherer {
                         self.gather_id, step, q, current_depth as i32,
                         reference_depth as i32, low_value_streak,
                     );
+                    resigned = true;
                     break;
                 }
             }
@@ -449,13 +475,71 @@ impl Gatherer {
         tilers_env.inner.set_cultivation_time(10);
         let solution_depth = tilers_env.inner.depth(true, true);
 
-        let score: f32 = if tilers_env.inner.done() && reference_depth > solution_depth {
-            1.0
-        } else if tilers_env.inner.done() && (reference_depth - solution_depth).abs() < 1e-3 {
-            0.0
-        } else {
+        // Must match `terminal_evaluator` above so recorded value targets
+        // match the leaf evaluations MCTS used during the producing search.
+        let score: f32 = if !tilers_env.inner.done() {
             -1.0
+        } else {
+            let d = solution_depth as f32;
+            let ref_d = reference_depth as f32;
+            let ratio = (ref_d - d) / (ref_d + 1e-6);
+            (ratio / self.reward_saturation_temperature).tanh()
         };
+
+        // Resignation calibration log (one JSON line per episode).
+        // The no-resign sample (resign_allowed=false) provides the
+        // ground truth for false-positive analysis: any episode whose
+        // q_per_step would have triggered resignation at threshold T
+        // but went on to win at the natural terminal is a false
+        // positive at T. Sweep T post-hoc from this data to pick the
+        // strictest threshold whose FP rate stays below 5%.
+        if let Some(dir) = &self.resignation_log_dir {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                eprintln!(
+                    "[Gatherer {}] failed to create resignation_log_dir {}: {}",
+                    self.gather_id, dir, e,
+                );
+            } else {
+                let filename = format!("{}/resignation_{}.jsonl", dir, self.gather_id);
+                match std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&filename)
+                {
+                    Ok(mut f) => {
+                        let record = json!({
+                            "gather_id": self.gather_id,
+                            "h": env.height,
+                            "w": env.width,
+                            "num_ancillas": env.num_ancillas(),
+                            "num_objectives": env.num_objectives(),
+                            "reference_depth": reference_depth,
+                            "final_depth": solution_depth,
+                            "final_score": score,
+                            "done": tilers_env.inner.done(),
+                            "resign_allowed": resign_allowed,
+                            "resignation_enabled": resignation_enabled,
+                            "resigned": resigned,
+                            "resign_threshold_in_use": self.resign_value_threshold,
+                            "resign_consecutive_moves_in_use": self.resign_consecutive_moves,
+                            "num_steps": q_trace.len(),
+                            "q_per_step": q_trace,
+                            "over_solver_per_step": over_solver_trace,
+                        });
+                        if let Err(e) = writeln!(f, "{}", record) {
+                            eprintln!(
+                                "[Gatherer {}] failed to write resignation log line: {}",
+                                self.gather_id, e,
+                            );
+                        }
+                    }
+                    Err(e) => eprintln!(
+                        "[Gatherer {}] failed to open resignation log {}: {}",
+                        self.gather_id, filename, e,
+                    ),
+                }
+            }
+        }
 
         // Write the full trajectory to trajectory_dir if we found a win.
         if score > 0.0 {
@@ -604,6 +688,7 @@ use pyo3::exceptions::PyRuntimeError;
     resign_value_threshold = -0.9,
     resign_consecutive_moves = 5,
     no_resign_rate = 0.1,
+    resignation_log_dir = None,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -628,6 +713,7 @@ pub fn run_gatherer(
     resign_value_threshold: f32,
     resign_consecutive_moves: usize,
     no_resign_rate: f32,
+    resignation_log_dir: Option<String>,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let num_objective_layers = DEFAULT_LOOKAHEAD;
@@ -660,6 +746,7 @@ pub fn run_gatherer(
         Some(resign_value_threshold),
         Some(resign_consecutive_moves),
         Some(no_resign_rate),
+        resignation_log_dir,
     );
 
     let mut rng = if let Some(s) = seed {
@@ -735,6 +822,7 @@ mod tests {
             Some(2.0),            // resign_value_threshold (>1.0 disables)
             Some(0),              // resign_consecutive_moves (0 disables)
             Some(0.0),            // no_resign_rate
+            None,                 // resignation_log_dir
         )
     }
 
@@ -744,7 +832,7 @@ mod tests {
     fn test_new_sets_explicit_reward_saturation_temperature() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1,
-            None, Some(0.3), Some(100), None, None, None,
+            None, Some(0.3), Some(100), None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
         assert_eq!(g.mcts_steps, 10);
@@ -757,7 +845,7 @@ mod tests {
         // default (reward_ratio_limit = 0.3 → slope 1/0.3); see Gatherer::new.
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
     }
@@ -766,7 +854,7 @@ mod tests {
     fn test_new_defaults_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None,
+            None, None, None, None, None, None, None,
         );
         assert!((g.resign_value_threshold - (-0.9)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 5);
@@ -777,7 +865,7 @@ mod tests {
     fn test_new_sets_explicit_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, Some(-0.5), Some(8), Some(0.2),
+            None, None, None, Some(-0.5), Some(8), Some(0.2), None,
         );
         assert!((g.resign_value_threshold - (-0.5)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 8);
@@ -986,6 +1074,7 @@ mod tests {
             1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0,
             None, Some(1.0), None,
             Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
+            None,                            // resignation_log_dir
         );
 
         let mut env = TilersEnvInner::new(3, 3, 1);
