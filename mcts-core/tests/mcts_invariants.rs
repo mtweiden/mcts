@@ -104,6 +104,8 @@ impl Environment for WideEnv {
         }
     }
 
+    fn num_actions(&self) -> usize { self.num_actions as usize }
+
     fn hash(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();
         self.history.hash(&mut h);
@@ -388,15 +390,15 @@ fn test_recompute_value_is_visit_plus_one_weighted_average() {
     //   no virtual losses
     // Expected parent.value = (0.0 + 4×0.6 + 6×-0.2) / (1 + 10) = 1.2 / 11
     let mut mcts: MCTS<WideEnv> = MCTS::new(4);
-    let mut parent = Node::new(HashMap::from([(0u32, 0.5), (1u32, 0.5)]), 0.0, 100, None);
+    let mut parent = Node::new(2, HashMap::from([(0u32, 0.5), (1u32, 0.5)]), 0.0, 100, None);
     parent.children.insert(0, 200);
     parent.children.insert(1, 300);
     parent.edge_visits.insert(0, 4);
     parent.edge_visits.insert(1, 6);
     parent.node_visits = 10;
-    let mut child_a = Node::new(HashMap::from([(0u32, 1.0)]), 0.6, 200, None);
+    let mut child_a = Node::new(1, HashMap::from([(0u32, 1.0)]), 0.6, 200, None);
     child_a.value = 0.6;
-    let mut child_b = Node::new(HashMap::from([(0u32, 1.0)]), -0.2, 300, None);
+    let mut child_b = Node::new(1, HashMap::from([(0u32, 1.0)]), -0.2, 300, None);
     child_b.value = -0.2;
 
     mcts.insert_node(100, parent);
@@ -441,7 +443,7 @@ fn test_perturb_root_prior_mixes_correctly_in_puct_scores() {
         (1u32, 0.3),
         (2u32, 0.2),
     ]);
-    let node = Node::new(priors, 0.0, 1, None);
+    let node = Node::new(3, priors, 0.0, 1, None);
     mcts.insert_node(1, node);
     mcts.root_id = Some(1);
     mcts.root_softmax_temp = 1.0;  // disable softmax to make math clean
@@ -538,6 +540,8 @@ impl Environment for ShrinkingEnv {
     fn valid_actions(&self) -> Vec<u32> {
         if self.done() { vec![] } else { (0..self.current_num_actions()).collect() }
     }
+
+    fn num_actions(&self) -> usize { self.current_num_actions() as usize }
 
     fn hash(&self) -> u64 {
         let mut h = std::collections::hash_map::DefaultHasher::new();

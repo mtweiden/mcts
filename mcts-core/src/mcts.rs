@@ -314,7 +314,7 @@ impl<E: Environment> MCTS<E> {
         let node = if env.done() {
             Node::new_terminal(node_id, value, repr)
         } else {
-            Node::new(priors, value.clamp(-1.0, 1.0), node_id, repr)
+            Node::new(env.num_actions(), priors, value.clamp(-1.0, 1.0), node_id, repr)
         };
         self.insert_node(node_id, node);
         node_id
@@ -940,6 +940,8 @@ pub mod test_env {
             }
         }
 
+        fn num_actions(&self) -> usize { 2 }
+
         fn done(&self) -> bool {
             self.position == self.target
         }
@@ -996,7 +998,7 @@ mod tests {
     fn test_insert_and_get_node() {
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let priors = HashMap::from([(0u8, 0.5), (1u8, 0.5)]);
-        let node = Node::new(priors, 0.42, 1, None);
+        let node = Node::new(2, priors, 0.42, 1, None);
         mcts.insert_node(1, node);
         let node = mcts.get_node_immut(1).unwrap();
         assert!((node.value - 0.42).abs() < 1e-6);
@@ -1024,7 +1026,7 @@ mod tests {
     /// Parent value = 0.5.
     fn build_fpu_node() -> MCTS<NumberLineEnv> {
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
-        let node = Node::new(HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.5, 1, None);
+        let node = Node::new(2, HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.5, 1, None);
         mcts.insert_node(1, node);
         if let Some(n) = mcts.get_node_mut(1) {
             *n.edge_visits.entry(0).or_insert(0) = 1;
@@ -1073,7 +1075,7 @@ mod tests {
         // n_forced(action 1) = √(2.0 × 0.4 × 11) ≈ 2.97
         // Action 1 has only 1 visit, so it should receive INFINITY.
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
-        let node = Node::new(HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.0, 1, None);
+        let node = Node::new(2, HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.0, 1, None);
         mcts.insert_node(1, node);
         if let Some(n) = mcts.get_node_mut(1) {
             *n.edge_visits.entry(0).or_insert(0) = 10;
@@ -1096,7 +1098,7 @@ mod tests {
         // to T = 1.0 (identity).
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         // Strongly skewed prior: action 0 = 0.9, action 1 = 0.1.
-        let node = Node::new(HashMap::from([(0u8, 0.9), (1u8, 0.1)]), 0.0, 1, None);
+        let node = Node::new(2, HashMap::from([(0u8, 0.9), (1u8, 0.1)]), 0.0, 1, None);
         mcts.insert_node(1, node);
         mcts.root_id = Some(1);
 
@@ -1169,15 +1171,15 @@ mod tests {
         let (root_id, child_a_id, child_b_id, grandchild_id): (NodeId, NodeId, NodeId, NodeId) =
             (10, 20, 30, 40);
 
-        let mut root = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
+        let mut root = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
         root.children.insert(0, child_a_id);
         root.children.insert(1, child_b_id);
 
-        let mut child_a = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
+        let mut child_a = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
         child_a.children.insert(0, grandchild_id);
 
-        let child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
-        let grandchild = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, grandchild_id, None);
+        let child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        let grandchild = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, grandchild_id, None);
 
         mcts.insert_node(root_id, root);
         mcts.insert_node(child_a_id, child_a);
@@ -1227,17 +1229,17 @@ mod tests {
         let (root_id, child_a_id, child_b_id, shared_id): (NodeId, NodeId, NodeId, NodeId) =
             (10, 20, 30, 40);
 
-        let mut root = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
+        let mut root = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
         root.children.insert(0, child_a_id);
         root.children.insert(1, child_b_id);
 
-        let mut child_a = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
+        let mut child_a = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
         child_a.children.insert(0, shared_id);
 
-        let mut child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        let mut child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
         child_b.children.insert(0, shared_id);
 
-        let shared = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, shared_id, None);
+        let shared = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, shared_id, None);
 
         mcts.insert_node(root_id, root);
         mcts.insert_node(child_a_id, child_a);
@@ -1264,13 +1266,13 @@ mod tests {
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let (root_id, child_a_id, child_b_id): (NodeId, NodeId, NodeId) = (10, 20, 30);
 
-        let mut root = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, root_id, None);
+        let mut root = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, root_id, None);
         root.children.insert(0, child_a_id);
 
-        let mut child_a = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, child_a_id, None);
+        let mut child_a = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, child_a_id, None);
         child_a.children.insert(1, child_b_id);
 
-        let mut child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        let mut child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
         child_b.children.insert(0, child_a_id); // back-edge
 
         mcts.insert_node(root_id, root);

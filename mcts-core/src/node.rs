@@ -5,9 +5,22 @@ use crate::environment::Act;
 pub type NodeId = u64;
 
 /// A single node in the MCTS graph.
+///
+/// `num_actions` is the size of the action space at this node's state —
+/// stored explicitly so the planned dense-Vec storage of per-edge data
+/// (priors, visits, virtual_losses, penalties, children) has a known
+/// length without re-querying the env. Action ids in this node are
+/// scoped to `[0, num_actions)`; the same numeric id may mean different
+/// things in another node's state.
+///
+/// At step 2 of the dense-Vec refactor `num_actions` is set but unused
+/// at runtime (per-edge data is still HashMap-backed). It will become
+/// load-bearing in step 3 onward when each per-edge HashMap is replaced
+/// with `Vec<T>` of length `num_actions`.
 #[derive(Clone)]
 pub struct Node<A: Act> {
     pub id: NodeId,
+    pub num_actions: usize,
     pub prior_probs: HashMap<A, f32>,
     pub value_estimate: f32,
     pub node_visits: usize,
@@ -22,6 +35,7 @@ pub struct Node<A: Act> {
 
 impl<A: Act> Node<A> {
     pub fn new(
+        num_actions: usize,
         prior_probs: HashMap<A, f32>,
         value: f32,
         id: NodeId,
@@ -38,6 +52,7 @@ impl<A: Act> Node<A> {
         }
         Self {
             id,
+            num_actions,
             prior_probs,
             value_estimate: value,
             node_visits: 0,
@@ -54,6 +69,9 @@ impl<A: Act> Node<A> {
     pub fn new_terminal(id: NodeId, value: f32, repr: Option<String>) -> Self {
         Self {
             id,
+            // Terminal nodes have no outgoing actions; size 0 is a
+            // sentinel that prevents any accidental dense indexing.
+            num_actions: 0,
             prior_probs: HashMap::new(),
             value_estimate: value,
             node_visits: 0,
@@ -111,8 +129,9 @@ mod tests {
         let mut priors: HashMap<u16, f32> = HashMap::new();
         priors.insert(0 as u16, 0.5);
         priors.insert(1 as u16, 0.5);
-        let node = Node::new(priors.clone(), 0.0, 1, None);
+        let node = Node::new(2, priors.clone(), 0.0, 1, None);
         assert_eq!(node.id, 1);
+        assert_eq!(node.num_actions, 2);
         assert_eq!(node.prior_probs, priors);
         assert_eq!(node.value_estimate, 0.0);
         assert_eq!(node.node_visits, 0);

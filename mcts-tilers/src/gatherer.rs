@@ -970,7 +970,7 @@ mod tests {
         let priors: HashMap<Action, f32> = valid.iter()
             .map(|&a| (a as Action, 1.0 / valid.len() as f32))
             .collect();
-        let node = Node::new(priors, 0.0, 0, None);
+        let node = Node::new(env.num_actions(), priors, 0.0, 0, None);
 
         let mut rng = StdRng::seed_from_u64(42);
         let action = g.select_action(&node, &env, 50, &mut rng);
@@ -987,7 +987,7 @@ mod tests {
         let priors: HashMap<Action, f32> = valid.iter()
             .map(|&a| (a as Action, 1.0 / valid.len() as f32))
             .collect();
-        let mut node = Node::new(priors, 0.0, 0, None);
+        let mut node = Node::new(env.num_actions(), priors, 0.0, 0, None);
         let dominant = valid[0] as Action;
         node.edge_visits.insert(dominant, 100_000);
 

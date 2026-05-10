@@ -97,6 +97,10 @@ impl Environment for TilersEnv {
         self.inner.valid_actions().into_iter().map(|a| a as u16).collect()
     }
 
+    fn num_actions(&self) -> usize {
+        self.inner.num_actions()
+    }
+
     fn hash(&self) -> u64 {
         self.inner.hash_state()
     }
