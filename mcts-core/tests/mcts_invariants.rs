@@ -478,6 +478,229 @@ fn test_perturb_root_prior_mixes_correctly_in_puct_scores() {
 }
 
 // ============================================================================
+// Variable action space: shrinking-on-step env
+// ============================================================================
+//
+// Tilers' real action space changes within an episode (ancilla operations
+// can add or remove valid actions). The dense-Vec refactor's per-Node
+// `num_actions` field has to track each node's own state, not inherit
+// from the parent. These tests pin the contract by using a synthetic env
+// whose action space shrinks by 1 each step.
+//
+// Bug shapes the tests would catch in the refactor:
+//   - Sizing a child's Vecs from the parent's num_actions.
+//   - Carrying parent's edge_visits / prior_probs into a child.
+//   - advance_root leaving the new root with stale per-edge data sized
+//     to the old root's action space.
+//   - Treating action ID `k` as the same action across two states with
+//     different valid_actions sets.
+
+#[derive(Clone, Debug)]
+pub struct ShrinkingEnv {
+    pub max_actions: u32,
+    pub depth: u32,
+    pub max_depth: u32,
+    pub history: Vec<u32>,
+    pub state_offset: u64,
+}
+
+impl ShrinkingEnv {
+    pub fn new(max_actions: u32, max_depth: u32) -> Self {
+        assert!(max_actions >= 2);
+        assert!(max_depth < max_actions, "max_depth must be < max_actions so action space stays >= 2");
+        Self { max_actions, depth: 0, max_depth, history: Vec::new(), state_offset: 0 }
+    }
+
+    pub fn current_num_actions(&self) -> u32 {
+        // Action space = max_actions at depth 0, decreasing by 1 each step.
+        // Floored at 2 so search always has work to do.
+        ((self.max_actions as i32) - (self.depth as i32)).max(2) as u32
+    }
+}
+
+impl Environment for ShrinkingEnv {
+    type Act = u32;
+    type Obs = WideObs;
+
+    fn step(&mut self, action: u32) {
+        self.history.push(action);
+        self.depth += 1;
+    }
+
+    fn done(&self) -> bool {
+        self.depth >= self.max_depth
+    }
+
+    fn observation(&self) -> WideObs {
+        WideObs { state_hash: self.hash(), valid: self.valid_actions() }
+    }
+
+    fn valid_actions(&self) -> Vec<u32> {
+        if self.done() { vec![] } else { (0..self.current_num_actions()).collect() }
+    }
+
+    fn hash(&self) -> u64 {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.history.hash(&mut h);
+        self.state_offset.hash(&mut h);
+        h.finish()
+    }
+
+    fn render(&self) -> String {
+        format!("ShrinkingEnv(depth={}, history={:?})", self.depth, self.history)
+    }
+}
+
+impl InferenceClient<ShrinkingEnv> for DeterministicClient {
+    fn infer(
+        &self,
+        observations: &[WideObs],
+    ) -> Result<(Vec<HashMap<u32, f32>>, Vec<f32>)> {
+        // Identical body to the WideEnv impl — both envs share WideObs.
+        let mut priors = Vec::with_capacity(observations.len());
+        let mut values = Vec::with_capacity(observations.len());
+        for obs in observations {
+            let raw: Vec<f32> = obs.valid.iter()
+                .map(|&a| pseudo_random_f32(obs.state_hash, a) + 0.01)
+                .collect();
+            let total: f32 = raw.iter().sum();
+            let mut prior = HashMap::with_capacity(obs.valid.len());
+            for (&a, &p) in obs.valid.iter().zip(raw.iter()) {
+                prior.insert(a, p / total);
+            }
+            priors.push(prior);
+            values.push((pseudo_random_f32(obs.state_hash, u32::MAX) * 2.0 - 1.0).clamp(-1.0, 1.0));
+        }
+        Ok((priors, values))
+    }
+}
+
+#[test]
+fn test_search_visits_only_valid_actions_in_shrinking_env() {
+    // Walk the principal-variation path from the root, querying the env
+    // at each step. At every node along the way, every action with a
+    // visit count must be valid in that node's state — i.e. action id <
+    // current_num_actions(). A refactor that sized a child's Vec from
+    // the parent's num_actions could let stale-larger action ids leak
+    // into edge_visits at the child; this test catches that.
+    let env_init = ShrinkingEnv::new(20, 8);
+    let client = DeterministicClient;
+    let mut mcts: MCTS<ShrinkingEnv> = MCTS::new(8);
+    let evaluator = |e: &ShrinkingEnv| if e.done() { 0.5 } else { 0.0 };
+    mcts.run(&env_init, &client, 400, 1.4, &evaluator, false);
+
+    let mut env = env_init.clone();
+    let mut current = mcts.root_id.unwrap();
+    let mut steps_walked = 0;
+    loop {
+        let n = match mcts.get_node_immut(current) { Some(n) => n, None => break };
+        let bound = env.current_num_actions();
+        for (&a, &v) in &n.edge_visits {
+            if v > 0 {
+                assert!(a < bound,
+                    "node at depth {} has visit {} for action {} but current_num_actions = {}",
+                    env.depth, v, a, bound);
+            }
+        }
+        // Walk to the most-visited child to keep going.
+        let best = n.edge_visits.iter()
+            .filter(|&(_, &v)| v > 0)
+            .max_by_key(|&(_, &v)| v)
+            .map(|(&a, _)| a);
+        match best {
+            Some(a) => {
+                if let Some(&cid) = n.children.get(&a) {
+                    env.step(a);
+                    current = cid;
+                    steps_walked += 1;
+                    if steps_walked > 20 { break; }
+                } else {
+                    break;
+                }
+            }
+            None => break,
+        }
+    }
+    assert!(steps_walked >= 1, "search did not expand past the root");
+}
+
+#[test]
+fn test_advance_root_into_smaller_action_space() {
+    // After advance_root from depth-0 (action space = max_actions) to a
+    // depth-1 child (action space = max_actions - 1), the new root's
+    // edge_visits must only mention actions valid at depth 1.
+    let env = ShrinkingEnv::new(20, 6);
+    let client = DeterministicClient;
+    let mut mcts: MCTS<ShrinkingEnv> = MCTS::new(8);
+    let evaluator = |e: &ShrinkingEnv| if e.done() { 0.5 } else { 0.0 };
+    mcts.run(&env, &client, 400, 1.4, &evaluator, false);
+
+    let root = mcts.root_id.unwrap();
+    let best_action = mcts.get_node_immut(root).unwrap()
+        .edge_visits.iter()
+        .filter(|&(_, &v)| v > 0)
+        .max_by_key(|&(_, &v)| v)
+        .map(|(&a, _)| a)
+        .expect("root must have a visited child after 400 search steps");
+
+    mcts.advance_root(best_action);
+
+    // The new root is at depth 1 → its current_num_actions = 19.
+    let new_root_id = mcts.root_id.unwrap();
+    let new_root = mcts.get_node_immut(new_root_id)
+        .expect("advance_root must produce a valid root");
+    for (&a, &v) in &new_root.edge_visits {
+        if v > 0 {
+            assert!(a < 19,
+                "new root at depth 1 has visit for action {} (count {}) but action space size is 19",
+                a, v);
+        }
+    }
+    // And action ids at the new root must not include any that weren't
+    // valid at depth 1 (i.e. action 19 — present at the old root, must
+    // not appear at the new one).
+    assert!(!new_root.edge_visits.contains_key(&19),
+        "new root unexpectedly contains action 19, which is invalid at depth 1");
+}
+
+#[test]
+fn test_each_node_action_set_matches_its_state_in_shrinking_env() {
+    // Stronger version of the principal-variation test: explore both
+    // visited children of the root, verifying each child's action set
+    // is bounded by the action space of its own state, not the parent's.
+    let env_init = ShrinkingEnv::new(20, 5);
+    let client = DeterministicClient;
+    let mut mcts: MCTS<ShrinkingEnv> = MCTS::new(8);
+    let evaluator = |e: &ShrinkingEnv| if e.done() { 0.5 } else { 0.0 };
+    mcts.run(&env_init, &client, 600, 1.4, &evaluator, false);
+
+    let root_id = mcts.root_id.unwrap();
+    let root = mcts.get_node_immut(root_id).unwrap();
+    let depth_one_bound = 19;  // 20 - 1
+
+    // Find at least two children of the root that received visits.
+    let visited_children: Vec<(u32, u64)> = root.edge_visits.iter()
+        .filter(|&(_, &v)| v > 0)
+        .filter_map(|(&a, _)| root.children.get(&a).map(|&cid| (a, cid)))
+        .collect();
+    assert!(visited_children.len() >= 2,
+        "expected ≥2 visited children of root after 600 sims; got {}",
+        visited_children.len());
+
+    for (action_at_root, child_id) in visited_children.into_iter().take(3) {
+        let child = mcts.get_node_immut(child_id).expect("visited child must exist in arena");
+        for (&a, &v) in &child.edge_visits {
+            if v > 0 {
+                assert!(a < depth_one_bound,
+                    "child via root action {} has visit for action {} (count {}) but \
+                     depth-1 action space size is {}",
+                    action_at_root, a, v, depth_one_bound);
+            }
+        }
+    }
+}
+
+// ============================================================================
 // puct_scores: invariants under high branching
 // ============================================================================
 
