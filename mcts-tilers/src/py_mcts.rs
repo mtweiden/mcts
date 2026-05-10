@@ -117,7 +117,14 @@ impl MctsNode {
     }
 
     fn edge_visits(&self) -> HashMap<Action, usize> {
-        self.inner.edge_visits.clone()
+        // Inner storage is a dense Vec<usize>; rebuild HashMap for the
+        // Python contract.
+        use mcts_core::environment::Act;
+        let mut out = HashMap::with_capacity(self.inner.valid_actions.len());
+        for &a in &self.inner.valid_actions {
+            out.insert(a, self.inner.edge_visits[a.to_action_index()]);
+        }
+        out
     }
 }
 

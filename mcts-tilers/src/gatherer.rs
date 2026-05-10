@@ -220,7 +220,7 @@ impl Gatherer {
         let probs = self._action_probabilities(
             &valid_actions
                 .iter()
-                .map(|&a| *node.edge_visits.get(&(a as Action)).unwrap_or(&0))
+                .map(|&a| node.edge_visits.get(a as usize).copied().unwrap_or(0))
                 .collect::<Vec<_>>(),
             temperature,
         );
@@ -435,7 +435,7 @@ impl Gatherer {
 
             // Only record training data for full searches.
             if is_full_search {
-                let n_total: usize = root.edge_visits.values().sum();
+                let n_total: usize = root.edge_visits.iter().sum();
                 let edge_visits: HashMap<Action, usize> = mcts
                     .policy_target(c_puct)
                     .unwrap_or_default()
@@ -989,7 +989,7 @@ mod tests {
             .collect();
         let mut node = Node::new(env.num_actions(), priors, 0.0, 0, None);
         let dominant = valid[0] as Action;
-        node.edge_visits.insert(dominant, 100_000);
+        node.edge_visits[dominant as usize] = 100_000;
 
         let mut rng = StdRng::seed_from_u64(7);
         for _ in 0..20 {

@@ -352,10 +352,13 @@ impl<E: Environment> MCTS<E> {
                 Some(p) => p,
                 None => return,
             };
-            let vl: usize = parent.virtual_losses.values().copied().sum();
+            // Sum the entire dense Vec — invalid slots are zero so they
+            // contribute nothing to the total.
+            let vl: usize = parent.virtual_losses.iter().sum();
             let data: Vec<(NodeId, usize, f32)> = parent.children.iter().map(|(&a, &child_id)| {
-                let ev = parent.edge_visits.get(&a).copied().unwrap_or(0);
-                let ep = parent.edge_penalties.get(&a).copied().unwrap_or(0.0);
+                let idx = a.to_action_index();
+                let ev = parent.edge_visits.get(idx).copied().unwrap_or(0);
+                let ep = parent.edge_penalties.get(idx).copied().unwrap_or(0.0);
                 (child_id, ev, ep)
             }).collect();
             (vl, parent.value_estimate, data)
@@ -442,7 +445,7 @@ impl<E: Environment> MCTS<E> {
             None => return HashMap::new(),
         };
 
-        let total_visits: usize = node.edge_visits.values().copied().sum::<usize>();
+        let total_visits: usize = node.edge_visits.iter().sum();
         let sqrt_total = (total_visits as f32).sqrt() + 1e-8;
 
         // --- FPU ---
@@ -455,7 +458,7 @@ impl<E: Environment> MCTS<E> {
         // and never read.
         let p_explored: f32 = node.valid_actions
             .iter()
-            .filter(|&&a| node.edge_visits.get(&a).copied().unwrap_or(0) > 0)
+            .filter(|&&a| node.edge_visits[a.to_action_index()] > 0)
             .map(|&a| node.prior_probs[a.to_action_index()])
             .sum();
         let fpu_q = node.value - c_fpu_eff * p_explored.sqrt();
@@ -514,10 +517,11 @@ impl<E: Environment> MCTS<E> {
         let mut scores = HashMap::new();
 
         for (&action, &prior) in &effective_priors {
-            let this_edge_visits = node.edge_visits.get(&action).copied().unwrap_or(0);
-            let num_virtual_losses = node.virtual_losses.get(&action).copied().unwrap_or(0);
+            let idx = action.to_action_index();
+            let this_edge_visits = node.edge_visits.get(idx).copied().unwrap_or(0);
+            let num_virtual_losses = node.virtual_losses.get(idx).copied().unwrap_or(0);
             let adjusted_visits = this_edge_visits + num_virtual_losses;
-            let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
+            let penalty = node.edge_penalties.get(idx).copied().unwrap_or(0.0);
 
             // --- Forced playouts ---
             // If this root child is under-visited, force selection by returning ∞.
@@ -729,7 +733,10 @@ impl<E: Environment> MCTS<E> {
         // Backpropagate visits and recompute values in both cases
         for &(node_hash, action) in search_path.iter().rev() {
             if let Some(node) = self.get_node_mut(node_hash) {
-                *node.edge_visits.entry(action).or_insert(0) += 1;
+                let idx = action.to_action_index();
+                if idx < node.edge_visits.len() {
+                    node.edge_visits[idx] += 1;
+                }
             }
             self.recompute_value(node_hash);
         }
@@ -767,7 +774,7 @@ impl<E: Environment> MCTS<E> {
         let root_id = self.root_id?;
         let node = self.get_node_immut(root_id)?;
 
-        let n_total: usize = node.edge_visits.values().copied().sum();
+        let n_total: usize = node.edge_visits.iter().sum();
         if n_total == 0 {
             return None;
         }
@@ -779,7 +786,7 @@ impl<E: Environment> MCTS<E> {
         // Pre-compute Q(c) for each action using the transposition table.
         // Q(c) = backed-up child value if available, otherwise the FPU fallback.
         let q_values: HashMap<E::Act, f32> = node.valid_actions.iter().map(|&action| {
-            let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
+            let penalty = node.edge_penalties[action.to_action_index()];
             let q = match node.children.get(&action).copied() {
                 Some(child_id) => self.get_node_immut(child_id)
                     .map(|c| c.value + penalty)
@@ -793,18 +800,30 @@ impl<E: Environment> MCTS<E> {
         // apply_forced=false so we get clean finite scores for the comparison.
         let puct_scores = self.puct_scores(root_id, c_puct, true, false);
 
-        // Step 1: find c* – the most-visited root child.
-        let (&best_action, _) = node.edge_visits.iter().max_by_key(|&(_, &v)| v)?;
+        // Step 1: find c* — the most-visited root child. Iterate
+        // valid_actions and look up dense visit counts.
+        let best_action = {
+            let mut best: Option<(E::Act, usize)> = None;
+            for &a in &node.valid_actions {
+                let v = node.edge_visits[a.to_action_index()];
+                match best {
+                    Some((_, bv)) if bv >= v => {}
+                    _ => best = Some((a, v)),
+                }
+            }
+            best.map(|(a, _)| a)?
+        };
         let puct_best = puct_scores
             .get(&best_action)
             .copied()
             .unwrap_or(f32::NEG_INFINITY);
 
         // Step 2: build the pruned visit map, starting from all visited children.
-        let mut pruned: HashMap<E::Act, usize> = node.edge_visits
-            .iter()
-            .filter(|&(_, &v)| v > 0)
-            .map(|(&a, &v)| (a, v))
+        let mut pruned: HashMap<E::Act, usize> = node.valid_actions.iter()
+            .filter_map(|&a| {
+                let v = node.edge_visits[a.to_action_index()];
+                if v > 0 { Some((a, v)) } else { None }
+            })
             .collect();
 
         for (&action, visits) in pruned.iter_mut() {
@@ -1043,7 +1062,7 @@ mod tests {
         let node = Node::new(2, HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.5, 1, None);
         mcts.insert_node(1, node);
         if let Some(n) = mcts.get_node_mut(1) {
-            *n.edge_visits.entry(0).or_insert(0) = 1;
+            n.edge_visits[0] = 1;
         }
         mcts.root_id = Some(1);
         mcts
@@ -1092,8 +1111,8 @@ mod tests {
         let node = Node::new(2, HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.0, 1, None);
         mcts.insert_node(1, node);
         if let Some(n) = mcts.get_node_mut(1) {
-            *n.edge_visits.entry(0).or_insert(0) = 10;
-            *n.edge_visits.entry(1).or_insert(0) = 1;
+            n.edge_visits[0] = 10;
+            n.edge_visits[1] = 1;
         }
         mcts.root_id = Some(1);
 
@@ -1159,7 +1178,7 @@ mod tests {
 
         let root_id = mcts.root_id.unwrap();
         let raw_actions = mcts.get_node_immut(root_id).unwrap()
-            .edge_visits.iter().filter(|&(_, &v)| v > 0).count();
+            .edge_visits.iter().filter(|&&v| v > 0).count();
         let pruned_actions = mcts.policy_target(1.4).unwrap().len();
         assert!(pruned_actions <= raw_actions,
             "pruning should not add actions: {} > {}", pruned_actions, raw_actions);

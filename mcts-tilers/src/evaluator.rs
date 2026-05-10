@@ -175,7 +175,7 @@ impl Evaluator {
             // Greedy: pick the action with the most visits.
             let action = *valid_actions
                 .iter()
-                .max_by_key(|&&a| *root.edge_visits.get(&(a as Action)).unwrap_or(&0))
+                .max_by_key(|&&a| root.edge_visits.get(a as usize).copied().unwrap_or(0))
                 .unwrap() as Action;
 
             actions_taken.push(action);

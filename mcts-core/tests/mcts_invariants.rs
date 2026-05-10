@@ -198,8 +198,8 @@ fn test_two_runs_have_identical_visit_totals_at_branching_50() {
 
     let r1 = m1.root_id.unwrap();
     let r2 = m2.root_id.unwrap();
-    let v1: usize = m1.get_node_immut(r1).unwrap().edge_visits.values().sum();
-    let v2: usize = m2.get_node_immut(r2).unwrap().edge_visits.values().sum();
+    let v1: usize = m1.get_node_immut(r1).unwrap().edge_visits.iter().sum();
+    let v2: usize = m2.get_node_immut(r2).unwrap().edge_visits.iter().sum();
     assert_eq!(v1, v2, "Two runs of MCTS::run on identical inputs must produce equal root visit totals");
 }
 
@@ -230,13 +230,10 @@ fn test_policy_target_only_visited_actions_at_branching_250() {
     // refactor could include zero-visit actions with nonzero policy mass.
     let mcts = run_search(250, 4, 1500, true);
     let root = mcts.root_id.unwrap();
-    let visited: std::collections::HashSet<u32> = mcts
-        .get_node_immut(root)
-        .unwrap()
-        .edge_visits
-        .iter()
-        .filter(|&(_, &v)| v > 0)
-        .map(|(&a, _)| a)
+    let n = mcts.get_node_immut(root).unwrap();
+    let visited: std::collections::HashSet<u32> = n.valid_actions.iter()
+        .filter(|&&a| n.edge_visits[a as usize] > 0)
+        .copied()
         .collect();
     let target = mcts.policy_target(1.4).expect("policy target should be Some");
     for (&a, &p) in target.iter() {
@@ -265,7 +262,7 @@ fn test_root_visit_total_matches_batch_aligned_steps_at_branching_50() {
     let expected = ((steps + batch_size - 1) / batch_size) * batch_size; // 504
     let mcts = run_search(50, 8, steps, false);
     let root = mcts.root_id.unwrap();
-    let total: usize = mcts.get_node_immut(root).unwrap().edge_visits.values().sum();
+    let total: usize = mcts.get_node_immut(root).unwrap().edge_visits.iter().sum();
     assert_eq!(total, expected,
         "root edge_visits total = {} but expected batch-aligned {} (steps={}, batch_size={})",
         total, expected, steps, batch_size);
@@ -278,8 +275,12 @@ fn test_invalid_actions_never_visited_at_branching_50() {
     // serious bug (writing past the dense array, or a stale leftover).
     let mcts = run_search(50, 6, 500, true);
     let root = mcts.root_id.unwrap();
-    for (&a, &v) in &mcts.get_node_immut(root).unwrap().edge_visits {
-        assert!(a < 50, "root has visit count {} for invalid action {}", v, a);
+    let n = mcts.get_node_immut(root).unwrap();
+    // Dense edge_visits has length num_actions (50 here); the iteration
+    // list valid_actions enforces the action-id bound.
+    assert_eq!(n.edge_visits.len(), 50);
+    for &a in &n.valid_actions {
+        assert!(a < 50, "valid_actions contains out-of-range id {}", a);
     }
 }
 
@@ -293,12 +294,14 @@ fn test_advance_root_consistency_at_branching_50() {
 
     // Pick the most-visited root action to advance into.
     let root = mcts.root_id.unwrap();
-    let (best_action, _) = mcts
-        .get_node_immut(root).unwrap()
-        .edge_visits.iter()
-        .max_by_key(|&(_, &v)| v)
-        .map(|(&a, &v)| (a, v))
-        .expect("root must have at least one visited child");
+    let best_action = {
+        let n = mcts.get_node_immut(root).unwrap();
+        n.valid_actions.iter()
+            .copied()
+            .max_by_key(|&a| n.edge_visits[a as usize])
+            .filter(|&a| n.edge_visits[a as usize] > 0)
+            .expect("root must have at least one visited child")
+    };
 
     let nodes_before = mcts.nodes.len();
     mcts.advance_root(best_action);
@@ -326,17 +329,19 @@ fn test_advance_root_preserves_visit_counts_in_subtree_at_branching_50() {
     // pruning is structural; it doesn't mutate node state.
     let mut mcts = run_search(50, 8, 500, true);
     let root = mcts.root_id.unwrap();
-    let best_action = mcts
-        .get_node_immut(root).unwrap()
-        .edge_visits.iter()
-        .max_by_key(|&(_, &v)| v)
-        .map(|(&a, _)| a)
-        .expect("root must have at least one visited child");
+    let best_action = {
+        let n = mcts.get_node_immut(root).unwrap();
+        n.valid_actions.iter()
+            .copied()
+            .max_by_key(|&a| n.edge_visits[a as usize])
+            .filter(|&a| n.edge_visits[a as usize] > 0)
+            .expect("root must have at least one visited child")
+    };
 
     let new_root_id = *mcts.get_node_immut(root).unwrap()
         .children.get(&best_action)
         .expect("most-visited root action must have a child");
-    let visits_before: HashMap<u32, usize> = mcts
+    let visits_before: Vec<usize> = mcts
         .get_node_immut(new_root_id).unwrap()
         .edge_visits.clone();
 
@@ -353,12 +358,14 @@ fn test_advance_root_no_dangling_nodeids_at_branching_50() {
     // point to a node that still exists in the table.
     let mut mcts = run_search(50, 8, 500, true);
     let root = mcts.root_id.unwrap();
-    let best_action = mcts
-        .get_node_immut(root).unwrap()
-        .edge_visits.iter()
-        .max_by_key(|&(_, &v)| v)
-        .map(|(&a, _)| a)
-        .expect("root must have at least one visited child");
+    let best_action = {
+        let n = mcts.get_node_immut(root).unwrap();
+        n.valid_actions.iter()
+            .copied()
+            .max_by_key(|&a| n.edge_visits[a as usize])
+            .filter(|&a| n.edge_visits[a as usize] > 0)
+            .expect("root must have at least one visited child")
+    };
 
     mcts.advance_root(best_action);
 
@@ -393,8 +400,8 @@ fn test_recompute_value_is_visit_plus_one_weighted_average() {
     let mut parent = Node::new(2, HashMap::from([(0u32, 0.5), (1u32, 0.5)]), 0.0, 100, None);
     parent.children.insert(0, 200);
     parent.children.insert(1, 300);
-    parent.edge_visits.insert(0, 4);
-    parent.edge_visits.insert(1, 6);
+    parent.edge_visits[0] = 4;
+    parent.edge_visits[1] = 6;
     parent.node_visits = 10;
     let mut child_a = Node::new(1, HashMap::from([(0u32, 1.0)]), 0.6, 200, None);
     child_a.value = 0.6;
@@ -599,7 +606,8 @@ fn test_search_visits_only_valid_actions_in_shrinking_env() {
     loop {
         let n = match mcts.get_node_immut(current) { Some(n) => n, None => break };
         let bound = env.current_num_actions();
-        for (&a, &v) in &n.edge_visits {
+        for &a in &n.valid_actions {
+            let v = n.edge_visits[a as usize];
             if v > 0 {
                 assert!(a < bound,
                     "node at depth {} has visit {} for action {} but current_num_actions = {}",
@@ -607,10 +615,10 @@ fn test_search_visits_only_valid_actions_in_shrinking_env() {
             }
         }
         // Walk to the most-visited child to keep going.
-        let best = n.edge_visits.iter()
-            .filter(|&(_, &v)| v > 0)
-            .max_by_key(|&(_, &v)| v)
-            .map(|(&a, _)| a);
+        let best = n.valid_actions.iter()
+            .copied()
+            .max_by_key(|&a| n.edge_visits[a as usize])
+            .filter(|&a| n.edge_visits[a as usize] > 0);
         match best {
             Some(a) => {
                 if let Some(&cid) = n.children.get(&a) {
@@ -640,12 +648,14 @@ fn test_advance_root_into_smaller_action_space() {
     mcts.run(&env, &client, 400, 1.4, &evaluator, false);
 
     let root = mcts.root_id.unwrap();
-    let best_action = mcts.get_node_immut(root).unwrap()
-        .edge_visits.iter()
-        .filter(|&(_, &v)| v > 0)
-        .max_by_key(|&(_, &v)| v)
-        .map(|(&a, _)| a)
-        .expect("root must have a visited child after 400 search steps");
+    let best_action = {
+        let n = mcts.get_node_immut(root).unwrap();
+        n.valid_actions.iter()
+            .copied()
+            .max_by_key(|&a| n.edge_visits[a as usize])
+            .filter(|&a| n.edge_visits[a as usize] > 0)
+            .expect("root must have a visited child after 400 search steps")
+    };
 
     mcts.advance_root(best_action);
 
@@ -653,18 +663,23 @@ fn test_advance_root_into_smaller_action_space() {
     let new_root_id = mcts.root_id.unwrap();
     let new_root = mcts.get_node_immut(new_root_id)
         .expect("advance_root must produce a valid root");
-    for (&a, &v) in &new_root.edge_visits {
+    for &a in &new_root.valid_actions {
+        let v = new_root.edge_visits[a as usize];
         if v > 0 {
             assert!(a < 19,
                 "new root at depth 1 has visit for action {} (count {}) but action space size is 19",
                 a, v);
         }
     }
-    // And action ids at the new root must not include any that weren't
-    // valid at depth 1 (i.e. action 19 — present at the old root, must
-    // not appear at the new one).
-    assert!(!new_root.edge_visits.contains_key(&19),
+    // And action 19 (valid at the old root, but invalid at depth 1)
+    // must not appear in the new root's valid_actions list.
+    assert!(!new_root.valid_actions.contains(&19),
         "new root unexpectedly contains action 19, which is invalid at depth 1");
+    // Dense Vec is sized to the new state's action space (19), not the
+    // parent's (20).
+    assert_eq!(new_root.edge_visits.len(), 19,
+        "new root's edge_visits Vec length must equal num_actions (19), got {}",
+        new_root.edge_visits.len());
 }
 
 #[test]
@@ -683,9 +698,9 @@ fn test_each_node_action_set_matches_its_state_in_shrinking_env() {
     let depth_one_bound = 19;  // 20 - 1
 
     // Find at least two children of the root that received visits.
-    let visited_children: Vec<(u32, u64)> = root.edge_visits.iter()
-        .filter(|&(_, &v)| v > 0)
-        .filter_map(|(&a, _)| root.children.get(&a).map(|&cid| (a, cid)))
+    let visited_children: Vec<(u32, u64)> = root.valid_actions.iter()
+        .filter(|&&a| root.edge_visits[a as usize] > 0)
+        .filter_map(|&a| root.children.get(&a).map(|&cid| (a, cid)))
         .collect();
     assert!(visited_children.len() >= 2,
         "expected ≥2 visited children of root after 600 sims; got {}",
@@ -693,7 +708,8 @@ fn test_each_node_action_set_matches_its_state_in_shrinking_env() {
 
     for (action_at_root, child_id) in visited_children.into_iter().take(3) {
         let child = mcts.get_node_immut(child_id).expect("visited child must exist in arena");
-        for (&a, &v) in &child.edge_visits {
+        for &a in &child.valid_actions {
+            let v = child.edge_visits[a as usize];
             if v > 0 {
                 assert!(a < depth_one_bound,
                     "child via root action {} has visit for action {} (count {}) but \

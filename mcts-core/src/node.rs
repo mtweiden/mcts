@@ -2,6 +2,12 @@ use std::collections::HashMap;
 
 use crate::environment::Act;
 
+// All per-edge data on Node (priors, visits, virtual losses, penalties)
+// is now stored as dense `Vec<T>` of length `num_actions`, indexed by
+// `action.to_action_index()`. `valid_actions` is the iteration list —
+// per-edge loops walk it and look up dense slots, so invalid action
+// slots are never read.
+
 pub type NodeId = u64;
 
 /// A single node in the MCTS graph.
@@ -16,9 +22,11 @@ pub type NodeId = u64;
 /// indexed by `action.to_action_index()`. Slots for invalid actions
 /// remain at the default 0.0 and are never read.
 ///
-/// `edge_visits` / `virtual_losses` / `edge_penalties` / `children`
-/// are still HashMap-backed in this step. Steps 4 and 5 of the refactor
-/// will convert them to dense Vecs the same way.
+/// `edge_visits` / `virtual_losses` / `edge_penalties` are dense
+/// `Vec<T>` of length `num_actions`. Slots for invalid actions stay at
+/// the default zero and are never read (loops walk `valid_actions`).
+/// `children` remains a HashMap in this step; step 5 of the refactor
+/// will convert it to `Vec<Option<NodeId>>`.
 ///
 /// Action ids are scoped to a single node's state. The same numeric id
 /// may mean different things in another node's state — the contract is
@@ -33,9 +41,9 @@ pub struct Node<A: Act> {
     pub value_estimate: f32,
     pub node_visits: usize,
     pub children: HashMap<A, NodeId>,
-    pub edge_visits: HashMap<A, usize>,
-    pub virtual_losses: HashMap<A, usize>,
-    pub edge_penalties: HashMap<A, f32>,
+    pub edge_visits: Vec<usize>,
+    pub virtual_losses: Vec<usize>,
+    pub edge_penalties: Vec<f32>,
     pub value: f32,
     pub terminal_state: bool,
     pub repr: Option<String>,
@@ -51,9 +59,6 @@ impl<A: Act> Node<A> {
     ) -> Self {
         let mut prior_probs = vec![0.0_f32; num_actions];
         let mut valid_actions: Vec<A> = Vec::with_capacity(prior_probs_map.len());
-        let mut edge_visits: HashMap<A, usize> = HashMap::new();
-        let mut virtual_losses: HashMap<A, usize> = HashMap::new();
-        let mut edge_penalties: HashMap<A, f32> = HashMap::new();
 
         for (action, prob) in prior_probs_map.iter() {
             let idx = action.to_action_index();
@@ -66,9 +71,6 @@ impl<A: Act> Node<A> {
                 prior_probs[idx] = *prob;
             }
             valid_actions.push(*action);
-            edge_visits.insert(*action, 0);
-            virtual_losses.insert(*action, 0);
-            edge_penalties.insert(*action, 0.0);
         }
 
         Self {
@@ -79,9 +81,9 @@ impl<A: Act> Node<A> {
             value_estimate: value,
             node_visits: 0,
             children: HashMap::new(),
-            edge_visits,
-            virtual_losses,
-            edge_penalties,
+            edge_visits: vec![0; num_actions],
+            virtual_losses: vec![0; num_actions],
+            edge_penalties: vec![0.0; num_actions],
             value,
             terminal_state: false,
             repr,
@@ -99,9 +101,9 @@ impl<A: Act> Node<A> {
             value_estimate: value,
             node_visits: 0,
             children: HashMap::new(),
-            edge_visits: HashMap::new(),
-            virtual_losses: HashMap::new(),
-            edge_penalties: HashMap::new(),
+            edge_visits: Vec::new(),
+            virtual_losses: Vec::new(),
+            edge_penalties: Vec::new(),
             value,
             terminal_state: true,
             repr,
@@ -109,40 +111,52 @@ impl<A: Act> Node<A> {
     }
 
     pub fn add_virtual_loss(&mut self, action: A) {
-        if let Some(count) = self.virtual_losses.get_mut(&action) {
-            *count += 1;
-        } else {
-            self.virtual_losses.insert(action, 1);
+        let idx = action.to_action_index();
+        if idx < self.virtual_losses.len() {
+            self.virtual_losses[idx] += 1;
         }
     }
 
     pub fn revert_virtual_loss(&mut self, action: A) {
-        if let Some(count) = self.virtual_losses.get_mut(&action) {
-            *count = (*count).saturating_sub(1);
+        let idx = action.to_action_index();
+        if idx < self.virtual_losses.len() {
+            self.virtual_losses[idx] = self.virtual_losses[idx].saturating_sub(1);
         }
     }
 
     pub fn apply_penalty(&mut self, action: A) {
         // Scale the penalty amount by the number of valid actions at
-        // this state. Pre-refactor this used prior_probs.len() (a
-        // HashMap whose size equalled the number of valid actions);
-        // valid_actions.len() is the dense-Vec equivalent.
+        // this state.
         let n = self.valid_actions.len() as f32;
         let penalty_amount = -1.0 / n;
-        *self.edge_penalties.entry(action).or_insert(0.0) += penalty_amount;
+        let idx = action.to_action_index();
+        if idx < self.edge_penalties.len() {
+            self.edge_penalties[idx] += penalty_amount;
+        }
     }
 
     pub fn revert_penalty(&mut self, action: A) {
-        if let Some(penalty) = self.edge_penalties.get_mut(&action) {
-            *penalty = (*penalty + 1.0).min(0.0);
+        let idx = action.to_action_index();
+        if idx < self.edge_penalties.len() {
+            let p = self.edge_penalties[idx];
+            self.edge_penalties[idx] = (p + 1.0).min(0.0);
         }
     }
 
     pub fn select_action(&self) -> Option<A> {
-        self.edge_visits
-            .iter()
-            .max_by_key(|(_, visits)| *visits)
-            .and_then(|(&action, &visits)| if visits == 0 { None } else { Some(action) })
+        // Iterate valid_actions and pick the one with the highest
+        // visit count (skipping zero-visit actions, matching the
+        // pre-refactor HashMap semantics).
+        let mut best: Option<(A, usize)> = None;
+        for &a in &self.valid_actions {
+            let v = self.edge_visits[a.to_action_index()];
+            if v == 0 { continue; }
+            match best {
+                Some((_, bv)) if bv >= v => {}
+                _ => best = Some((a, v)),
+            }
+        }
+        best.map(|(a, _)| a)
     }
 }
     
@@ -167,9 +181,9 @@ mod tests {
         assert_eq!(node.value_estimate, 0.0);
         assert_eq!(node.node_visits, 0);
         assert!(node.children.is_empty());
-        assert_eq!(node.edge_visits, HashMap::from([(0 as u16, 0), (1 as u16, 0)]));
-        assert_eq!(node.virtual_losses, HashMap::from([(0 as u16, 0), (1 as u16, 0)]));
-        assert_eq!(node.edge_penalties, HashMap::from([(0 as u16, 0.0), (1 as u16, 0.0)]));
+        assert_eq!(node.edge_visits, vec![0_usize, 0]);
+        assert_eq!(node.virtual_losses, vec![0_usize, 0]);
+        assert_eq!(node.edge_penalties, vec![0.0_f32, 0.0]);
         assert_eq!(node.value, 0.0);
         assert!(!node.terminal_state);
     }
