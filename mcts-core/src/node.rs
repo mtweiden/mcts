@@ -22,11 +22,12 @@ pub type NodeId = u64;
 /// indexed by `action.to_action_index()`. Slots for invalid actions
 /// remain at the default 0.0 and are never read.
 ///
-/// `edge_visits` / `virtual_losses` / `edge_penalties` are dense
-/// `Vec<T>` of length `num_actions`. Slots for invalid actions stay at
-/// the default zero and are never read (loops walk `valid_actions`).
-/// `children` remains a HashMap in this step; step 5 of the refactor
-/// will convert it to `Vec<Option<NodeId>>`.
+/// `edge_visits` / `virtual_losses` / `edge_penalties` / `children` are
+/// dense `Vec<T>` of length `num_actions`. Slots for invalid actions
+/// stay at the default zero / `None` and are never read (loops walk
+/// `valid_actions`). `children[i] = None` means "action `i` has no
+/// expanded child yet" (the FPU branch in PUCT applies); `Some(node_id)`
+/// means the child is in the transposition table.
 ///
 /// Action ids are scoped to a single node's state. The same numeric id
 /// may mean different things in another node's state — the contract is
@@ -40,7 +41,7 @@ pub struct Node<A: Act> {
     pub prior_probs: Vec<f32>,
     pub value_estimate: f32,
     pub node_visits: usize,
-    pub children: HashMap<A, NodeId>,
+    pub children: Vec<Option<NodeId>>,
     pub edge_visits: Vec<usize>,
     pub virtual_losses: Vec<usize>,
     pub edge_penalties: Vec<f32>,
@@ -80,7 +81,7 @@ impl<A: Act> Node<A> {
             prior_probs,
             value_estimate: value,
             node_visits: 0,
-            children: HashMap::new(),
+            children: vec![None; num_actions],
             edge_visits: vec![0; num_actions],
             virtual_losses: vec![0; num_actions],
             edge_penalties: vec![0.0; num_actions],
@@ -100,7 +101,7 @@ impl<A: Act> Node<A> {
             prior_probs: Vec::new(),
             value_estimate: value,
             node_visits: 0,
-            children: HashMap::new(),
+            children: Vec::new(),
             edge_visits: Vec::new(),
             virtual_losses: Vec::new(),
             edge_penalties: Vec::new(),
@@ -180,7 +181,8 @@ mod tests {
         assert!(node.valid_actions.contains(&1));
         assert_eq!(node.value_estimate, 0.0);
         assert_eq!(node.node_visits, 0);
-        assert!(node.children.is_empty());
+        // Children Vec is sized to num_actions and starts with all None.
+        assert_eq!(node.children, vec![None, None]);
         assert_eq!(node.edge_visits, vec![0_usize, 0]);
         assert_eq!(node.virtual_losses, vec![0_usize, 0]);
         assert_eq!(node.edge_penalties, vec![0.0_f32, 0.0]);

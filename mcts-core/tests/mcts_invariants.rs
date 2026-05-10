@@ -338,8 +338,8 @@ fn test_advance_root_preserves_visit_counts_in_subtree_at_branching_50() {
             .expect("root must have at least one visited child")
     };
 
-    let new_root_id = *mcts.get_node_immut(root).unwrap()
-        .children.get(&best_action)
+    let new_root_id = mcts.get_node_immut(root).unwrap()
+        .children[best_action as usize]
         .expect("most-visited root action must have a child");
     let visits_before: Vec<usize> = mcts
         .get_node_immut(new_root_id).unwrap()
@@ -370,10 +370,12 @@ fn test_advance_root_no_dangling_nodeids_at_branching_50() {
     mcts.advance_root(best_action);
 
     for node in &mcts.nodes {
-        for (&_a, &cid) in &node.children {
-            assert!(mcts.transposition_table.contains_key(&cid),
-                "node {} has child {} that is missing from the transposition table",
-                node.id, cid);
+        for slot in &node.children {
+            if let Some(cid) = *slot {
+                assert!(mcts.transposition_table.contains_key(&cid),
+                    "node {} has child {} that is missing from the transposition table",
+                    node.id, cid);
+            }
         }
     }
 }
@@ -398,8 +400,8 @@ fn test_recompute_value_is_visit_plus_one_weighted_average() {
     // Expected parent.value = (0.0 + 4×0.6 + 6×-0.2) / (1 + 10) = 1.2 / 11
     let mut mcts: MCTS<WideEnv> = MCTS::new(4);
     let mut parent = Node::new(2, HashMap::from([(0u32, 0.5), (1u32, 0.5)]), 0.0, 100, None);
-    parent.children.insert(0, 200);
-    parent.children.insert(1, 300);
+    parent.children[0] = Some(200);
+    parent.children[1] = Some(300);
     parent.edge_visits[0] = 4;
     parent.edge_visits[1] = 6;
     parent.node_visits = 10;
@@ -621,7 +623,7 @@ fn test_search_visits_only_valid_actions_in_shrinking_env() {
             .filter(|&a| n.edge_visits[a as usize] > 0);
         match best {
             Some(a) => {
-                if let Some(&cid) = n.children.get(&a) {
+                if let Some(cid) = n.children.get(a as usize).and_then(|c| *c) {
                     env.step(a);
                     current = cid;
                     steps_walked += 1;
@@ -700,7 +702,7 @@ fn test_each_node_action_set_matches_its_state_in_shrinking_env() {
     // Find at least two children of the root that received visits.
     let visited_children: Vec<(u32, u64)> = root.valid_actions.iter()
         .filter(|&&a| root.edge_visits[a as usize] > 0)
-        .filter_map(|&a| root.children.get(&a).map(|&cid| (a, cid)))
+        .filter_map(|&a| root.children.get(a as usize).and_then(|c| *c).map(|cid| (a, cid)))
         .collect();
     assert!(visited_children.len() >= 2,
         "expected ≥2 visited children of root after 600 sims; got {}",

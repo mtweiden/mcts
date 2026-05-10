@@ -254,7 +254,10 @@ impl<E: Environment> MCTS<E> {
                 return;
             }
         };
-        if let Some(&new_root_id) = old_root_node.children.get(&action) {
+        let new_root_id_opt = old_root_node.children
+            .get(action.to_action_index())
+            .and_then(|opt| *opt);
+        if let Some(new_root_id) = new_root_id_opt {
             self.root_id = Some(new_root_id);
 
             // Collect all NodeIds reachable from new_root_id via a BFS.
@@ -269,9 +272,12 @@ impl<E: Environment> MCTS<E> {
                 }
                 if let Some(idx) = self.transposition_table.get(&id) {
                     if let Some(node) = self.nodes.get(*idx) {
-                        for &child_id in node.children.values() {
-                            if !reachable.contains(&child_id) {
-                                queue.push_back(child_id);
+                        // Walk dense children: only Some slots are real.
+                        for slot in &node.children {
+                            if let Some(child_id) = *slot {
+                                if !reachable.contains(&child_id) {
+                                    queue.push_back(child_id);
+                                }
                             }
                         }
                     }
@@ -355,12 +361,20 @@ impl<E: Environment> MCTS<E> {
             // Sum the entire dense Vec — invalid slots are zero so they
             // contribute nothing to the total.
             let vl: usize = parent.virtual_losses.iter().sum();
-            let data: Vec<(NodeId, usize, f32)> = parent.children.iter().map(|(&a, &child_id)| {
-                let idx = a.to_action_index();
-                let ev = parent.edge_visits.get(idx).copied().unwrap_or(0);
-                let ep = parent.edge_penalties.get(idx).copied().unwrap_or(0.0);
-                (child_id, ev, ep)
-            }).collect();
+            // Walk valid_actions and collect (child_id, edge_visits, penalty)
+            // for each slot whose child is expanded. Iterating the dense
+            // children Vec works too, but valid_actions short-circuits the
+            // None slots without bounds checks.
+            let data: Vec<(NodeId, usize, f32)> = parent.valid_actions.iter()
+                .filter_map(|&a| {
+                    let idx = a.to_action_index();
+                    parent.children.get(idx).and_then(|c| *c).map(|child_id| {
+                        let ev = parent.edge_visits.get(idx).copied().unwrap_or(0);
+                        let ep = parent.edge_penalties.get(idx).copied().unwrap_or(0.0);
+                        (child_id, ev, ep)
+                    })
+                })
+                .collect();
             (vl, parent.value_estimate, data)
         };  // Immutable borrows end here
 
@@ -540,7 +554,7 @@ impl<E: Environment> MCTS<E> {
             // Use the child's backed-up value when it is in the transposition table.
             // If the child has never been reached at all, apply the FPU fallback.
             // Reference: [Wu 2020, §2, footnote 3].
-            let q_value = match node.children.get(&action).copied() {
+            let q_value = match node.children.get(idx).and_then(|c| *c) {
                 Some(child_id) => self.get_node_immut(child_id)
                     .map(|c| c.value + penalty)
                     .unwrap_or(fpu_q + penalty),
@@ -570,7 +584,10 @@ impl<E: Environment> MCTS<E> {
 
     pub fn add_child(&mut self, parent_id: NodeId, action: E::Act, child_id: NodeId) {
         if let Some(parent) = self.get_node_mut(parent_id) {
-            parent.children.insert(action, child_id);
+            let idx = action.to_action_index();
+            if idx < parent.children.len() {
+                parent.children[idx] = Some(child_id);
+            }
         }
     }
 
@@ -661,10 +678,10 @@ impl<E: Environment> MCTS<E> {
 
             // lookup child id from the parent snapshot
             if let Some(parent_node) = self.get_node_immut(node_id) {
-                if let Some(cid) = parent_node.children.get(&action.unwrap()).copied() {
-                    node_id = cid;
-                } else {
-                    break;
+                let idx = action.unwrap().to_action_index();
+                match parent_node.children.get(idx).and_then(|c| *c) {
+                    Some(cid) => { node_id = cid; }
+                    None => break,
                 }
             } else {
                 break;
@@ -693,16 +710,29 @@ impl<E: Environment> MCTS<E> {
         }
 
         if let Some(parent) = self.get_node_mut(parent_id) {
-            if parent.children.contains_key(&action) {
-                let existing_id = parent.children.get(&action).copied().unwrap();
-                if existing_id != leaf_id {
-                    eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id);
-                }
-            } else {
-                parent.children.insert(action, leaf_id);
-                for (&a, &cid) in &parent.children {
-                    if cid == leaf_id && a != action {
-                        eprintln!("[Alias detected] actions {:?} - {:?}", a, action);
+            let idx = action.to_action_index();
+            if idx < parent.children.len() {
+                match parent.children[idx] {
+                    Some(existing_id) => {
+                        if existing_id != leaf_id {
+                            eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id);
+                        }
+                    }
+                    None => {
+                        parent.children[idx] = Some(leaf_id);
+                        // Alias detection: warn if any other slot already
+                        // points at the same leaf_id (would mean two
+                        // actions in the same parent transposed to a
+                        // single state).
+                        for (i, slot) in parent.children.iter().enumerate() {
+                            if i != idx {
+                                if let Some(cid) = *slot {
+                                    if cid == leaf_id {
+                                        eprintln!("[Alias detected] action index {} - {}", i, idx);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -786,8 +816,9 @@ impl<E: Environment> MCTS<E> {
         // Pre-compute Q(c) for each action using the transposition table.
         // Q(c) = backed-up child value if available, otherwise the FPU fallback.
         let q_values: HashMap<E::Act, f32> = node.valid_actions.iter().map(|&action| {
-            let penalty = node.edge_penalties[action.to_action_index()];
-            let q = match node.children.get(&action).copied() {
+            let idx = action.to_action_index();
+            let penalty = node.edge_penalties[idx];
+            let q = match node.children.get(idx).and_then(|c| *c) {
                 Some(child_id) => self.get_node_immut(child_id)
                     .map(|c| c.value + penalty)
                     .unwrap_or(fpu_q + penalty),
@@ -1205,11 +1236,11 @@ mod tests {
             (10, 20, 30, 40);
 
         let mut root = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
-        root.children.insert(0, child_a_id);
-        root.children.insert(1, child_b_id);
+        root.children[0] = Some(child_a_id);
+        root.children[1] = Some(child_b_id);
 
         let mut child_a = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
-        child_a.children.insert(0, grandchild_id);
+        child_a.children[0] = Some(grandchild_id);
 
         let child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
         let grandchild = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, grandchild_id, None);
@@ -1263,14 +1294,14 @@ mod tests {
             (10, 20, 30, 40);
 
         let mut root = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
-        root.children.insert(0, child_a_id);
-        root.children.insert(1, child_b_id);
+        root.children[0] = Some(child_a_id);
+        root.children[1] = Some(child_b_id);
 
         let mut child_a = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
-        child_a.children.insert(0, shared_id);
+        child_a.children[0] = Some(shared_id);
 
         let mut child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
-        child_b.children.insert(0, shared_id);
+        child_b.children[0] = Some(shared_id);
 
         let shared = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, shared_id, None);
 
@@ -1300,13 +1331,13 @@ mod tests {
         let (root_id, child_a_id, child_b_id): (NodeId, NodeId, NodeId) = (10, 20, 30);
 
         let mut root = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, root_id, None);
-        root.children.insert(0, child_a_id);
+        root.children[0] = Some(child_a_id);
 
         let mut child_a = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, child_a_id, None);
-        child_a.children.insert(1, child_b_id);
+        child_a.children[1] = Some(child_b_id);
 
         let mut child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
-        child_b.children.insert(0, child_a_id); // back-edge
+        child_b.children[0] = Some(child_a_id); // back-edge
 
         mcts.insert_node(root_id, root);
         mcts.insert_node(child_a_id, child_a);
