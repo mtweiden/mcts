@@ -93,7 +93,15 @@ impl MctsNode {
     }
 
     fn prior_probs(&self) -> HashMap<Action, f32> {
-        self.inner.prior_probs.clone()
+        // Inner storage is a dense Vec<f32> indexed by action; the
+        // Python contract is still HashMap<Action, f32>, so re-emit
+        // entries only for actions that are valid at this node.
+        use mcts_core::environment::Act;
+        let mut out = HashMap::with_capacity(self.inner.valid_actions.len());
+        for &a in &self.inner.valid_actions {
+            out.insert(a, self.inner.prior_probs[a.to_action_index()]);
+        }
+        out
     }
 
     fn value(&self) -> f32 {

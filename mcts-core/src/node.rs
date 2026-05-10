@@ -6,22 +6,30 @@ pub type NodeId = u64;
 
 /// A single node in the MCTS graph.
 ///
-/// `num_actions` is the size of the action space at this node's state —
-/// stored explicitly so the planned dense-Vec storage of per-edge data
-/// (priors, visits, virtual_losses, penalties, children) has a known
-/// length without re-querying the env. Action ids in this node are
-/// scoped to `[0, num_actions)`; the same numeric id may mean different
-/// things in another node's state.
+/// `num_actions` is the size of the action space at this node's state.
+/// `valid_actions` is the dense list of actions actually playable from
+/// this node (subset of `0..num_actions`). All "for each action" loops
+/// iterate `valid_actions` — never the full prior_probs Vec — so
+/// invalid slots in the dense storage are never read.
 ///
-/// At step 2 of the dense-Vec refactor `num_actions` is set but unused
-/// at runtime (per-edge data is still HashMap-backed). It will become
-/// load-bearing in step 3 onward when each per-edge HashMap is replaced
-/// with `Vec<T>` of length `num_actions`.
+/// `prior_probs` is now a dense `Vec<f32>` of length `num_actions`,
+/// indexed by `action.to_action_index()`. Slots for invalid actions
+/// remain at the default 0.0 and are never read.
+///
+/// `edge_visits` / `virtual_losses` / `edge_penalties` / `children`
+/// are still HashMap-backed in this step. Steps 4 and 5 of the refactor
+/// will convert them to dense Vecs the same way.
+///
+/// Action ids are scoped to a single node's state. The same numeric id
+/// may mean different things in another node's state — the contract is
+/// that within this node, every entry of `valid_actions` is a valid
+/// action whose `to_action_index()` is in `0..num_actions`.
 #[derive(Clone)]
 pub struct Node<A: Act> {
     pub id: NodeId,
     pub num_actions: usize,
-    pub prior_probs: HashMap<A, f32>,
+    pub valid_actions: Vec<A>,
+    pub prior_probs: Vec<f32>,
     pub value_estimate: f32,
     pub node_visits: usize,
     pub children: HashMap<A, NodeId>,
@@ -36,33 +44,47 @@ pub struct Node<A: Act> {
 impl<A: Act> Node<A> {
     pub fn new(
         num_actions: usize,
-        prior_probs: HashMap<A, f32>,
+        prior_probs_map: HashMap<A, f32>,
         value: f32,
         id: NodeId,
         repr: Option<String>
     ) -> Self {
+        let mut prior_probs = vec![0.0_f32; num_actions];
+        let mut valid_actions: Vec<A> = Vec::with_capacity(prior_probs_map.len());
         let mut edge_visits: HashMap<A, usize> = HashMap::new();
         let mut virtual_losses: HashMap<A, usize> = HashMap::new();
         let mut edge_penalties: HashMap<A, f32> = HashMap::new();
 
-        for &action in prior_probs.keys() {
-            edge_visits.insert(action, 0);
-            virtual_losses.insert(action, 0);
-            edge_penalties.insert(action, 0.0);
+        for (action, prob) in prior_probs_map.iter() {
+            let idx = action.to_action_index();
+            debug_assert!(
+                idx < num_actions,
+                "Node::new: action index {} out of bounds for num_actions={}",
+                idx, num_actions
+            );
+            if idx < num_actions {
+                prior_probs[idx] = *prob;
+            }
+            valid_actions.push(*action);
+            edge_visits.insert(*action, 0);
+            virtual_losses.insert(*action, 0);
+            edge_penalties.insert(*action, 0.0);
         }
+
         Self {
             id,
             num_actions,
+            valid_actions,
             prior_probs,
             value_estimate: value,
             node_visits: 0,
             children: HashMap::new(),
-            edge_visits: edge_visits,
-            virtual_losses: virtual_losses,
-            edge_penalties: edge_penalties,
-            value: value,
+            edge_visits,
+            virtual_losses,
+            edge_penalties,
+            value,
             terminal_state: false,
-            repr: repr,
+            repr,
         }
     }
 
@@ -72,7 +94,8 @@ impl<A: Act> Node<A> {
             // Terminal nodes have no outgoing actions; size 0 is a
             // sentinel that prevents any accidental dense indexing.
             num_actions: 0,
-            prior_probs: HashMap::new(),
+            valid_actions: Vec::new(),
+            prior_probs: Vec::new(),
             value_estimate: value,
             node_visits: 0,
             children: HashMap::new(),
@@ -81,7 +104,7 @@ impl<A: Act> Node<A> {
             edge_penalties: HashMap::new(),
             value,
             terminal_state: true,
-            repr: repr,
+            repr,
         }
     }
 
@@ -100,9 +123,12 @@ impl<A: Act> Node<A> {
     }
 
     pub fn apply_penalty(&mut self, action: A) {
-        // Scale the penalty amount by the number of actions that can be taken
-        let num_actions = self.prior_probs.len() as f32;
-        let penalty_amount = -1.0 / num_actions;
+        // Scale the penalty amount by the number of valid actions at
+        // this state. Pre-refactor this used prior_probs.len() (a
+        // HashMap whose size equalled the number of valid actions);
+        // valid_actions.len() is the dense-Vec equivalent.
+        let n = self.valid_actions.len() as f32;
+        let penalty_amount = -1.0 / n;
         *self.edge_penalties.entry(action).or_insert(0.0) += penalty_amount;
     }
 
@@ -132,7 +158,12 @@ mod tests {
         let node = Node::new(2, priors.clone(), 0.0, 1, None);
         assert_eq!(node.id, 1);
         assert_eq!(node.num_actions, 2);
-        assert_eq!(node.prior_probs, priors);
+        assert_eq!(node.prior_probs.len(), 2);
+        assert!((node.prior_probs[0] - 0.5).abs() < 1e-6);
+        assert!((node.prior_probs[1] - 0.5).abs() < 1e-6);
+        assert_eq!(node.valid_actions.len(), 2);
+        assert!(node.valid_actions.contains(&0));
+        assert!(node.valid_actions.contains(&1));
         assert_eq!(node.value_estimate, 0.0);
         assert_eq!(node.node_visits, 0);
         assert!(node.children.is_empty());

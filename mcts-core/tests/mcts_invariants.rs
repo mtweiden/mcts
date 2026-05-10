@@ -459,7 +459,7 @@ fn test_perturb_root_prior_mixes_correctly_in_puct_scores() {
 
     // Sanity: prior_probs is unchanged on the node itself.
     let root = mcts.get_node_immut(1).unwrap();
-    assert!((root.prior_probs[&0] - 0.5).abs() < 1e-6,
+    assert!((root.prior_probs[0] - 0.5).abs() < 1e-6,
         "perturb_root_prior must not mutate node.prior_probs");
 
     // Now puct_scores at root must reflect the blended priors. Without

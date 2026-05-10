@@ -1,5 +1,5 @@
 use crate::node::{Node, NodeId};
-use crate::environment::Environment;
+use crate::environment::{Act, Environment};
 use crate::inference::InferenceClient;
 use std::collections::HashMap;
 use rustc_hash::FxHashMap;
@@ -450,10 +450,13 @@ impl<E: Environment> MCTS<E> {
         // At the root c_fpu is 0: Dirichlet noise handles exploration there.
         // Reference: [Wu 2020, §2, footnote 3].
         let c_fpu_eff: f32 = if is_root { 0.0 } else { self.c_fpu };
-        let p_explored: f32 = node.prior_probs
+        // Iterate valid_actions (the small list) and index into the dense
+        // prior_probs Vec. Invalid action slots in prior_probs are zero
+        // and never read.
+        let p_explored: f32 = node.valid_actions
             .iter()
-            .filter(|&(&a, _)| node.edge_visits.get(&a).copied().unwrap_or(0) > 0)
-            .map(|(_, &p)| p)
+            .filter(|&&a| node.edge_visits.get(&a).copied().unwrap_or(0) > 0)
+            .map(|&a| node.prior_probs[a.to_action_index()])
             .sum();
         let fpu_q = node.value - c_fpu_eff * p_explored.sqrt();
 
@@ -464,13 +467,17 @@ impl<E: Environment> MCTS<E> {
         // Noise is read from `self.root_noise` (set by `perturb_root_prior`)
         // rather than baked into `node.prior_probs`, so it never permanently
         // alters the transposition table.  References: [Wu 2020, §2].
+        // effective_priors is kept as a HashMap because the loop below iterates
+        // it; step 6 of the refactor will swap this transient HashMap for a
+        // reused Vec<f32>.
         let effective_priors: HashMap<E::Act, f32> = if is_root {
             // Step 1: blend noise if present.
             let noisy: HashMap<E::Act, f32> = if let Some(noise) = &self.root_noise {
                 let eps = self.root_noise_epsilon;
-                let mut blended: HashMap<E::Act, f32> = node.prior_probs
+                let mut blended: HashMap<E::Act, f32> = node.valid_actions
                     .iter()
-                    .map(|(&a, &p)| {
+                    .map(|&a| {
+                        let p = node.prior_probs[a.to_action_index()];
                         let n = noise.get(&a).copied().unwrap_or(0.0);
                         (a, (1.0 - eps) * p + eps * n)
                     })
@@ -481,7 +488,9 @@ impl<E: Environment> MCTS<E> {
                 }
                 blended
             } else {
-                node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
+                node.valid_actions.iter()
+                    .map(|&a| (a, node.prior_probs[a.to_action_index()]))
+                    .collect()
             };
 
             // Step 2: apply softmax temperature.
@@ -497,7 +506,9 @@ impl<E: Environment> MCTS<E> {
                 noisy
             }
         } else {
-            node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
+            node.valid_actions.iter()
+                .map(|&a| (a, node.prior_probs[a.to_action_index()]))
+                .collect()
         };
 
         let mut scores = HashMap::new();
@@ -767,7 +778,7 @@ impl<E: Environment> MCTS<E> {
 
         // Pre-compute Q(c) for each action using the transposition table.
         // Q(c) = backed-up child value if available, otherwise the FPU fallback.
-        let q_values: HashMap<E::Act, f32> = node.prior_probs.keys().map(|&action| {
+        let q_values: HashMap<E::Act, f32> = node.valid_actions.iter().map(|&action| {
             let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
             let q = match node.children.get(&action).copied() {
                 Some(child_id) => self.get_node_immut(child_id)
@@ -800,7 +811,10 @@ impl<E: Environment> MCTS<E> {
             if action == best_action {
                 continue; // never modify the best child's count
             }
-            let prior = node.prior_probs.get(&action).copied().unwrap_or(0.0);
+            let prior = node.prior_probs
+                .get(action.to_action_index())
+                .copied()
+                .unwrap_or(0.0);
             if prior == 0.0 {
                 continue;
             }
