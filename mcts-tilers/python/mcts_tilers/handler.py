@@ -1,3 +1,4 @@
+import json
 import logging
 from pathlib import Path
 from argparse import ArgumentParser
@@ -253,7 +254,27 @@ def build_boards(
 # ------------------------------------------------------------------------------
 # Inference loop
 # ------------------------------------------------------------------------------
-def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
+def do_work(
+    arena: PyArena,
+    device: str,
+    handler_id: int = 0,
+    metrics_path: Path | None = None,
+) -> None:
+    """
+    Inference handler main loop.
+
+    metrics_path: if set, writes one JSON line per inference batch with
+    {ts, num_slots, num_obs, fill_ms, build_ms, gpu_ms}. Used to calibrate
+    MAX_BATCH and BATCH_TIMEOUT — small/sparse batches mean GPU
+    underutilisation; long fill times mean slots arrive faster than
+    BATCH_TIMEOUT lets us aggregate; large gpu_ms variance suggests
+    inference itself is the variable cost.
+    """
+    metrics_fh = None
+    if metrics_path is not None:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        metrics_fh = open(metrics_path, "a", buffering=1)
+
     iteration = 0
     while True:
         try:
@@ -266,15 +287,15 @@ def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
 
         slot_views = [first_sv]
 
-        start = time.monotonic()
-        while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - start) < BATCH_TIMEOUT:
+        fill_start = time.monotonic()
+        while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - fill_start) < BATCH_TIMEOUT:
             sv = arena.try_pop_ready_view(clear_outputs=True)
             if sv is None:
                 time.sleep(0.0005)
                 continue
             sv.set_handler_start_time()
             slot_views.append(sv)
-            # print(f"[handler {handler_id}] batched slot {sv.slot}")
+        fill_ms = (time.monotonic() - fill_start) * 1000.0
 
         # print(f"[handler {handler_id}] loop iteration {iteration}, {len(slot_views)} slots pending", flush=True)
 
@@ -346,16 +367,23 @@ def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
             assert boards_np.shape[1] == MODEL.lookahead + 1, \
                 f"build_boards returned shape {boards_np.shape}, expected num_layers={MODEL.lookahead + 1}"
 
-            # Build tensors
-            boards_t = torch.from_numpy(np.ascontiguousarray(boards_np)).to(device)
+            build_ms = (time.monotonic() - fill_start - fill_ms / 1000.0) * 1000.0
+
+            # Build tensors. non_blocking=True lets the H2D copy overlap
+            # with the next Python op (model.infer's own setup); pinned
+            # source memory is not used here because the numpy arrays
+            # are backed by the shared-memory arena, but the flag still
+            # avoids unnecessary cudaStreamSynchronize.
+            boards_t = torch.from_numpy(np.ascontiguousarray(boards_np)).to(device, non_blocking=True)
             action_masks_t = torch.from_numpy(
                 np.ascontiguousarray(action_mask_raw.astype(bool, copy=False))
-            ).to(device)
-            heights_t = torch.from_numpy(h_all.astype(np.int32, copy=False)).to(device)
-            widths_t = torch.from_numpy(w_all.astype(np.int32, copy=False)).to(device)
-            num_ancillas_t = torch.from_numpy(ancillas_all.astype(np.int32, copy=False)).to(device)
+            ).to(device, non_blocking=True)
+            heights_t = torch.from_numpy(h_all.astype(np.int32, copy=False)).to(device, non_blocking=True)
+            widths_t = torch.from_numpy(w_all.astype(np.int32, copy=False)).to(device, non_blocking=True)
+            num_ancillas_t = torch.from_numpy(ancillas_all.astype(np.int32, copy=False)).to(device, non_blocking=True)
 
             # Model inference
+            gpu_start = time.monotonic()
             with no_grad():
                 priors_tensor, values_tensor = MODEL.infer(
                     boards=boards_t,
@@ -367,6 +395,7 @@ def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
 
             priors_np = priors_tensor.detach().cpu().numpy()
             values_np = values_tensor.squeeze(-1).detach().cpu().numpy()
+            gpu_ms = (time.monotonic() - gpu_start) * 1000.0
 
             # Write back per-slot
             idx = 0
@@ -381,6 +410,17 @@ def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
                 )
                 sv.mark_done()
 
+            if metrics_fh is not None:
+                num_obs = int(boards_np.shape[0])
+                metrics_fh.write(json.dumps({
+                    "ts": time.time(),
+                    "num_slots": len(valid_slot_views),
+                    "num_obs": num_obs,
+                    "fill_ms": round(fill_ms, 3),
+                    "build_ms": round(build_ms, 3),
+                    "gpu_ms": round(gpu_ms, 3),
+                }) + "\n")
+
         except KeyboardInterrupt:
             for sv in valid_slot_views:
                 try:
@@ -388,6 +428,9 @@ def do_work(arena: PyArena, device: str, handler_id: int = 0) -> None:
                 except Exception:
                     pass
             break
+
+    if metrics_fh is not None:
+        metrics_fh.close()
 
 
 # ------------------------------------------------------------------------------
@@ -401,6 +444,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_slots", type=int, default=2048)
     parser.add_argument("--num_handlers", type=int, default=1)
     parser.add_argument("--handler_id", type=int, default=0)
+    parser.add_argument("--metrics_dir", type=str, default=None,
+        help="If set, the handler writes one JSON line per inference batch "
+             "to {metrics_dir}/handler_{arena_tag}_{handler_id}.jsonl with "
+             "fill / build / gpu wallclock breakdown. Used to calibrate "
+             "MAX_BATCH and BATCH_TIMEOUT from real workload distributions.")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -429,4 +477,10 @@ if __name__ == "__main__":
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
     arena_name = f"{args.arena_name}{tag}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
-    do_work(arena, device, handler_id=args.handler_id)
+
+    metrics_path = None
+    if args.metrics_dir:
+        atag = args.arena_tag or "default"
+        metrics_path = Path(args.metrics_dir) / f"handler_{atag}_{args.handler_id}.jsonl"
+
+    do_work(arena, device, handler_id=args.handler_id, metrics_path=metrics_path)
