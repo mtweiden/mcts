@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 use serde_json::{Value, json, Map};
 use rand_distr::{Gamma, Distribution};
@@ -153,19 +153,20 @@ impl Gatherer {
 
     /// Directly sampling from Dirichlet distribution requires num_actions to be known at
     /// compile time, so we sample using Gamma distributions instead.
+    ///
+    /// alpha is constant for all actions in a single call (10 / num_actions, capped at
+    /// 0.5), so the Gamma distribution is constructed once and shared across all
+    /// num_actions samples — pre-refactor this allocated num_actions × Gamma
+    /// distributions per call.
     fn _dirichlet_noise(&self, num_actions: usize, rng: &mut impl Rng) -> Vec<f64> {
-        let alpha = 10f64 / (num_actions as f64);  // Rule of thumb for Dirichlet noise
-        let alphas = vec![alpha.min(0.5); num_actions];
-        let mut xs: Vec<f64> = alphas
-            .iter()
-            .map(|&a| {
-                let gamma = Gamma::new(a, 1.0).unwrap();
-                gamma.sample(rng)
-            })
-            .collect();
+        let alpha = (10f64 / (num_actions as f64)).min(0.5);
+        let gamma = Gamma::new(alpha, 1.0).unwrap();
+        let mut xs: Vec<f64> = (0..num_actions).map(|_| gamma.sample(rng)).collect();
         let sum_xs: f64 = xs.iter().sum();
-        for x in xs.iter_mut() {
-            *x /= sum_xs;
+        if sum_xs > 0.0 {
+            for x in xs.iter_mut() {
+                *x /= sum_xs;
+            }
         }
         xs
     }
@@ -548,11 +549,17 @@ impl Gatherer {
 
                 let filename = format!("{}/traj_{}.json", dir, self.gather_id);
 
-                let mut traj_file = std::fs::OpenOptions::new()
+                // Buffer writes (~64 KB by default) so each writeln! is a
+                // memcpy into the buffer rather than a syscall. On Lustre
+                // small-record syncs are expensive; the implicit flush at
+                // BufWriter drop (or the explicit one below) is one syscall
+                // per episode instead of one per record.
+                let traj_file_raw = std::fs::OpenOptions::new()
                     .create(true)
                     .append(true)
                     .open(&filename)
                     .expect("Unable to open trajectory file");
+                let mut traj_file = BufWriter::new(traj_file_raw);
 
                 let depth = all_steps_data.len();
                 let gamma = 0.80f32;
@@ -608,11 +615,15 @@ impl Gatherer {
         }
 
         // Write full-search data to output_path as normal.
-        let mut file = std::fs::OpenOptions::new()
+        // BufWriter batches the per-record writes into one syscall per
+        // ~64 KB on flush — important on Lustre where every individual
+        // write is a small sync.
+        let file_raw = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.output_path)
             .expect("Unable to open output file");
+        let mut file = BufWriter::new(file_raw);
 
         for ((p, o), va, ev, last_dirs) in temp_data {
             let num_ancillas = p.iter().filter(|q| q.id.as_i32() < 0).count();
