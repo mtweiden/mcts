@@ -131,6 +131,7 @@ fn main() {
         None,                 // resign_value_threshold (default)
         None,                 // resign_consecutive_moves (default)
         None,                 // no_resign_rate (default)
+        None,                 // resignation_log_dir (off in standalone binary)
     );
 
     loop {
@@ -155,7 +156,7 @@ fn main() {
             env.set_seed(Some(seed.unwrap() as u64));
         }
 
-        env.random_objectives(no, false);
+        env.random_start(no, false);
         if env.valid_actions().contains(&0) {
             let mut tmp_env = env.clone();
             let _ = tmp_env.step(0);

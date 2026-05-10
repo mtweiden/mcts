@@ -122,7 +122,7 @@ impl PyArena {
     ) -> PyResult<(Vec<Vec<f32>>, Vec<f32>)> {
         let mut env = TilersEnvInner::new(h, w, num_blanks);
         env.set_seed(Some(seed));
-        env.random_objectives(num_objectives, false);
+        env.random_start(num_objectives, false);
         let tilers_env = TilersEnv::new(env, 2);
 
         let obs = tilers_env.observation();

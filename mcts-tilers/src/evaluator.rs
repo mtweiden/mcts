@@ -332,7 +332,7 @@ mod tests {
     fn small_env() -> TilersEnvInner {
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(7));
-        env.random_objectives(1, false);
+        env.random_start(1, false);
         env
     }
 

@@ -766,7 +766,7 @@ pub fn run_gatherer(
     if let Some(s) = seed {
         env.set_seed(Some(s as u64));
     }
-    env.random_objectives(no, false);
+    env.random_start(no, false);
 
     if env.valid_actions().contains(&0) {
         let mut tmp_env = env.clone();
@@ -1056,7 +1056,7 @@ mod tests {
         let g = default_gatherer("/dev/null");
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(1));
-        env.random_objectives(2, false);
+        env.random_start(2, false);
         let (depth, actions) = g.solve_with_heuristic(&env);
         assert!(depth >= 0.0, "depth={depth}");
         assert!(!actions.is_empty(), "heuristic solution should be non-empty");
@@ -1079,7 +1079,7 @@ mod tests {
 
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(99));
-        env.random_objectives(1, false);
+        env.random_start(1, false);
 
         let client = TrivialTilersIpcClient {};
         let mut rng = StdRng::seed_from_u64(0);

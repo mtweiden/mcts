@@ -10,6 +10,52 @@ use tilers::enums::{Operation, Orientation, QubitId};
 use crate::constants::*;
 use crate::environment::TilersObs;
 
+// Local u8 → enum decoders. The tilers crate previously exposed
+// Orientation::from_u8 / Operation::from_u8; those were removed in favour
+// of typed conversions on the python side. The wire format we use across
+// the shared-memory arena is still raw u8, so we keep the decoders here
+// where they're owned by the consumer of the wire format.
+//
+// The discriminants must match `PyOrientation` and `PyOperation` in
+// tilers/src/enums.rs (the python bindings) because those define the
+// numeric values that handler.py packs into the slot.
+fn orientation_from_u8(v: u8) -> Option<Orientation> {
+    match v {
+        0 => Some(Orientation::Vertical),
+        1 => Some(Orientation::Horizontal),
+        2 => Some(Orientation::Ancilla),
+        3 => Some(Orientation::Cultivating),
+        4 => Some(Orientation::Resource),
+        _ => None,
+    }
+}
+
+fn operation_from_u8(v: u8) -> Option<Operation> {
+    match v {
+        0 => Some(Operation::X),
+        1 => Some(Operation::Y),
+        2 => Some(Operation::Z),
+        3 => Some(Operation::H),
+        4 => Some(Operation::S),
+        5 => Some(Operation::Sdg),
+        6 => Some(Operation::SX),
+        7 => Some(Operation::SXdg),
+        8 => Some(Operation::T),
+        9 => Some(Operation::Tdg),
+        10 => Some(Operation::TX),
+        11 => Some(Operation::TXdg),
+        12 => Some(Operation::CX),
+        13 => Some(Operation::CZ),
+        14 => Some(Operation::RZ),
+        15 => Some(Operation::MV),
+        16 => Some(Operation::ROT),
+        17 => Some(Operation::CULT),
+        18 => Some(Operation::MEASURE),
+        19 => Some(Operation::RESET),
+        _ => None,
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Slot states
 // ─────────────────────────────────────────────────────────────────────────────
@@ -176,7 +222,7 @@ impl TilersSlot {
                 let orientation = self.placement[i][offset + 4];
                 placement.push(Qubit {
                     id: QubitId(id),
-                    orientation: Orientation::from_u8(orientation).unwrap(),
+                    orientation: orientation_from_u8(orientation).unwrap(),
                 });
             }
 
@@ -204,7 +250,7 @@ impl TilersSlot {
                     ]);
                     layer.push(
                         Objective::new(
-                            Operation::from_u8(opcode).unwrap(),
+                            operation_from_u8(opcode).unwrap(),
                             QubitId(arg_0),
                             vec![],
                             QubitId(arg_1),
