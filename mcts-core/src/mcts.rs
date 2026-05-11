@@ -284,27 +284,19 @@ impl<E: Environment> MCTS<E> {
                 }
             }
 
-            // In-place compaction: drop unreachable Nodes from self.nodes
-            // without allocating a new Vec, then rebuild the transposition
-            // table over the surviving indices. After dense-Vec refactor
-            // each Node is ~10 KB (5 dense Vecs of length num_actions);
-            // pre-rewrite this path drained every Node into a freshly
-            // allocated Vec, which means the survivors' Node headers were
-            // moved twice (drain → push). retain_mut moves them at most
-            // once and avoids the new-Vec allocation entirely. The dropped
-            // Nodes' inner dense Vecs are deallocated by Drop the same as
-            // before, so memory behavior is unchanged.
-            self.nodes.retain(|n| reachable.contains(&n.id));
-
-            // Rebuild transposition_table fresh over the new (possibly
-            // compacted) indices. Same big-O as before; the
-            // with_capacity hint preserves the previous allocation
-            // shape so rehashing during repopulation is avoided.
-            self.transposition_table.clear();
-            self.transposition_table.reserve(self.nodes.len());
-            for (i, n) in self.nodes.iter().enumerate() {
-                self.transposition_table.insert(n.id, i);
+            // Rebuild the arena keeping only reachable nodes, and remap indices.
+            let mut nodes_after_pruning: Vec<Node<E::Act>> = Vec::with_capacity(reachable.len());
+            let mut table_after_pruning: FxHashMap<NodeId, usize> =
+                FxHashMap::with_capacity_and_hasher(reachable.len(), Default::default());
+            for node in self.nodes.drain(..) {
+                if reachable.contains(&node.id) {
+                    let new_idx = nodes_after_pruning.len();
+                    table_after_pruning.insert(node.id, new_idx);
+                    nodes_after_pruning.push(node);
+                }
             }
+            self.nodes = nodes_after_pruning;
+            self.transposition_table = table_after_pruning;
         } else {
             // The action does not lead to a known child. This might happen if the search is
             // shallow and the node was never fully expanded.
