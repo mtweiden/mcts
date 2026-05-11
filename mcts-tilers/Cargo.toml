@@ -22,6 +22,11 @@ rand_distr = "0.6.0"
 rand = "0.10.0"
 rusqlite = { version = "0.39", features = ["bundled"] }
 chrono = { version = "0.4", features = ["serde"] }
+# Used by the handler::boards / handler::unpack hot path (cfg=python).
+# rustc-hash matches mcts-core for cache-friendly per-instance maps; rayon
+# parallelises the per-instance loop in build_boards_rs.
+rustc-hash = "2.1"
+rayon = "1.10"
 
 [dependencies.pyo3]
 version = "0.28.2"

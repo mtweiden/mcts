@@ -6,6 +6,8 @@ pub mod evaluator;
 pub mod gatherer;
 
 #[cfg(feature = "python")]
+pub mod handler;
+#[cfg(feature = "python")]
 pub mod py_ipc;
 #[cfg(feature = "python")]
 pub mod py_mcts;
@@ -52,6 +54,13 @@ fn mcts_tilers(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // for gathering and evaluating
     m.add_function(wrap_pyfunction!(gatherer::run_gatherer, m)?)?;
     m.add_function(wrap_pyfunction!(evaluator::run_evaluator, m)?)?;
+
+    // Handler-side preprocessing in Rust (drop-in replacements for the
+    // Python+numpy hot path in handler.py). Opted-in by handler.py via
+    // the MCTS_HANDLER_RUST env var.
+    m.add_function(wrap_pyfunction!(handler::boards::build_boards_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(handler::unpack::unpack_placement_batch_rs, m)?)?;
+    m.add_function(wrap_pyfunction!(handler::unpack::unpack_objectives_batch_rs, m)?)?;
 
     Ok(())
 }

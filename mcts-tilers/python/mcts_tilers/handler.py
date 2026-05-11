@@ -1,5 +1,6 @@
 import json
 import logging
+import os
 from pathlib import Path
 from argparse import ArgumentParser
 
@@ -12,6 +13,13 @@ from tile import Agent
 
 from mcts_tilers import PyArena
 from mcts_tilers import QUBIT_SIZE, OBJECTIVE_SIZE, OBJECTIVES_LAYER_MAX
+
+# Rust opt-in for the build_boards / unpack_* hot path. The actual
+# rebinding happens at the bottom of this file once the Python defs
+# exist; this constant just controls which branch wins. Set
+# MCTS_HANDLER_RUST=1 to flip the handler over to the Rust
+# implementations exposed by the mcts_tilers PyO3 module.
+_USE_RUST_HANDLER = os.environ.get("MCTS_HANDLER_RUST", "0") == "1"
 
 # ------------------------------------------------------------------------------
 # Constants
@@ -542,3 +550,20 @@ if __name__ == "__main__":
         metrics_path = Path(args.metrics_dir) / f"handler_{atag}_{args.handler_id}.jsonl"
 
     do_work(arena, device, handler_id=args.handler_id, metrics_path=metrics_path)
+
+
+# ------------------------------------------------------------------------------
+# Rust dispatch (must be after the Python defs above so `build_boards` etc.
+# exist as module attributes before we conditionally rebind them).
+# ------------------------------------------------------------------------------
+# do_work looks up `build_boards`, `unpack_placement_batch`,
+# `unpack_objectives_batch` at call time from this module's globals, so
+# overwriting them here flips every call site at once. Tests still
+# import the originals from this module by name; parametrized tests
+# pull the Rust versions directly from mcts_tilers.
+if _USE_RUST_HANDLER:
+    from mcts_tilers import (
+        build_boards_rs as build_boards,                  # noqa: F811
+        unpack_placement_batch_rs as unpack_placement_batch,  # noqa: F811
+        unpack_objectives_batch_rs as unpack_objectives_batch,  # noqa: F811
+    )

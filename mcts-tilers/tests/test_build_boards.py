@@ -1,14 +1,25 @@
 """
-Tests for handler.build_boards. Pinned-behavior tests:
+Tests for the handler.py preprocessing hot path: build_boards plus the
+unpack_placement_batch / unpack_objectives_batch helpers, in both Python and
+Rust implementations.
 
+Pinned-behavior tests:
 - The canonical reference (`_reference_build_boards`) is a literal copy of the
   implementation as of 2026-05-09, before any vectorization. It encodes the
-  intended semantics on representative inputs.
-- The production `build_boards` must match this reference output exactly on
-  every test case, including edge cases (empty layers, no objectives, ancillas
-  with the 6→7 orientation transition, CX/CZ pairs, mixed batches).
+  intended semantics on representative inputs. Both the Python production
+  `build_boards` and the Rust `build_boards_rs` must match this reference
+  output bit-for-bit, including edge cases (empty layers, no objectives,
+  ancillas with the 6→7 orientation transition, CX/CZ pairs, mixed batches).
+- `TestUnpackRust` verifies that `unpack_placement_batch_rs` and
+  `unpack_objectives_batch_rs` produce byte-identical output to their Python
+  counterparts on randomized raw byte slabs (opcodes are promoted i8→i32 on
+  the Rust side so they chain cleanly into `build_boards_rs`).
 
-The randomized smoke test uses a fixed RNG seed so failures are reproducible.
+The Rust test classes skip cleanly when the binding isn't built (no
+`build_boards_rs` in `mcts_tilers`) or is still a `NotImplementedError` stub,
+so the suite stays green while the Rust path is in flight.
+
+Randomized sweeps use fixed RNG seeds so failures are reproducible.
 Run with: pytest mcts/mcts-tilers/tests/test_build_boards.py
 """
 
@@ -17,6 +28,8 @@ import pytest
 
 from mcts_tilers.handler import (
     build_boards,
+    unpack_placement_batch,
+    unpack_objectives_batch,
     _RAW_OPCODE_TO_TOKEN,
     _RAW_CX_OPCODE,
     _RAW_CZ_OPCODE,
@@ -25,6 +38,14 @@ from mcts_tilers.handler import (
     _TOKEN_CZ_TARGET,
     _TOKEN_CX_CONTROL,
     _TOKEN_CX_TARGET,
+)
+from mcts_tilers import (
+    QUBIT_SIZE,
+    OBJECTIVE_SIZE,
+    OBJECTIVES_LAYER_MAX,
+    PLACEMENT_MAX,
+    OBJECTIVES_MAX,
+    LOOKAHEAD_MAX,
 )
 
 
@@ -394,3 +415,230 @@ class TestMatchesReference:
                 f"no_il={num_objectives[i, l]})"
             )
         assert np.array_equal(actual, expected)
+
+
+# ----------------------------------------------------------------------------
+# Rust implementation correctness — same correctness gate, different impl.
+# Skips cleanly when the Rust binding is unbuilt (no `build_boards_rs` in
+# mcts_tilers) or when it's still a NotImplementedError stub.
+# ----------------------------------------------------------------------------
+class TestMatchesReferenceRust:
+    """Same random-seed sweep as TestMatchesReference, but against the Rust
+    implementation exposed by mcts_tilers as `build_boards_rs`. Skipped if the
+    Rust binding isn't built yet (run `maturin develop` in mcts-tilers/) or if
+    the binding is still a NotImplementedError stub."""
+
+    @staticmethod
+    def _get_rust_impl():
+        try:
+            from mcts_tilers import build_boards_rs
+        except ImportError:
+            pytest.skip("build_boards_rs not built — run maturin develop in mcts-tilers/")
+        # Probe with a trivial input; if the stub raises NotImplementedError,
+        # skip rather than fail every test. Once the real impl lands the probe
+        # call returns a value and the suite runs for real.
+        try:
+            build_boards_rs(
+                np.zeros((0, 0), dtype=np.int32),
+                np.zeros((0, 0), dtype=np.uint8),
+                np.zeros((0,), dtype=np.uint16),
+                np.zeros((0,), dtype=np.int32),
+                [],
+                np.zeros((0,), dtype=np.uint8),
+                np.zeros((0, 0), dtype=np.uint16),
+                np.zeros((0, 0), dtype=bool),
+            )
+        except NotImplementedError:
+            pytest.skip("build_boards_rs is still a stub (NotImplementedError)")
+        except Exception:
+            # Real runtime errors are real test failures — let the actual
+            # tests surface them rather than masking here.
+            pass
+        return build_boards_rs
+
+    @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 17, 42, 100, 256, 9999])
+    def test_random_inputs_match_reference(self, seed):
+        build_boards_rs = self._get_rust_impl()
+
+        rng = np.random.default_rng(seed)
+        total = int(rng.integers(1, 16))
+        max_nq = int(rng.integers(1, 30))
+        max_nl = int(rng.integers(1, 4))
+        max_no = int(rng.integers(1, 20))
+        widths = rng.integers(1, 6, size=total).astype(np.int32)
+
+        qids = rng.integers(-10, 50, size=(total, max_nq)).astype(np.int32)
+        oris = rng.integers(0, 8, size=(total, max_nq)).astype(np.uint8)
+        num_qubits = rng.integers(0, max_nq + 1, size=total).astype(np.uint16)
+        num_layers = rng.integers(0, max_nl + 1, size=total).astype(np.uint8)
+        num_objectives = rng.integers(0, max_no + 1, size=(total, max_nl)).astype(np.uint16)
+        last_dir_vertical = rng.integers(0, 2, size=(total, 50)).astype(bool)
+
+        opcode_choices = (
+            list(_RAW_OPCODE_TO_TOKEN.keys()) + [_RAW_CX_OPCODE, _RAW_CZ_OPCODE]
+        )
+        layers = []
+        for _ in range(max_nl):
+            opcodes = rng.choice(opcode_choices, size=(total, max_no)).astype(np.int32)
+            arg0s = rng.integers(-10, 50, size=(total, max_no)).astype(np.int32)
+            arg1s = rng.integers(-10, 50, size=(total, max_no)).astype(np.int32)
+            layers.append(_make_layer_data(opcodes, arg0s, arg1s))
+
+        actual = build_boards_rs(
+            qids, oris, num_qubits, widths,
+            layers, num_layers, num_objectives, last_dir_vertical,
+        )
+        expected = _reference_build_boards(
+            qids, oris, num_qubits, widths,
+            layers, num_layers, num_objectives, last_dir_vertical,
+        )
+        assert actual.shape == expected.shape
+        assert actual.dtype == expected.dtype
+        if not np.array_equal(actual, expected):
+            diff_idx = np.argwhere(actual != expected)
+            first = diff_idx[0]
+            i, l, j, c = first
+            pytest.fail(
+                f"Rust mismatch at (i={i}, l={l}, j={j}, c={c}): "
+                f"rust={actual[i, l, j, c]} ref={expected[i, l, j, c]} "
+                f"(qid={qids[i, j]}, ori={oris[i, j]}, "
+                f"nq={num_qubits[i]}, nl={num_layers[i]}, "
+                f"no_il={num_objectives[i, l]})"
+            )
+        assert np.array_equal(actual, expected)
+
+
+# ----------------------------------------------------------------------------
+# Rust unpack_* parity tests.
+# These check that unpack_placement_batch_rs / unpack_objectives_batch_rs
+# produce byte-identical output to the Python originals on a sweep of random
+# raw byte slabs. Same skip-on-stub probe as TestMatchesReferenceRust.
+# ----------------------------------------------------------------------------
+def _build_random_placement_raw(rng, total, max_nq_per_inst):
+    """Generate a (total, PLACEMENT_MAX) u8 slab + matching num_qubits."""
+    nq_arr = rng.integers(0, max_nq_per_inst + 1, size=total).astype(np.uint16)
+    raw = np.zeros((total, PLACEMENT_MAX), dtype=np.uint8)
+    for i in range(total):
+        nq = int(nq_arr[i])
+        for j in range(nq):
+            qid = int(rng.integers(-10, 50))
+            off = j * QUBIT_SIZE
+            raw[i, off:off + 4] = np.array([qid], dtype=np.int32).view(np.uint8)
+            raw[i, off + 4] = rng.integers(0, 8)
+    return raw, nq_arr
+
+
+def _build_random_objectives_raw(rng, total, max_nl_per_inst, max_no_per_layer):
+    """Generate (total, OBJECTIVES_MAX) u8 + num_layers + num_objectives."""
+    nl_arr = rng.integers(0, max_nl_per_inst + 1, size=total).astype(np.uint8)
+    no_arr = np.zeros((total, LOOKAHEAD_MAX), dtype=np.uint16)
+    raw = np.zeros((total, OBJECTIVES_MAX), dtype=np.uint8)
+    valid_opcodes = list(_RAW_OPCODE_TO_TOKEN.keys()) + [_RAW_CX_OPCODE, _RAW_CZ_OPCODE]
+    for i in range(total):
+        nl = int(nl_arr[i])
+        for l in range(min(nl, LOOKAHEAD_MAX)):
+            no = int(rng.integers(0, max_no_per_layer + 1))
+            no_arr[i, l] = no
+            layer_off = l * OBJECTIVES_LAYER_MAX
+            for k in range(no):
+                off = layer_off + k * OBJECTIVE_SIZE
+                raw[i, off] = np.uint8(rng.choice(valid_opcodes))
+                arg0 = int(rng.integers(-10, 50))
+                arg1 = int(rng.integers(-10, 50))
+                raw[i, off + 1: off + 5] = np.array([arg0], dtype=np.int32).view(np.uint8)
+                raw[i, off + 5: off + 9] = np.array([arg1], dtype=np.int32).view(np.uint8)
+    return raw, nl_arr, no_arr
+
+
+class TestUnpackRust:
+    """Bit-for-bit parity between the Python and Rust unpack_* helpers.
+    Skipped if the Rust bindings aren't built yet or are still stubs."""
+
+    @staticmethod
+    def _get_placement_impl():
+        try:
+            from mcts_tilers import unpack_placement_batch_rs
+        except ImportError:
+            pytest.skip("unpack_placement_batch_rs not built — run maturin develop")
+        try:
+            unpack_placement_batch_rs(
+                np.zeros((0, PLACEMENT_MAX), dtype=np.uint8),
+                np.zeros((0,), dtype=np.uint16),
+            )
+        except NotImplementedError:
+            pytest.skip("unpack_placement_batch_rs is still a stub")
+        except Exception:
+            pass
+        return unpack_placement_batch_rs
+
+    @staticmethod
+    def _get_objectives_impl():
+        try:
+            from mcts_tilers import unpack_objectives_batch_rs
+        except ImportError:
+            pytest.skip("unpack_objectives_batch_rs not built — run maturin develop")
+        try:
+            unpack_objectives_batch_rs(
+                np.zeros((0, OBJECTIVES_MAX), dtype=np.uint8),
+                np.zeros((0,), dtype=np.uint8),
+                np.zeros((0, LOOKAHEAD_MAX), dtype=np.uint16),
+            )
+        except NotImplementedError:
+            pytest.skip("unpack_objectives_batch_rs is still a stub")
+        except Exception:
+            pass
+        return unpack_objectives_batch_rs
+
+    @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 17, 42, 100, 256, 9999])
+    def test_placement_matches_python(self, seed):
+        rs = self._get_placement_impl()
+        rng = np.random.default_rng(seed)
+        total = int(rng.integers(1, 16))
+        max_nq_per_inst = int(rng.integers(1, 30))
+
+        raw, nq = _build_random_placement_raw(rng, total, max_nq_per_inst)
+
+        py_ids, py_oris = unpack_placement_batch(raw, nq)
+        rs_ids, rs_oris = rs(raw, nq)
+
+        # Python uses int32 for ids and uint8 for orientations; Rust matches.
+        assert rs_ids.dtype == py_ids.dtype, f"ids dtype: {rs_ids.dtype} vs {py_ids.dtype}"
+        assert rs_oris.dtype == py_oris.dtype, f"oris dtype: {rs_oris.dtype} vs {py_oris.dtype}"
+        assert rs_ids.shape == py_ids.shape, f"ids shape: {rs_ids.shape} vs {py_ids.shape}"
+        assert rs_oris.shape == py_oris.shape, f"oris shape: {rs_oris.shape} vs {py_oris.shape}"
+        np.testing.assert_array_equal(rs_ids, py_ids)
+        np.testing.assert_array_equal(rs_oris, py_oris)
+
+    @pytest.mark.parametrize("seed", [1, 2, 3, 4, 5, 17, 42, 100, 256, 9999])
+    def test_objectives_matches_python(self, seed):
+        rs = self._get_objectives_impl()
+        rng = np.random.default_rng(seed)
+        total = int(rng.integers(1, 16))
+        max_nl = int(rng.integers(1, LOOKAHEAD_MAX + 1))
+        max_no_per_layer = int(rng.integers(1, 20))
+
+        raw, nl, no = _build_random_objectives_raw(rng, total, max_nl, max_no_per_layer)
+
+        py_layers = unpack_objectives_batch(raw, nl, no)
+        rs_layers = rs(raw, nl, no)
+
+        assert len(rs_layers) == len(py_layers), (
+            f"layer count: rust={len(rs_layers)} python={len(py_layers)}"
+        )
+        for li, (pl, rl) in enumerate(zip(py_layers, rs_layers)):
+            assert set(rl.keys()) == set(pl.keys()), f"layer {li} keys differ"
+            for key in ("opcodes", "arg0s", "arg1s"):
+                p_arr = pl[key]
+                r_arr = rl[key]
+                # Python opcodes are int8; Rust promotes to int32. arg0s/arg1s
+                # are int32 in both. Compare values (cast Python's int8 → int32).
+                if key == "opcodes":
+                    assert r_arr.dtype == np.int32, (
+                        f"layer {li} opcodes Rust dtype should be int32, got {r_arr.dtype}"
+                    )
+                    np.testing.assert_array_equal(r_arr, p_arr.astype(np.int32))
+                else:
+                    assert r_arr.dtype == p_arr.dtype, (
+                        f"layer {li} {key} dtype: rust={r_arr.dtype} python={p_arr.dtype}"
+                    )
+                    np.testing.assert_array_equal(r_arr, p_arr)
