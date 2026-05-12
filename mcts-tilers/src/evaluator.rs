@@ -169,7 +169,14 @@ impl Evaluator {
                 self.mcts_steps,
                 self.c_puct,
                 &terminal_evaluator,
-                true,
+                // forced_playouts=false. Eval wants maximum move strength —
+                // forced playouts (Wu 2020 §3.2) deliberately routes some
+                // playouts to low-prior root actions for training-data
+                // exploration, which is correct during gather but skews
+                // edge_visits during eval and weakens the agent's argmax
+                // action selection below. See mcts-core/src/mcts.rs:121–140
+                // for the contract.
+                false,
             );
 
             // Greedy: pick the action with the most visits.
