@@ -6,22 +6,18 @@
 // in that file is the source of truth. Output must match it bit-for-bit on
 // every input.
 //
-// Parallelism: the outer (total,) loop is embarrassingly parallel — each
-// instance writes to its own contiguous (max_nl, max_nq, 4) slab of the
-// output, with no cross-instance reads. rayon's par_chunks_mut splits the
-// flat output buffer by instance, one rayon iter per instance.
-//
-// Allocations: each instance constructs its own FxHashMap<i32, ...> for
-// pos_map (qid → position) and per-layer obj_map (qid → token+mate). The
-// maps are small (capacity ≈ nq) and reused only within one instance; not
-// worth pooling across instances given that thread allocators amortize.
+// Parallelism: none. The outer (total,) loop is embarrassingly parallel,
+// but the gather pipeline runs many handler processes concurrently — each
+// would over-spawn Rayon threads (default = num CPUs), causing severe
+// thread oversubscription that erased the per-call speedup in production
+// (measured 2026-05-11). Sequential iteration here is the right choice;
+// process-level parallelism does the work.
 
 use numpy::ndarray::{Array2, Array4};
 use numpy::{IntoPyArray, PyArray4, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyKeyError;
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rayon::prelude::*;
 use rustc_hash::FxHashMap;
 
 // ----------------------------------------------------------------------------
@@ -80,11 +76,11 @@ pub fn build_boards_rs<'py>(
     qubit_ids: PyReadonlyArray2<'py, i32>,      // (total, max_nq)
     qubit_oris: PyReadonlyArray2<'py, u8>,      // (total, max_nq)
     num_qubits: PyReadonlyArray1<'py, u16>,     // (total,)
-    widths: PyReadonlyArray1<'py, i32>,         // (total,)
+    widths: PyReadonlyArray1<'py, u8>,          // (total,)  — slot view returns u8
     obj_layers: Bound<'py, PyList>,             // list[dict[str, np.ndarray]]
     num_layers: PyReadonlyArray1<'py, u8>,      // (total,)
     num_objectives: PyReadonlyArray2<'py, u16>, // (total, LOOKAHEAD_MAX)
-    last_dir_vertical: PyReadonlyArray2<'py, bool>, // (total, MAX_ANCILLAS)
+    last_dir_vertical: PyReadonlyArray2<'py, u8>, // (total, MAX_ANCILLAS) — slot view returns u8 (0/1)
 ) -> PyResult<Bound<'py, PyArray4<i32>>> {
     let qids = qubit_ids.as_array();
     let oris = qubit_oris.as_array();
@@ -142,7 +138,7 @@ pub fn build_boards_rs<'py>(
     let mut boards = Array4::<i32>::zeros((total, max_nl, max_nq, 4));
     let chunk_size = max_nl * max_nq * 4;
 
-    // Empty-input fast path. par_chunks_mut(0) panics, and there's nothing
+    // Empty-input fast path. chunks_mut(0) panics, and there's nothing
     // to do when total == 0 either — the zero-initialised array is already
     // the correct answer. Reference implementation returns the same empty
     // shape on these inputs.
@@ -153,12 +149,12 @@ pub fn build_boards_rs<'py>(
     boards
         .as_slice_mut()
         .expect("Array4::zeros produces contiguous storage")
-        .par_chunks_mut(chunk_size)
+        .chunks_mut(chunk_size)
         .enumerate()
         .for_each(|(i, boards_i)| {
             let nq = nq_arr[i] as usize;
             let nl = (nl_arr[i] as usize).min(max_nl);
-            let w = w_arr[i];
+            let w = w_arr[i] as i32;
             if nq == 0 || w <= 0 {
                 // Default-zeroed slab is already correct; nothing to do.
                 return;
@@ -237,7 +233,7 @@ pub fn build_boards_rs<'py>(
                         let mut ori = ori_lookup_val;
                         if ori == 6 && anc_idx >= 0 && (anc_idx as usize) < ldv_max
                         {
-                            if ldv_arr[[i, anc_idx as usize]] {
+                            if ldv_arr[[i, anc_idx as usize]] != 0 {
                                 ori = 7;
                             }
                         }

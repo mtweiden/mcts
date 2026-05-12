@@ -18,9 +18,12 @@ use numpy::ndarray::Array2;
 use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::prelude::*;
 use pyo3::types::{PyDict, PyList};
-use rayon::prelude::*;
 
 use crate::constants::{OBJECTIVE_SIZE, OBJECTIVES_LAYER_MAX, QUBIT_SIZE};
+
+// Note on parallelism: sequential by design. Many handler processes run
+// concurrently in production gather; per-call thread pools (e.g. Rayon's)
+// would over-subscribe CPUs. Process-level parallelism does the work.
 
 // ----------------------------------------------------------------------------
 // unpack_placement_batch_rs
@@ -57,11 +60,11 @@ pub fn unpack_placement_batch_rs<'py>(
         .as_slice_mut()
         .expect("Array2::zeros produces contiguous storage");
 
-    // Parallel per-instance. zip the two output slices so each rayon iter
+    // Sequential per-instance. zip the two output slices so each iter
     // owns exclusive write access to its row of both ids and oris.
     ids_slice
-        .par_chunks_mut(max_nq)
-        .zip(oris_slice.par_chunks_mut(max_nq))
+        .chunks_mut(max_nq)
+        .zip(oris_slice.chunks_mut(max_nq))
         .enumerate()
         .for_each(|(i, (ids_row, oris_row))| {
             let nq = nq_view[i] as usize;
@@ -145,13 +148,13 @@ pub fn unpack_objectives_batch_rs<'py>(
                 .as_slice_mut()
                 .expect("Array2::zeros produces contiguous storage");
 
-            // Parallelize per-instance. Triple-zip via nested zips; unpack
-            // the nested tuple in the closure. Each rayon iter owns its
-            // row in all three output arrays.
+            // Sequential per-instance. Triple-zip via nested zips; unpack
+            // the nested tuple in the closure. Each iter owns its row in
+            // all three output arrays.
             op_slice
-                .par_chunks_mut(max_no)
-                .zip(a0_slice.par_chunks_mut(max_no))
-                .zip(a1_slice.par_chunks_mut(max_no))
+                .chunks_mut(max_no)
+                .zip(a0_slice.chunks_mut(max_no))
+                .zip(a1_slice.chunks_mut(max_no))
                 .enumerate()
                 .for_each(|(i, ((op_row, a0_row), a1_row))| {
                     if l >= nl_view[i] as usize {
