@@ -80,7 +80,12 @@ def latest_checkpoint() -> str | None:
     return files[-1]
 
 
-MODEL = Agent(embedding_dim=128, num_layers=10, lookahead=1)
+# Module-level default so import-mode users (bench_handler.py,
+# profile_inference.py) and any other importer get a working MODEL.
+# Script-mode reassigns this in __main__ based on CLI args. Defaults
+# match the d=128 / 4-head pretrained checkpoint that's currently
+# in production.
+MODEL = Agent(embedding_dim=128, num_layers=10, lookahead=1, num_heads=4)
 
 # ------------------------------------------------------------------------------
 # Unpacking helpers
@@ -687,7 +692,26 @@ if __name__ == "__main__":
              "to {metrics_dir}/handler_{arena_tag}_{handler_id}.jsonl with "
              "fill / build / gpu wallclock breakdown. Used to calibrate "
              "MAX_BATCH and BATCH_TIMEOUT from real workload distributions.")
+    # Model architecture — must match the checkpoint in --weights. Defaults
+    # match the d=128 production checkpoint; orchestrator.start_handlers
+    # forwards args.embedding_dim/num_layers/lookahead/num_heads on every
+    # launch.
+    parser.add_argument("--embedding_dim", type=int, default=128)
+    parser.add_argument("--num_layers", type=int, default=10)
+    parser.add_argument("--lookahead", type=int, default=1)
+    parser.add_argument("--num_heads", type=int, default=4)
     args = parser.parse_args()
+
+    # Re-instantiate MODEL with the requested architecture. Replaces the
+    # module-level default so do_work / pre-warm / autocast wrappers all
+    # see the right model. Keeps backward compat with the module-level
+    # MODEL for any importer that doesn't go through this entry point.
+    MODEL = Agent(
+        embedding_dim=args.embedding_dim,
+        num_layers=args.num_layers,
+        lookahead=args.lookahead,
+        num_heads=args.num_heads,
+    )
 
     if torch.cuda.is_available():
         print(f"CUDA is available. {torch.cuda.device_count()} devices found.")
