@@ -6,6 +6,7 @@ use mcts_core::inference::InferenceClient;
 use mcts_core::mcts::MCTS;
 
 use tilers::env::Environment;
+use tilers::rl;
 use tilers::solver::Solver;
 
 use crate::constants::*;
@@ -113,14 +114,19 @@ impl Evaluator {
                 true,
             );
 
-            // Greedy: pick the action with the most visits.
-            let action = *valid_actions
+            // Greedy: pick the action with the most visits.  `valid_actions`
+            // is `Vec<tilers::Action>`; encode to the flat `u16` id space the
+            // tree/visits are keyed by.
+            let action = valid_actions
                 .iter()
-                .max_by_key(|&&a| *root.edge_visits.get(&(a as Action)).unwrap_or(&0))
-                .unwrap() as Action;
+                .map(|&a| rl::encode(&tilers_env.inner, a) as Action)
+                .max_by_key(|&id| *root.edge_visits.get(&id).unwrap_or(&0))
+                .unwrap();
 
             actions_taken.push(action);
-            let _ = tilers_env.inner.step(action as usize);
+            let a = rl::decode(&tilers_env.inner, action as usize)
+                .expect("evaluator produced an invalid action id");
+            let _ = tilers_env.inner.step(a);
             tilers_env.inner.finish_cultivating(None, None);
             mcts.advance_root(action);
         }
@@ -286,7 +292,7 @@ mod tests {
     fn small_env() -> TilersEnvInner {
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(7));
-        env.random_objectives(1, false);
+        env.random_start(1, false);
         env
     }
 

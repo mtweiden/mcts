@@ -151,10 +151,10 @@ fn main() {
             env.set_seed(Some(seed.unwrap() as u64));
         }
 
-        env.random_objectives(no, false);
-        if env.valid_actions().contains(&0) {
+        env.random_start(no, false);
+        if env.valid_actions().contains(&tilers::enums::Action::AutoExecute) {
             let mut tmp_env = env.clone();
-            let _ = tmp_env.step(0);
+            let _ = tmp_env.step(tilers::enums::Action::AutoExecute);
             if tmp_env.done() {
                 continue;
             }
