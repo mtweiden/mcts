@@ -47,7 +47,9 @@ pub struct Gatherer {
     /// full-search turns. 0.0 disables root noise.
     /// Reference: [Wu 2020, §2].
     dirichlet_epsilon: f32,
-    num_objective_layers: usize,
+    /// Future objective layers beyond the current one; board has
+    /// `lookahead + 1` layers.  See `tilers::rl::board::construct_board`.
+    lookahead: usize,
     gather_id: usize,
     /// The reward_ratio_limit scales and clamps the reward ratio above and below
     /// this value when computing value targets. 1.0 means there is no scaling.
@@ -65,7 +67,7 @@ impl Gatherer {
         output_path: String,
         noise_strength: f64,
         dirichlet_epsilon: f32,
-        num_objective_layers: usize,
+        lookahead: usize,
         gather_id: usize,
         trajectory_dir: Option<String>,
         reward_ratio_limit: Option<f32>,
@@ -80,7 +82,7 @@ impl Gatherer {
             output_path,
             noise_strength,
             dirichlet_epsilon,
-            num_objective_layers,
+            lookahead,
             gather_id,
             reward_ratio_limit: reward_ratio_limit.unwrap_or(1.0),
             trajectory_dir,
@@ -238,7 +240,8 @@ impl Gatherer {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
         let mut game = env.clone();
-        game.drop_objectives_beyond_nth_layer(self.num_objective_layers - 1);
+        // Keep objective layers 0..=lookahead (lookahead + 1 layers total).
+        game.drop_objectives_beyond_nth_layer(self.lookahead);
         game.set_cultivation_time(10);
         let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
 
@@ -270,7 +273,7 @@ impl Gatherer {
             usize,
         )> = Vec::new();
 
-        let mut tilers_env = TilersEnv::new(game.clone(), self.num_objective_layers);
+        let mut tilers_env = TilersEnv::new(game.clone(), self.lookahead);
 
         let max_actions = if let Some(max) = self.max_actions {
             max
@@ -524,7 +527,7 @@ pub fn run_gatherer(
     seed: Option<i32>,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
-    let num_objective_layers = DEFAULT_LOOKAHEAD;
+    let lookahead = DEFAULT_LOOKAHEAD;
 
     let arena_name = if arena_tag.is_empty() {
         format!("mcts_{}_{}", num_slots, num_handlers)
@@ -546,7 +549,7 @@ pub fn run_gatherer(
         output_path,
         0.20,
         dirichlet_epsilon,
-        num_objective_layers,
+        lookahead,
         worker_id as usize,
         trajectory_dir,
         Some(reward_ratio_limit),
@@ -618,7 +621,7 @@ mod tests {
             output_path.to_string(),
             0.0,                  // noise_strength
             0.0,                  // dirichlet_epsilon
-            2,                    // num_objective_layers
+            1,                    // lookahead
             0,                    // gather_id
             None,                 // trajectory_dir
             Some(1.0),            // reward_ratio_limit
@@ -630,7 +633,7 @@ mod tests {
 
     #[test]
     fn test_new_sets_explicit_reward_ratio_limit() {
-        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1, None, Some(0.3), Some(100));
+        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 1, 1, None, Some(0.3), Some(100));
         assert!((g.reward_ratio_limit - 0.3).abs() < 1e-6);
         assert_eq!(g.mcts_steps, 10);
         assert_eq!(g.fast_steps, 2);
@@ -638,7 +641,7 @@ mod tests {
 
     #[test]
     fn test_new_defaults_reward_ratio_limit_to_one() {
-        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0, None, None, None);
+        let g = Gatherer::new(8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 1, 0, None, None, None);
         assert!((g.reward_ratio_limit - 1.0).abs() < 1e-6);
     }
 
@@ -806,7 +809,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let out = tmp.path().join("out.jsonl").to_str().unwrap().to_string();
 
-        let g = Gatherer::new(1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0, None, Some(1.0), None);
+        let g = Gatherer::new(1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 1, 0, None, Some(1.0), None);
 
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(99));

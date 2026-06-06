@@ -56,9 +56,9 @@ fn e2e_gather_full_game_writes_board_records() {
     let out = tmp.to_str().unwrap().to_string();
 
     // batch_size, mcts_steps, fast_steps, p_full_search, output, noise,
-    // dirichlet, num_objective_layers, gather_id, traj_dir, reward_limit, max_actions
+    // dirichlet, lookahead, gather_id, traj_dir, reward_limit, max_actions
     let gatherer = Gatherer::new(
-        1, 16, 8, 1.0, out.clone(), 0.0, 0.0, 2, 0, None, Some(1.0), None,
+        1, 16, 8, 1.0, out.clone(), 0.0, 0.0, 1, 0, None, Some(1.0), None,
     );
     let client = TrivialTilersIpcClient {};
     let mut rng = StdRng::seed_from_u64(0);

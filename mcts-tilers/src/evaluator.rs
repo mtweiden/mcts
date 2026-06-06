@@ -18,7 +18,7 @@ use crate::client::TilersIpcClient;
 // Configuration
 // =============================================================================
 const NUM_SLOTS: usize = 2048;
-const NUM_OBJECTIVE_LAYERS: usize = DEFAULT_LOOKAHEAD;
+const LOOKAHEAD: usize = DEFAULT_LOOKAHEAD;
 
 // =============================================================================
 // HoldoutEnvironment
@@ -69,7 +69,7 @@ impl Evaluator {
         client: &dyn InferenceClient<TilersEnv>,
     ) -> (Vec<Action>, Option<f32>) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
-        let mut tilers_env = TilersEnv::new(env.clone(), NUM_OBJECTIVE_LAYERS);
+        let mut tilers_env = TilersEnv::new(env.clone(), LOOKAHEAD);
         tilers_env.inner.set_cultivation_time(10);
 
         let reference_depth = self.solve_with_heuristic(&tilers_env.inner);
@@ -284,7 +284,8 @@ mod tests {
     fn make_holdout(id: i64, env: &TilersEnvInner) -> HoldoutEnvironment {
         HoldoutEnvironment {
             environment_id: id,
-            json: env.to_json(NUM_OBJECTIVE_LAYERS),
+            // `to_json` takes a layer count, not a lookahead.
+            json: env.to_json(LOOKAHEAD + 1),
             num_objectives: 1,
         }
     }

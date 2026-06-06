@@ -13,8 +13,11 @@ const _: () = assert!(NUM_ACTIONS == 1 + 6 * MAX_ANCILLAS);
 pub const GRID_MAX: usize = 400;
 /// Maximum number of layers that can be looked ahead for
 pub const LOOKAHEAD_MAX: usize = 3;
-/// Default number of layers to look ahead for when creating the environment
-pub const DEFAULT_LOOKAHEAD: usize = 2;
+/// Default lookahead: the number of *future* objective layers stacked on
+/// top of the current one.  Matches `tilers::rl::board::construct_board`
+/// (which yields `lookahead + 1` layers) and `tile.Agent.lookahead`, so the
+/// whole system speaks one definition.  Default 1 → 2 board layers.
+pub const DEFAULT_LOOKAHEAD: usize = 1;
 /// Maximum batch size for inference requests
 pub const MAX_BATCH: usize = 8;
 

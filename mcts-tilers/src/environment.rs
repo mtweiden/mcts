@@ -35,12 +35,15 @@ impl Obs for TilersObs {}
 #[derive(Clone)]
 pub struct TilersEnv {
     pub inner: TilersInner,
-    pub num_objective_layers: usize,
+    /// Number of *future* objective layers beyond the current one; the board
+    /// has `lookahead + 1` layers.  Same definition as
+    /// `tilers::rl::board::construct_board` and `tile.Agent.lookahead`.
+    pub lookahead: usize,
 }
 
 impl TilersEnv {
-    pub fn new(inner: TilersInner, num_objective_layers: usize) -> Self {
-        Self { inner, num_objective_layers }
+    pub fn new(inner: TilersInner, lookahead: usize) -> Self {
+        Self { inner, lookahead }
     }
 
     pub fn build_obs(&self) -> TilersObs {
@@ -48,10 +51,8 @@ impl TilersEnv {
         let width = self.inner.width;
         let num_ancillas = self.inner.num_ancillas();
 
-        // `construct_board(env, lookahead)` produces `lookahead + 1` layers;
-        // `num_objective_layers` is that count.
-        let lookahead = self.num_objective_layers.saturating_sub(1);
-        let board = construct_board(&self.inner, lookahead);
+        // `construct_board(env, lookahead)` produces `lookahead + 1` layers.
+        let board = construct_board(&self.inner, self.lookahead);
         let num_layers = board.len();
 
         // Validity mask in the flat integer action space, padded to the
