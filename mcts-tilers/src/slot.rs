@@ -3,58 +3,16 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use anyhow::{anyhow, Result};
 use mcts_core::ipc_core::{SlotInit, SLOT_FREE};
 
-use tilers::qubit::Qubit;
-use tilers::objective::Objective;
-use tilers::enums::{Operation, Orientation, QubitId};
+use tilers::rl::board::BoardCell;
 
 use crate::constants::*;
 use crate::environment::TilersObs;
 
-// Local u8 → enum decoders. The tilers crate previously exposed
-// Orientation::from_u8 / Operation::from_u8; those were removed in favour
-// of typed conversions on the python side. The wire format we use across
-// the shared-memory arena is still raw u8, so we keep the decoders here
-// where they're owned by the consumer of the wire format.
-//
-// The discriminants must match `PyOrientation` and `PyOperation` in
-// tilers/src/enums.rs (the python bindings) because those define the
-// numeric values that handler.py packs into the slot.
-fn orientation_from_u8(v: u8) -> Option<Orientation> {
-    match v {
-        0 => Some(Orientation::Vertical),
-        1 => Some(Orientation::Horizontal),
-        2 => Some(Orientation::Ancilla),
-        3 => Some(Orientation::Cultivating),
-        4 => Some(Orientation::Resource),
-        _ => None,
-    }
-}
-
-fn operation_from_u8(v: u8) -> Option<Operation> {
-    match v {
-        0 => Some(Operation::X),
-        1 => Some(Operation::Y),
-        2 => Some(Operation::Z),
-        3 => Some(Operation::H),
-        4 => Some(Operation::S),
-        5 => Some(Operation::Sdg),
-        6 => Some(Operation::SX),
-        7 => Some(Operation::SXdg),
-        8 => Some(Operation::T),
-        9 => Some(Operation::Tdg),
-        10 => Some(Operation::TX),
-        11 => Some(Operation::TXdg),
-        12 => Some(Operation::CX),
-        13 => Some(Operation::CZ),
-        14 => Some(Operation::RZ),
-        15 => Some(Operation::MV),
-        16 => Some(Operation::ROT),
-        17 => Some(Operation::CULT),
-        18 => Some(Operation::MEASURE),
-        19 => Some(Operation::RESET),
-        _ => None,
-    }
-}
+// Note: the pre-PauliProduct env exposed `Orientation::from_u8` and
+// `Operation::from_u8` for the placement/objective wire format used by
+// the old slot layout.  Both helpers + that wire format are gone — the
+// observation is now `Vec<Vec<BoardCell>>` (the 10-channel board) and
+// the slot serializes those cells directly as i16 channels.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Slot states
@@ -63,6 +21,11 @@ pub use mcts_core::ipc_core::{SLOT_DONE, SLOT_READY, SLOT_WAITING};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tilers-specific Slot
+//
+// The observation is the 10-channel `tilers::rl::board` (see
+// TILERS_MIGRATION.md §4): `num_layers` layers, each `h*w` cells in
+// row-major order, each cell `CELL_FIELDS` i16 channels.  The flat
+// placement/objective byte packing of the pre-PauliProduct env is gone.
 // ─────────────────────────────────────────────────────────────────────────────
 #[repr(C)]
 pub struct TilersSlot {
@@ -72,20 +35,16 @@ pub struct TilersSlot {
     pub owner_id: u32,
     pub req_id: u64,
 
-    // Inputs
+    // Inputs — per-batch metadata
     pub h: [u8; MAX_BATCH],
     pub w: [u8; MAX_BATCH],
     pub num_ancillas: [u8; MAX_BATCH],
-    pub num_qubits: [u16; MAX_BATCH],
     pub num_layers: [u8; MAX_BATCH],
-    pub num_objectives: [[u16; LOOKAHEAD_MAX]; MAX_BATCH],
 
-    pub placement: [[u8; PLACEMENT_MAX]; MAX_BATCH],
-    pub objectives: [[u8; OBJECTIVES_MAX]; MAX_BATCH],
+    // Observation board, laid out [layer][cell][channel] within BOARD_MAX i16.
+    pub board: [[i16; BOARD_MAX]; MAX_BATCH],
 
     pub action_mask: [u8; MAX_BATCH * NUM_ACTIONS],
-
-    pub last_dir_vertical: [u8; MAX_BATCH * MAX_ANCILLAS],  // bool for each ancilla in each batch
 
     // Outputs
     pub priors: [f32; MAX_BATCH * NUM_ACTIONS],
@@ -107,13 +66,9 @@ impl Default for TilersSlot {
             h: [0; MAX_BATCH],
             w: [0; MAX_BATCH],
             num_ancillas: [0; MAX_BATCH],
-            num_qubits: [0; MAX_BATCH],
             num_layers: [0; MAX_BATCH],
-            num_objectives: [[0; LOOKAHEAD_MAX]; MAX_BATCH],
-            placement: [[0; PLACEMENT_MAX]; MAX_BATCH],
-            objectives: [[0; OBJECTIVES_MAX]; MAX_BATCH],
+            board: [[0; BOARD_MAX]; MAX_BATCH],
             action_mask: [0; MAX_BATCH * NUM_ACTIONS],
-            last_dir_vertical: [0; MAX_BATCH * MAX_ANCILLAS],
             priors: [0.0; MAX_BATCH * NUM_ACTIONS],
             values: [0.0; MAX_BATCH],
             request_time_ns: AtomicU64::new(0),
@@ -133,6 +88,38 @@ impl SlotInit for TilersSlot {
     }
 }
 
+#[inline]
+fn cell_to_array(c: &BoardCell) -> [i16; CELL_FIELDS] {
+    [
+        c.qubit_role,
+        c.factor_kind,
+        c.resource_kind,
+        c.pp_group_row,
+        c.pp_group_col,
+        c.ancilla_idx,
+        c.last_move_dir,
+        c.weight_in_pp,
+        c.is_hub_for_pp,
+        c.is_y_ready,
+    ]
+}
+
+#[inline]
+fn cell_from_slice(s: &[i16]) -> BoardCell {
+    BoardCell {
+        qubit_role: s[0],
+        factor_kind: s[1],
+        resource_kind: s[2],
+        pp_group_row: s[3],
+        pp_group_col: s[4],
+        ancilla_idx: s[5],
+        last_move_dir: s[6],
+        weight_in_pp: s[7],
+        is_hub_for_pp: s[8],
+        is_y_ready: s[9],
+    }
+}
+
 impl TilersSlot {
     pub fn pack_observations(&mut self, observations: &[TilersObs]) -> Result<()> {
         let b = observations.len();
@@ -146,52 +133,25 @@ impl TilersSlot {
             self.w[i] = obs.width as u8;
             self.num_ancillas[i] = obs.num_ancillas as u8;
 
-            // Pack placement
-            let nq = obs.placement.len().min(GRID_MAX);
-            self.num_qubits[i] = nq as u16;
-            self.placement[i].fill(0);
-            for (j, qubit) in obs.placement.iter().take(nq).enumerate() {
-                let offset = j * QUBIT_SIZE;
-                let id_bytes = qubit.id.as_i32().to_le_bytes();
-                self.placement[i][offset..offset + 4].copy_from_slice(&id_bytes);
-                self.placement[i][offset + 4] = qubit.orientation as u8;
-            }
-
-            // Pack objectives
-            let nl = obs.objectives.len().min(LOOKAHEAD_MAX);
+            let nl = obs.board.len().min(LOOKAHEAD_MAX);
             self.num_layers[i] = nl as u8;
-            self.objectives[i].fill(0);
-            for (l, layer) in obs.objectives.iter().take(nl).enumerate() {
-                let no = layer.len().min(GRID_MAX);
-                self.num_objectives[i][l] = no as u16;
-                let layer_offset = l * OBJECTIVES_LAYER_MAX;
-                for (k, obj) in layer.iter().take(no).enumerate() {
-                    let offset = layer_offset + k * OBJECTIVE_SIZE;
-                    self.objectives[i][offset] = obj.opcode as u8;
-                    let a0 = obj.arg_0.as_i32().to_le_bytes();
-                    self.objectives[i][offset + 1..offset + 5].copy_from_slice(&a0);
-                    let a1 = obj.arg_1.as_i32().to_le_bytes();
-                    self.objectives[i][offset + 5..offset + 9].copy_from_slice(&a1);
+
+            self.board[i].fill(0);
+            for (l, layer) in obs.board.iter().take(nl).enumerate() {
+                let layer_off = l * BOARD_LAYER_MAX;
+                for (c, cell) in layer.iter().take(GRID_MAX).enumerate() {
+                    let off = layer_off + c * CELL_FIELDS;
+                    self.board[i][off..off + CELL_FIELDS].copy_from_slice(&cell_to_array(cell));
                 }
             }
 
-            // Pack action mask
+            // Pack action mask (length NUM_ACTIONS, already encoded ids).
             let mask_offset = i * NUM_ACTIONS;
             let mask_slice = &mut self.action_mask[mask_offset..mask_offset + NUM_ACTIONS];
             mask_slice.fill(0);
             for (a, &m) in obs.action_mask.iter().enumerate() {
                 if a < NUM_ACTIONS && m {
                     mask_slice[a] = 1;
-                }
-            }
-
-            // Pack last direction information
-            let last_dir_offset = i * MAX_ANCILLAS;
-            let last_dir_slice = &mut self.last_dir_vertical[last_dir_offset..last_dir_offset + MAX_ANCILLAS];
-            last_dir_slice.fill(0);
-            for (a, &m) in obs.last_dir_vertical.iter().enumerate() {
-                if a < MAX_ANCILLAS && m {
-                    last_dir_slice[a] = 1;
                 }
             }
         }
@@ -206,82 +166,33 @@ impl TilersSlot {
             let height = self.h[i] as usize;
             let width = self.w[i] as usize;
             let num_ancillas = self.num_ancillas[i] as usize;
-            let nq = self.num_qubits[i] as usize;
             let nl = (self.num_layers[i] as usize).min(LOOKAHEAD_MAX);
+            let hw = (height * width).min(GRID_MAX);
 
-            // Unpack placement
-            let mut placement = Vec::with_capacity(nq);
-            for j in 0..nq {
-                let offset = j * QUBIT_SIZE;
-                let id = i32::from_le_bytes([
-                    self.placement[i][offset],
-                    self.placement[i][offset + 1],
-                    self.placement[i][offset + 2],
-                    self.placement[i][offset + 3],
-                ]);
-                let orientation = self.placement[i][offset + 4];
-                placement.push(Qubit {
-                    id: QubitId(id),
-                    orientation: orientation_from_u8(orientation).unwrap(),
-                });
-            }
-
-            // Unpack objectives
-            let mut objectives = Vec::with_capacity(nl);
+            let mut board = Vec::with_capacity(nl);
             for l in 0..nl {
-                let no = self.num_objectives[i][l] as usize;
-                let layer_offset = l * OBJECTIVES_LAYER_MAX;
-                let mut layer = Vec::with_capacity(no);
-
-                for k in 0..no {
-                    let offset = layer_offset + k * OBJECTIVE_SIZE;
-                    let opcode = self.objectives[i][offset];
-                    let arg_0 = i32::from_le_bytes([
-                        self.objectives[i][offset + 1],
-                        self.objectives[i][offset + 2],
-                        self.objectives[i][offset + 3],
-                        self.objectives[i][offset + 4],
-                    ]);
-                    let arg_1 = i32::from_le_bytes([
-                        self.objectives[i][offset + 5],
-                        self.objectives[i][offset + 6],
-                        self.objectives[i][offset + 7],
-                        self.objectives[i][offset + 8],
-                    ]);
-                    layer.push(
-                        Objective::new(
-                            operation_from_u8(opcode).unwrap(),
-                            QubitId(arg_0),
-                            vec![],
-                            QubitId(arg_1),
-                        )
-                    );
+                let layer_off = l * BOARD_LAYER_MAX;
+                let mut layer = Vec::with_capacity(hw);
+                for c in 0..hw {
+                    let off = layer_off + c * CELL_FIELDS;
+                    layer.push(cell_from_slice(&self.board[i][off..off + CELL_FIELDS]));
                 }
-                objectives.push(layer);
+                board.push(layer);
             }
 
-            // Unpack action mask
             let mask_offset = i * NUM_ACTIONS;
             let action_mask: Vec<bool> = self.action_mask[mask_offset..mask_offset + NUM_ACTIONS]
                 .iter()
                 .map(|&m| m != 0)
                 .collect();
 
-            // Unpack last direction information
-            let last_dir_offset = i * MAX_ANCILLAS;
-            let last_dir_vertical: Vec<bool> = self.last_dir_vertical[last_dir_offset..last_dir_offset + MAX_ANCILLAS]
-                .iter()
-                .map(|&m| m != 0)
-                .collect();
-
             out.push(TilersObs {
-                placement,
-                objectives,
                 height,
                 width,
                 num_ancillas,
+                num_layers: nl,
+                board,
                 action_mask,
-                last_dir_vertical,
             });
         }
         out
@@ -291,224 +202,48 @@ impl TilersSlot {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::environment::TilersObs;
     use crate::environment::TilersEnv;
     use mcts_core::Environment;
-    use tilers::qubit::{Qubit};
-    use tilers::objective::Objective;
-    use tilers::enums::{Orientation, QubitId};
     use tilers::env::Environment as TilersEnvInner;
 
+    fn sample_obs(h: usize, w: usize, na: usize) -> TilersObs {
+        let env = TilersEnvInner::new(h, w, na);
+        TilersEnv::new(env, DEFAULT_LOOKAHEAD).observation()
+    }
+
     #[test]
-    fn test_slot_roundtrip() {
-        let obs = TilersObs {
-            placement: vec![
-                Qubit { id: QubitId(0), orientation: Orientation::Vertical },
-                Qubit { id: QubitId(1), orientation: Orientation::Horizontal },
-            ],
-            objectives: vec![vec![Objective::cx(QubitId(0), QubitId(1))]],
-            height: 3,
-            width: 4,
-            num_ancillas: 1,
-            action_mask: vec![true, false, true, false],
-            last_dir_vertical: vec![false; MAX_ANCILLAS],
-        };
-
+    fn test_slot_roundtrip_board() {
+        let obs = sample_obs(3, 3, 1);
         let mut slot = TilersSlot::default();
-        slot.pack_observations(&[obs]).unwrap();
+        slot.pack_observations(std::slice::from_ref(&obs)).unwrap();
 
-        // Read back and verify fields match
         assert_eq!(slot.b, 1);
-        assert_eq!(slot.h[0], 3);
-        assert_eq!(slot.w[0], 4);
-        assert_eq!(slot.num_ancillas[0], 1);
-        assert_eq!(slot.num_qubits[0], 2);
-        assert_eq!(slot.num_layers[0], 1);
-        assert_eq!(slot.num_objectives[0][0], 1);
+        assert_eq!(slot.h[0] as usize, obs.height);
+        assert_eq!(slot.w[0] as usize, obs.width);
+        assert_eq!(slot.num_ancillas[0] as usize, obs.num_ancillas);
+        assert_eq!(slot.num_layers[0] as usize, obs.num_layers);
 
-        // Test full roundtrip through unpack
         let unpacked = slot.unpack_observations();
         assert_eq!(unpacked.len(), 1);
         let u = &unpacked[0];
-        assert_eq!(u.height, 3);
-        assert_eq!(u.width, 4);
-        assert_eq!(u.num_ancillas, 1);
-        assert_eq!(u.placement.len(), 2);
-        assert_eq!(u.placement[0].id, QubitId(0));
-        assert_eq!(u.placement[1].id, QubitId(1));
-        assert_eq!(u.objectives.len(), 1);
-        assert_eq!(u.objectives[0].len(), 1);
-        assert_eq!(u.objectives[0][0].opcode, Operation::CX);
-        assert_eq!(u.objectives[0][0].arg_0, QubitId(0));
-        assert_eq!(u.objectives[0][0].arg_1, QubitId(1));
-        assert!(u.action_mask[0]);
-        assert!(!u.action_mask[1]);
-        assert!(u.action_mask[2]);
-        assert!(!u.action_mask[3]);
-    }
-
-    #[test]
-    fn test_slot_roundtrip_larger_grid() {
-        let mut placement = Vec::new();
-        for i in 0..25 {
-            placement.push(Qubit {
-                id: QubitId(i),
-                orientation: if i % 2 == 0 { Orientation::Vertical } else { Orientation::Horizontal },
-            });
-        }
-        // Add some ancillas with negative IDs
-        placement.push(Qubit { id: QubitId(-1), orientation: Orientation::Vertical });
-        placement.push(Qubit { id: QubitId(-2), orientation: Orientation::Horizontal });
-
-        let obs = TilersObs {
-            placement,
-            objectives: vec![],
-            height: 5,
-            width: 5,
-            num_ancillas: 2,
-            action_mask: vec![false; NUM_ACTIONS],
-            last_dir_vertical: vec![false; MAX_ANCILLAS],
-        };
-
-        let mut slot = TilersSlot::default();
-        slot.pack_observations(&[obs]).unwrap();
-        let unpacked = slot.unpack_observations();
-        let u = &unpacked[0];
-
-        assert_eq!(u.placement.len(), 27);
-        assert_eq!(u.placement[25].id, QubitId(-1));
-        assert_eq!(u.placement[26].id, QubitId(-2));
-        assert_eq!(u.placement[0].orientation, Orientation::Vertical);
-        assert_eq!(u.placement[1].orientation, Orientation::Horizontal);
-    }
-
-    #[test]
-    fn test_slot_roundtrip_multi_layer() {
-        let obs = TilersObs {
-            placement: vec![
-                Qubit { id: QubitId(0), orientation: Orientation::Vertical },
-                Qubit { id: QubitId(1), orientation: Orientation::Horizontal },
-                Qubit { id: QubitId(2), orientation: Orientation::Vertical },
-            ],
-            objectives: vec![
-                vec![
-                    Objective::cx(QubitId(0), QubitId(1)),
-                ],
-                vec![
-                    Objective::cz(QubitId(1), QubitId(2)),
-                    Objective::x(QubitId(0)),
-                ],
-            ],
-            height: 3,
-            width: 3,
-            num_ancillas: 0,
-            action_mask: vec![true; NUM_ACTIONS],
-            last_dir_vertical: vec![false; MAX_ANCILLAS],
-        };
-
-        let mut slot = TilersSlot::default();
-        slot.pack_observations(&[obs]).unwrap();
-        let unpacked = slot.unpack_observations();
-        let u = &unpacked[0];
-
-        assert_eq!(u.objectives.len(), 2);
-        assert_eq!(u.objectives[0].len(), 1);
-        assert_eq!(u.objectives[0][0].opcode, Operation::CX);
-        assert_eq!(u.objectives[1].len(), 2);
-        assert_eq!(u.objectives[1][0].opcode, Operation::CZ);
-        assert_eq!(u.objectives[1][1].opcode, Operation::X);
+        assert_eq!(u.height, obs.height);
+        assert_eq!(u.width, obs.width);
+        assert_eq!(u.num_layers, obs.num_layers);
+        // Exact board + mask round-trip.
+        assert_eq!(u.board, obs.board);
+        assert_eq!(u.action_mask, obs.action_mask);
     }
 
     #[test]
     fn test_slot_roundtrip_batch() {
-        let obs1 = TilersObs {
-            placement: vec![Qubit { id: QubitId(0), orientation: Orientation::Vertical }],
-            objectives: vec![vec![
-                Objective::cx(QubitId(0), QubitId(1)),
-            ]],
-            height: 3,
-            width: 3,
-            num_ancillas: 0,
-            action_mask: vec![true; NUM_ACTIONS],
-            last_dir_vertical: vec![false; MAX_ANCILLAS],
-        };
-
-        let obs2 = TilersObs {
-            placement: vec![
-                Qubit { id: QubitId(10), orientation: Orientation::Horizontal },
-                Qubit { id: QubitId(11), orientation: Orientation::Vertical },
-            ],
-            objectives: vec![vec![
-                Objective::cz(QubitId(10), QubitId(11)),
-            ]],
-            height: 5,
-            width: 4,
-            num_ancillas: 1,
-            action_mask: vec![false; NUM_ACTIONS],
-            last_dir_vertical: vec![false; MAX_ANCILLAS],
-        };
-
+        let o1 = sample_obs(3, 3, 1);
+        let o2 = sample_obs(4, 4, 2);
         let mut slot = TilersSlot::default();
-        slot.pack_observations(&[obs1, obs2]).unwrap();
-        let unpacked = slot.unpack_observations();
+        slot.pack_observations(&[o1.clone(), o2.clone()]).unwrap();
+        assert_eq!(slot.b, 2);
 
-        assert_eq!(unpacked.len(), 2);
-
-        assert_eq!(unpacked[0].height, 3);
-        assert_eq!(unpacked[0].placement[0].id, QubitId(0));
-        assert_eq!(unpacked[0].objectives[0][0].opcode, Operation::CX);
-        assert!(unpacked[0].action_mask[0]);
-
-        assert_eq!(unpacked[1].height, 5);
-        assert_eq!(unpacked[1].width, 4);
-        assert_eq!(unpacked[1].num_ancillas, 1);
-        assert_eq!(unpacked[1].placement[0].id, QubitId(10));
-        assert_eq!(unpacked[1].objectives[0][0].opcode, Operation::CZ);
-        assert!(!unpacked[1].action_mask[0]);
-    }
-
-    #[test]
-    fn test_action_mask_roundtrip() {
-        let mut mask = vec![false; NUM_ACTIONS];
-        mask[0] = true;
-        mask[42] = true;
-        mask[NUM_ACTIONS - 1] = true;
-
-        let obs = TilersObs {
-            placement: vec![Qubit { id: QubitId(0), orientation: Orientation::Vertical }],
-            objectives: vec![],
-            height: 2,
-            width: 2,
-            num_ancillas: 0,
-            action_mask: mask.clone(),
-            last_dir_vertical: vec![false; MAX_ANCILLAS],
-        };
-
-        let mut slot = TilersSlot::default();
-        slot.pack_observations(&[obs]).unwrap();
-        let unpacked = slot.unpack_observations();
-
-        assert!(unpacked[0].action_mask[0]);
-        assert!(unpacked[0].action_mask[42]);
-        assert!(unpacked[0].action_mask[NUM_ACTIONS - 1]);
-        assert!(!unpacked[0].action_mask[1]);
-        assert!(!unpacked[0].action_mask[43]);
-    }    
-
-    #[test]
-    fn test_env_to_slot_roundtrip() {
-        let env = TilersEnvInner::new(3, 3, 1);
-        // set up objectives however your Environment API requires
-        let tilers_env = TilersEnv::new(env, 2);
-        let obs = tilers_env.observation();
-
-        let mut slot = TilersSlot::default();
-        slot.pack_observations(&[obs.clone()]).unwrap();
-        let unpacked = slot.unpack_observations();
-
-        assert_eq!(unpacked[0].height, obs.height);
-        assert_eq!(unpacked[0].width, obs.width);
-        assert_eq!(unpacked[0].placement.len(), obs.placement.len());
-        assert_eq!(unpacked[0].objectives.len(), obs.objectives.len());
+        let u = slot.unpack_observations();
+        assert_eq!(u[0].board, o1.board);
+        assert_eq!(u[1].board, o2.board);
     }
 }

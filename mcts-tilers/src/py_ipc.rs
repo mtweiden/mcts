@@ -240,42 +240,23 @@ impl PySlotView {
         Ok(unsafe { copy_to_array1(py, s.num_ancillas.as_ptr(), b) })
     }
 
-    pub fn num_qubits<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u16>>> {
-        let s = self.slot_ref()?;
-        let b = self.batch_len()?;
-        Ok(unsafe { copy_to_array1(py, s.num_qubits.as_ptr(), b) })
-    }
-
+    /// Per-batch board layer count (`= lookahead + 1`).
     pub fn num_layers<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray1<u8>>> {
         let s = self.slot_ref()?;
         let b = self.batch_len()?;
         Ok(unsafe { copy_to_array1(py, s.num_layers.as_ptr(), b) })
     }
 
-    /// Returns shape (b, LOOKAHEAD_MAX)
-    pub fn num_objectives<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<u16>>> {
+    // ── observation board ───────────────────────────────────────────────
+
+    /// The 10-channel observation board, shape `(b, BOARD_MAX)` i16.
+    /// Python reshapes to `(b, LOOKAHEAD_MAX, GRID_MAX, CELL_FIELDS)` and
+    /// slices to each item's `num_layers` × `h*w` (see TILERS_MIGRATION.md
+    /// §4 and `tilers::rl::board`).
+    pub fn board<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<i16>>> {
         let s = self.slot_ref()?;
         let b = self.batch_len()?;
-        Ok(unsafe { copy_to_array2(py, s.num_objectives.as_ptr() as *const u16, b, LOOKAHEAD_MAX) })
-    }
-
-    // ── raw packed data ─────────────────────────────────────────────────
-
-    /// Returns shape (b, PLACEMENT_MAX) as raw bytes.
-    /// Python unpacks using QUBIT_SIZE stride: [i32_le id, u8 orientation].
-    pub fn placement<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<u8>>> {
-        let s = self.slot_ref()?;
-        let b = self.batch_len()?;
-        Ok(unsafe { copy_to_array2(py, s.placement.as_ptr() as *const u8, b, PLACEMENT_MAX) })
-    }
-
-    /// Returns shape (b, OBJECTIVES_MAX) as raw bytes.
-    /// Python unpacks using OBJECTIVE_SIZE stride per objective,
-    /// OBJECTIVES_LAYER_MAX stride per layer.
-    pub fn objectives<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<u8>>> {
-        let s = self.slot_ref()?;
-        let b = self.batch_len()?;
-        Ok(unsafe { copy_to_array2(py, s.objectives.as_ptr() as *const u8, b, OBJECTIVES_MAX) })
+        Ok(unsafe { copy_to_array2(py, s.board.as_ptr() as *const i16, b, BOARD_MAX) })
     }
 
     /// Returns shape (b, NUM_ACTIONS)
@@ -283,13 +264,6 @@ impl PySlotView {
         let s = self.slot_ref()?;
         let b = self.batch_len()?;
         Ok(unsafe { copy_to_array2(py, s.action_mask.as_ptr(), b, NUM_ACTIONS) })
-    }
-
-    /// Returns shape (b, MAX_ANCILLAS)
-    pub fn last_dir_vertical<'py>(&self, py: Python<'py>) -> PyResult<Bound<'py, PyArray2<u8>>> {
-        let s = self.slot_ref()?;
-        let b = self.batch_len()?;
-        Ok(unsafe { copy_to_array2(py, s.last_dir_vertical.as_ptr(), b, MAX_ANCILLAS) })
     }
 
     // ── outputs ──────────────────────────────────────────────────────────

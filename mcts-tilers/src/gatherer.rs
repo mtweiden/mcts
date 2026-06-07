@@ -15,10 +15,9 @@ use mcts_core::mcts::MCTS;
 use mcts_core::node::Node;
 
 use tilers::env::Environment;
-use tilers::objective::Objective;
-use tilers::qubit::Qubit;
+use tilers::rl;
+use tilers::rl::board::BoardCell;
 use tilers::solver::Solver;
-use tilers::enums::{Direction, QubitId};
 
 use crate::constants::*;
 use crate::environment::TilersEnv;
@@ -48,7 +47,9 @@ pub struct Gatherer {
     /// full-search turns. 0.0 disables root noise.
     /// Reference: [Wu 2020, §2].
     dirichlet_epsilon: f32,
-    num_objective_layers: usize,
+    /// Future objective layers beyond the current one; board has
+    /// `lookahead + 1` layers.  See `tilers::rl::board::construct_board`.
+    lookahead: usize,
     gather_id: usize,
     /// Saturation temperature for the terminal reward. The terminal value
     /// target is `tanh((reference_depth - actual_depth) / (reference_depth + ε)
@@ -99,7 +100,7 @@ impl Gatherer {
         output_path: String,
         noise_strength: f64,
         dirichlet_epsilon: f32,
-        num_objective_layers: usize,
+        lookahead: usize,
         gather_id: usize,
         trajectory_dir: Option<String>,
         reward_saturation_temperature: Option<f32>,
@@ -118,7 +119,7 @@ impl Gatherer {
             output_path,
             noise_strength,
             dirichlet_epsilon,
-            num_objective_layers,
+            lookahead,
             gather_id,
             // Default of 0.3 preserves the slope-at-origin (1/0.3 ≈ 3.33) of
             // the previous clip-and-normalize default with reward_ratio_limit
@@ -145,7 +146,7 @@ impl Gatherer {
         let actions = solver.solve(&mut solved_env, true)
             .unwrap()
             .into_iter()
-            .map(|a| a as Action)
+            .map(|a| rl::encode(&solved_env, a) as Action)
             .collect();
         let depth = solved_env.depth(true, true);
         (depth, actions)
@@ -208,8 +209,13 @@ impl Gatherer {
         step: usize,
         rng: &mut impl Rng,
     ) -> Action {
-        let valid_actions = env.valid_actions();
-        let num_actions = valid_actions.len();
+        // Flat `u16` action ids the tree/visits are keyed by.
+        let ids: Vec<Action> = env
+            .valid_actions()
+            .iter()
+            .map(|&a| rl::encode(env, a) as Action)
+            .collect();
+        let num_actions = ids.len();
         if num_actions == 0 {
             panic!("No valid actions available");
         }
@@ -219,7 +225,7 @@ impl Gatherer {
         let noise_strength = self.noise_strength * (-0.5 * step as f64).exp();
 
         let probs = self._action_probabilities(
-            &valid_actions
+            &ids
                 .iter()
                 .map(|&a| node.edge_visits.get(a as usize).copied().unwrap_or(0))
                 .collect::<Vec<_>>(),
@@ -240,34 +246,33 @@ impl Gatherer {
             .collect();
 
         let dist = WeightedIndex::new(&mixed_probs).unwrap();
-        valid_actions[dist.sample(rng)] as Action
+        ids[dist.sample(rng)]
     }
 
-    fn serialize_placement(placement: &[Qubit]) -> Value {
+    /// Serialize the 10-channel observation board as nested JSON:
+    /// `[layer][cell] -> [10 ints]` (channel order = `BoardCell` field
+    /// order).  Replaces the old placement+objectives serialization.
+    fn serialize_board(board: &[Vec<BoardCell>]) -> Value {
         Value::Array(
-            placement
-                .iter()
-                .map(|q| {
-                    json!([q.id.as_i32(), q.orientation as u8])
-                })
-                .collect(),
-        )
-    }
-
-    fn serialize_objectives(objectives: &[Vec<Objective>]) -> Value {
-        Value::Array(
-            objectives
+            board
                 .iter()
                 .map(|layer| {
                     Value::Array(
                         layer
                             .iter()
-                            .map(|o| {
-                                if o.opcode.is_single_qubit() {
-                                    json!([o.opcode as u8, o.arg_0.as_i32()])
-                                } else {
-                                    json!([o.opcode as u8, o.arg_0.as_i32(), o.arg_1.as_i32()])
-                                }
+                            .map(|c| {
+                                json!([
+                                    c.qubit_role,
+                                    c.factor_kind,
+                                    c.resource_kind,
+                                    c.pp_group_row,
+                                    c.pp_group_col,
+                                    c.ancilla_idx,
+                                    c.last_move_dir,
+                                    c.weight_in_pp,
+                                    c.is_hub_for_pp,
+                                    c.is_y_ready,
+                                ])
                             })
                             .collect::<Vec<Value>>(),
                     )
@@ -286,7 +291,8 @@ impl Gatherer {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
         let mut game = env.clone();
-        game.drop_objectives_beyond_nth_layer(self.num_objective_layers - 1);
+        // Keep objective layers 0..=lookahead (lookahead + 1 layers total).
+        game.drop_objectives_beyond_nth_layer(self.lookahead);
         game.set_cultivation_time(10);
         let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
 
@@ -299,24 +305,26 @@ impl Gatherer {
         );
 
         // Training data for full-search turns only (written to output_path).
+        // (board, num_ancillas, valid_action_ids, edge_visits)
         let mut temp_data: Vec<(
-            (Vec<Qubit>, Vec<Vec<Objective>>),
+            Vec<Vec<BoardCell>>,
+            usize,
             Vec<Action>,
             HashMap<Action, usize>,
-            HashMap<QubitId, Direction>,
         )> = Vec::new();
 
         // Full trajectory data for every step (written to trajectory_dir on a win).
+        // (board, num_ancillas, valid_action_ids, action_taken, height, width)
         let mut all_steps_data: Vec<(
-            (Vec<Qubit>, Vec<Vec<Objective>>),
-            Vec<Action>,        // valid actions
-            Action,             // action taken
-            HashMap<QubitId, Direction>,
-            usize,              // height
-            usize,              // width
+            Vec<Vec<BoardCell>>,
+            usize,
+            Vec<Action>,
+            Action,
+            usize,
+            usize,
         )> = Vec::new();
 
-        let mut tilers_env = TilersEnv::new(game.clone(), self.num_objective_layers);
+        let mut tilers_env = TilersEnv::new(game.clone(), self.lookahead);
 
         let max_actions = if let Some(max) = self.max_actions {
             max
@@ -375,7 +383,7 @@ impl Gatherer {
                 let raw_noise = self._dirichlet_noise(valid.len(), rng);
                 let noise_map: HashMap<Action, f32> = valid.iter()
                     .zip(raw_noise.iter())
-                    .map(|(&a, &n)| (a as Action, n as f32))
+                    .map(|(&a, &n)| (rl::encode(&tilers_env.inner, a) as Action, n as f32))
                     .collect();
                 mcts.perturb_root_prior(&noise_map, self.dirichlet_epsilon);
             }
@@ -422,14 +430,15 @@ impl Gatherer {
             }
 
             // Snapshot state before stepping (shared between temp_data and all_steps_data).
-            let placement = tilers_env.inner.get_placement();
-            let objectives = tilers_env.inner.get_objectives(self.num_objective_layers);
-            let last_dirs = tilers_env.inner.last_dirs.clone();
+            // The observation is the 10-channel board; `valid_actions()` (the
+            // wrapper) already returns encoded `u16` ids.
+            let board = tilers_env.build_obs().board;
+            let num_ancillas = tilers_env.inner.num_ancillas();
             let valid_actions: Vec<Action> = tilers_env
                 .inner
                 .valid_actions()
                 .iter()
-                .map(|&a| a as Action)
+                .map(|&a| rl::encode(&tilers_env.inner, a) as Action)
                 .collect();
             let step_height = tilers_env.inner.height;
             let step_width = tilers_env.inner.width;
@@ -444,10 +453,10 @@ impl Gatherer {
                     .map(|(a, p)| (a, (p * n_total as f32).round() as usize))
                     .collect();
                 temp_data.push((
-                    (placement.clone(), objectives.clone()),
+                    board.clone(),
+                    num_ancillas,
                     valid_actions.clone(),
                     edge_visits,
-                    last_dirs.clone(),
                 ));
             }
 
@@ -455,15 +464,17 @@ impl Gatherer {
 
             // Record every step for trajectory saving.
             all_steps_data.push((
-                (placement, objectives),
+                board,
+                num_ancillas,
                 valid_actions,
                 action,
-                last_dirs,
                 step_height,
                 step_width,
             ));
 
-            let _ = tilers_env.inner.step(action as usize);
+            let a = rl::decode(&tilers_env.inner, action as usize)
+                .expect("gatherer produced an invalid action id");
+            let _ = tilers_env.inner.step(a);
             tilers_env.inner.finish_cultivating(None, None);
 
             if tilers_env.inner.done() {
@@ -564,10 +575,8 @@ impl Gatherer {
                 let depth = all_steps_data.len();
                 let gamma = 0.80f32;
 
-                for (step, ((placement, objectives), valid_actions, action, last_dirs, s_height, s_width)) in all_steps_data.iter().enumerate() {
-                    let num_ancillas = placement.iter().filter(|q| q.id.as_i32() < 0).count();
-                    let placement_json = Self::serialize_placement(placement);
-                    let objectives_json = Self::serialize_objectives(objectives);
+                for (step, (board, num_ancillas, valid_actions, action, s_height, s_width)) in all_steps_data.iter().enumerate() {
+                    let board_json = Self::serialize_board(board);
                     let valid_actions_json = Value::Array(valid_actions.iter().map(|&a| Value::from(a)).collect());
 
                     // Near-one-hot edge visits: 99% weight to the action taken.
@@ -588,23 +597,14 @@ impl Gatherer {
                         1.0
                     };
 
-                    let last_dirs_json = Value::Array(
-                        last_dirs
-                            .iter()
-                            .map(|(qid, dir)| json!([qid.as_i32(), dir.to_string()]))
-                            .collect(),
-                    );
-
                     let record = json!({
                         "height": s_height,
                         "width": s_width,
                         "num_ancillas": num_ancillas,
-                        "placement": placement_json,
-                        "objectives": objectives_json,
+                        "board": board_json,
                         "valid_actions": valid_actions_json,
                         "edge_visits": Value::Object(visits_map),
                         "reward": value,
-                        "last_dirs": last_dirs_json,
                     });
 
                     writeln!(traj_file, "{}", record).expect("Failed to write trajectory record");
@@ -625,10 +625,8 @@ impl Gatherer {
             .expect("Unable to open output file");
         let mut file = BufWriter::new(file_raw);
 
-        for ((p, o), va, ev, last_dirs) in temp_data {
-            let num_ancillas = p.iter().filter(|q| q.id.as_i32() < 0).count();
-            let placement_json = Self::serialize_placement(&p);
-            let objectives_json = Self::serialize_objectives(&o);
+        for (board, num_ancillas, va, ev) in temp_data {
+            let board_json = Self::serialize_board(&board);
             let valid_actions_json = Value::Array(va.into_iter().map(Value::from).collect());
             let mut visits_map = Map::with_capacity(ev.len());
             for (action, count) in ev {
@@ -636,23 +634,14 @@ impl Gatherer {
             }
             let visits_json = Value::Object(visits_map);
 
-            let last_dirs_json = Value::Array(
-                last_dirs
-                    .iter()
-                    .map(|(qid, dir)| json!([qid.as_i32(), dir.to_string()]))
-                    .collect(),
-            );
-
             let record = json!({
                 "height": tilers_env.inner.height,
                 "width": tilers_env.inner.width,
                 "num_ancillas": num_ancillas,
-                "placement": placement_json,
-                "objectives": objectives_json,
+                "board": board_json,
                 "valid_actions": valid_actions_json,
                 "edge_visits": visits_json,
                 "reward": score,
-                "last_dirs": last_dirs_json,
             });
 
             writeln!(file, "{}", record).expect("Failed to write record");
@@ -727,7 +716,7 @@ pub fn run_gatherer(
     resignation_log_dir: Option<String>,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
-    let num_objective_layers = DEFAULT_LOOKAHEAD;
+    let lookahead = DEFAULT_LOOKAHEAD;
 
     let arena_name = if arena_tag.is_empty() {
         format!("mcts_{}_{}", num_slots, num_handlers)
@@ -749,7 +738,7 @@ pub fn run_gatherer(
         output_path,
         0.20,
         dirichlet_epsilon,
-        num_objective_layers,
+        lookahead,
         worker_id as usize,
         trajectory_dir,
         Some(reward_saturation_temperature),
@@ -779,9 +768,9 @@ pub fn run_gatherer(
     }
     env.random_start(no, false);
 
-    if env.valid_actions().contains(&0) {
+    if env.valid_actions().contains(&tilers::enums::Action::AutoExecute) {
         let mut tmp_env = env.clone();
-        let _ = tmp_env.step(0);
+        let _ = tmp_env.step(tilers::enums::Action::AutoExecute);
         if tmp_env.done() {
             return Ok(None);
         }
@@ -825,7 +814,7 @@ mod tests {
             output_path.to_string(),
             0.0,                  // noise_strength
             0.0,                  // dirichlet_epsilon
-            2,                    // num_objective_layers
+            1,                    // lookahead
             0,                    // gather_id
             None,                 // trajectory_dir
             Some(1.0),            // reward_saturation_temperature
@@ -975,31 +964,35 @@ mod tests {
     fn test_select_action_returns_valid_action() {
         let g = default_gatherer("/dev/null");
         let env = TilersEnvInner::new(3, 3, 1);
-        let valid = env.valid_actions();
-        assert!(!valid.is_empty());
+        let ids: Vec<Action> = env.valid_actions().iter()
+            .map(|&a| tilers::rl::encode(&env, a) as Action)
+            .collect();
+        assert!(!ids.is_empty());
 
-        let priors: HashMap<Action, f32> = valid.iter()
-            .map(|&a| (a as Action, 1.0 / valid.len() as f32))
+        let priors: HashMap<Action, f32> = ids.iter()
+            .map(|&id| (id, 1.0 / ids.len() as f32))
             .collect();
         let node = Node::new(env.num_actions(), priors, 0.0, 0, None);
 
         let mut rng = StdRng::seed_from_u64(42);
         let action = g.select_action(&node, &env, 50, &mut rng);
-        assert!(valid.contains(&(action as usize)), "action {action} not in valid_actions");
+        assert!(ids.contains(&action), "action {action} not in valid ids");
     }
 
     #[test]
     fn test_select_action_picks_dominant_at_late_step() {
         let g = default_gatherer("/dev/null");
         let env = TilersEnvInner::new(3, 3, 1);
-        let valid = env.valid_actions();
-        assert!(valid.len() >= 2, "need ≥2 valid actions");
+        let ids: Vec<Action> = env.valid_actions().iter()
+            .map(|&a| tilers::rl::encode(&env, a) as Action)
+            .collect();
+        assert!(ids.len() >= 2, "need ≥2 valid actions");
 
-        let priors: HashMap<Action, f32> = valid.iter()
-            .map(|&a| (a as Action, 1.0 / valid.len() as f32))
+        let priors: HashMap<Action, f32> = ids.iter()
+            .map(|&id| (id, 1.0 / ids.len() as f32))
             .collect();
         let mut node = Node::new(env.num_actions(), priors, 0.0, 0, None);
-        let dominant = valid[0] as Action;
+        let dominant = ids[0];
         node.edge_visits[dominant as usize] = 100_000;
 
         let mut rng = StdRng::seed_from_u64(7);
@@ -1008,56 +1001,18 @@ mod tests {
         }
     }
 
-    // ─── serialize_placement ────────────────────────────────────────────────
+    // ─── serialize_board ─────────────────────────────────────────────────────
 
     #[test]
-    fn test_serialize_placement_empty() {
-        let v = Gatherer::serialize_placement(&[]);
-        assert!(matches!(v, serde_json::Value::Array(ref a) if a.is_empty()));
-    }
-
-    #[test]
-    fn test_serialize_placement_single_qubit() {
-        use tilers::qubit::Qubit;
-        use tilers::enums::{Orientation, QubitId};
-        let q = Qubit::new(QubitId(0), Orientation::Vertical);
-        let v = Gatherer::serialize_placement(&[q]);
-        let arr = v.as_array().unwrap();
-        assert_eq!(arr.len(), 1);
-        let pair = arr[0].as_array().unwrap();
-        assert_eq!(pair.len(), 2);
-        assert_eq!(pair[0].as_i64().unwrap(), 0);  // id = 0
-        assert_eq!(pair[1].as_u64().unwrap(), 0);  // Vertical = 0
-    }
-
-    // ─── serialize_objectives ────────────────────────────────────────────────
-
-    #[test]
-    fn test_serialize_objectives_empty() {
-        let v = Gatherer::serialize_objectives(&[]);
-        assert!(matches!(v, serde_json::Value::Array(ref a) if a.is_empty()));
-    }
-
-    #[test]
-    fn test_serialize_objectives_single_qubit_op_has_two_elements() {
-        use tilers::objective::Objective;
-        use tilers::enums::{Operation, QubitId};
-        let obj = Objective::new(Operation::H, QubitId(0), vec![], QubitId(-1));
-        let v = Gatherer::serialize_objectives(&[vec![obj]]);
+    fn test_serialize_board_shape() {
+        // A board from a real env serializes to [layer][cell][10 ints].
+        let env = TilersEnvInner::new(3, 3, 1);
+        let board = TilersEnv::new(env, DEFAULT_LOOKAHEAD).build_obs().board;
+        let v = Gatherer::serialize_board(&board);
         let layers = v.as_array().unwrap();
-        let entry = layers[0].as_array().unwrap()[0].as_array().unwrap();
-        assert_eq!(entry.len(), 2, "single-qubit op should produce [opcode, arg0]");
-    }
-
-    #[test]
-    fn test_serialize_objectives_two_qubit_op_has_three_elements() {
-        use tilers::objective::Objective;
-        use tilers::enums::{Operation, QubitId};
-        let obj = Objective::new(Operation::CX, QubitId(0), vec![], QubitId(1));
-        let v = Gatherer::serialize_objectives(&[vec![obj]]);
-        let layers = v.as_array().unwrap();
-        let entry = layers[0].as_array().unwrap()[0].as_array().unwrap();
-        assert_eq!(entry.len(), 3, "two-qubit op should produce [opcode, arg0, arg1]");
+        assert_eq!(layers.len(), board.len());
+        let cell = layers[0].as_array().unwrap()[0].as_array().unwrap();
+        assert_eq!(cell.len(), CELL_FIELDS, "each cell carries CELL_FIELDS channels");
     }
 
     // ─── solve_with_heuristic ────────────────────────────────────────────────
@@ -1106,8 +1061,8 @@ mod tests {
         assert!(!lines.is_empty(), "no data lines written");
         for line in &lines {
             let v: serde_json::Value = serde_json::from_str(line).expect("invalid JSON");
-            for key in &["height", "width", "placement", "objectives",
-                         "valid_actions", "edge_visits", "reward", "last_dirs"] {
+            for key in &["height", "width", "num_ancillas", "board",
+                         "valid_actions", "edge_visits", "reward"] {
                 assert!(v.get(key).is_some(), "missing key '{key}' in: {line}");
             }
         }
