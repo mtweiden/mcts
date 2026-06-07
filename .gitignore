@@ -4,3 +4,7 @@ __pycache__
 .DS_Store
 .pytest_cache
 *.so
+# Cargo's per-build .cargo/ directory (config cache, credentials).
+# Created by maturin/cargo at the workspace root and inside individual
+# crates; safe to ignore — nothing here should be committed.
+.cargo/

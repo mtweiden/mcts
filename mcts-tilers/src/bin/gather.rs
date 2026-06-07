@@ -39,8 +39,9 @@ fn main() {
     let mut arena_tag = String::new();
     let mut output_dir = String::from("/shared/staging");
 
-    // Reward ratio limit for value target scaling/clamping. 1.0 means no scaling.
-    let mut reward_ratio_limit = 0.3f32;
+    // Tanh saturation temperature for the terminal reward; smaller →
+    // sharper, larger → more linear. See Gatherer struct doc.
+    let mut reward_saturation_temperature = 0.3f32;
 
     // Parse command-line arguments
     let args: Vec<String> = env::args().collect();
@@ -99,8 +100,8 @@ fn main() {
         if args[i] == "--output_dir" && i + 1 < args.len() {
             output_dir = args[i + 1].clone();
         }
-        if args[i] == "--reward_ratio_limit" && i + 1 < args.len() {
-            reward_ratio_limit = args[i + 1].parse().unwrap_or(0.3);
+        if args[i] == "--reward_saturation_temperature" && i + 1 < args.len() {
+            reward_saturation_temperature = args[i + 1].parse().unwrap_or(0.3);
         }
     }
 
@@ -125,8 +126,12 @@ fn main() {
         lookahead,
         worker_id as usize,
         trajectory_dir,
-        Some(reward_ratio_limit),
+        Some(reward_saturation_temperature),
         None,                 // max actions
+        None,                 // resign_value_threshold (default)
+        None,                 // resign_consecutive_moves (default)
+        None,                 // no_resign_rate (default)
+        None,                 // resignation_log_dir (off in standalone binary)
     );
 
     loop {

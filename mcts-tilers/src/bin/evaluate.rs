@@ -7,7 +7,7 @@ use mcts_tilers::evaluator::Evaluator;
 // =============================================================================
 const DEFAULT_MCTS_STEPS: usize = 10_000;
 const DEFAULT_C_PUCT: f32 = 1.4;
-const DEFAULT_REWARD_RATIO_LIMIT: f32 = 0.3;
+const DEFAULT_REWARD_SATURATION_TEMPERATURE: f32 = 0.3;
 
 // =============================================================================
 // main
@@ -26,21 +26,27 @@ fn main() {
     let mut db_path = String::from("pipeline.db");
     let mut mcts_steps = DEFAULT_MCTS_STEPS;
     let mut c_puct = DEFAULT_C_PUCT;
-    let mut reward_ratio_limit = DEFAULT_REWARD_RATIO_LIMIT;
+    let mut reward_saturation_temperature = DEFAULT_REWARD_SATURATION_TEMPERATURE;
     let mut arena_tag = String::from("eval");
     let mut num_handlers: usize = 1;
+    let mut max_num_objectives: Option<i64> = None;
+    let mut node_idx: i64 = 0;
+    let mut num_nodes: i64 = 1;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--agent_id"           => { agent_id = args[i+1].parse().unwrap(); i += 2; }
-            "--db"                 => { db_path = args[i+1].clone(); i += 2; }
-            "--mcts_steps"         => { mcts_steps = args[i+1].parse().unwrap(); i += 2; }
-            "--c_puct"             => { c_puct = args[i+1].parse().unwrap(); i += 2; }
-            "--reward_ratio_limit" => { reward_ratio_limit = args[i+1].parse().unwrap(); i += 2; }
-            "--arena_tag"          => { arena_tag = args[i+1].clone(); i += 2; }
-            "--num_handlers"       => { num_handlers = args[i+1].parse().unwrap(); i += 2; }
-            _                      => { i += 1; }
+            "--agent_id"            => { agent_id = args[i+1].parse().unwrap(); i += 2; }
+            "--db"                  => { db_path = args[i+1].clone(); i += 2; }
+            "--mcts_steps"          => { mcts_steps = args[i+1].parse().unwrap(); i += 2; }
+            "--c_puct"              => { c_puct = args[i+1].parse().unwrap(); i += 2; }
+            "--reward_saturation_temperature" => { reward_saturation_temperature = args[i+1].parse().unwrap(); i += 2; }
+            "--arena_tag"           => { arena_tag = args[i+1].clone(); i += 2; }
+            "--num_handlers"        => { num_handlers = args[i+1].parse().unwrap(); i += 2; }
+            "--max_num_objectives"  => { max_num_objectives = Some(args[i+1].parse().unwrap()); i += 2; }
+            "--node_idx"            => { node_idx = args[i+1].parse().unwrap(); i += 2; }
+            "--num_nodes"           => { num_nodes = args[i+1].parse().unwrap(); i += 2; }
+            _                       => { i += 1; }
         }
     }
 
@@ -49,10 +55,13 @@ fn main() {
     let evaluator = Evaluator::new(
         mcts_steps,
         c_puct,
-        reward_ratio_limit,
+        reward_saturation_temperature,
     );
 
     evaluator
-        .evaluate_agent(agent_id, &db_path, &arena_tag, num_handlers)
+        .evaluate_agent(
+            agent_id, &db_path, &arena_tag, num_handlers,
+            max_num_objectives, node_idx, num_nodes,
+        )
         .expect("evaluation failed");
 }

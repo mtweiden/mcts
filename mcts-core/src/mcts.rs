@@ -1,7 +1,8 @@
 use crate::node::{Node, NodeId};
-use crate::environment::Environment;
+use crate::environment::{Act, Environment};
 use crate::inference::InferenceClient;
 use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 
 /// ----------------------------------------------------------------------------
@@ -26,7 +27,12 @@ pub struct MCTS<E: Environment> {
     /// The NodeId of the current root of the search tree.
     pub root_id: Option<NodeId>,
     /// Arena-style storage for all nodes.
-    pub transposition_table: HashMap<NodeId, usize>,
+    /// FxHashMap (linear-probing, FxHash) instead of std HashMap (SipHash)
+    /// because NodeId is already a hash (random 64-bit u64) — running it
+    /// through SipHash a second time is wasted work. Profiling showed
+    /// transposition_table lookups in `puct_scores` and `select_leaf` were
+    /// a meaningful fraction of MCTS step time at branching factor ≥ 100.
+    pub transposition_table: FxHashMap<NodeId, usize>,
     pub nodes: Vec<Node<E::Act>>,
     pub batch_size: usize,
 
@@ -90,7 +96,7 @@ impl<E: Environment> MCTS<E> {
     pub fn new(batch_size: usize) -> Self {
         Self {
             root_id: None,
-            transposition_table: HashMap::new(),
+            transposition_table: FxHashMap::default(),
             nodes: Vec::new(),
             batch_size,
             c_fpu: 0.2,
@@ -248,7 +254,10 @@ impl<E: Environment> MCTS<E> {
                 return;
             }
         };
-        if let Some(&new_root_id) = old_root_node.children.get(&action) {
+        let new_root_id_opt = old_root_node.children
+            .get(action.to_action_index())
+            .and_then(|opt| *opt);
+        if let Some(new_root_id) = new_root_id_opt {
             self.root_id = Some(new_root_id);
 
             // Collect all NodeIds reachable from new_root_id via a BFS.
@@ -263,9 +272,12 @@ impl<E: Environment> MCTS<E> {
                 }
                 if let Some(idx) = self.transposition_table.get(&id) {
                     if let Some(node) = self.nodes.get(*idx) {
-                        for &child_id in node.children.values() {
-                            if !reachable.contains(&child_id) {
-                                queue.push_back(child_id);
+                        // Walk dense children: only Some slots are real.
+                        for slot in &node.children {
+                            if let Some(child_id) = *slot {
+                                if !reachable.contains(&child_id) {
+                                    queue.push_back(child_id);
+                                }
                             }
                         }
                     }
@@ -274,7 +286,8 @@ impl<E: Environment> MCTS<E> {
 
             // Rebuild the arena keeping only reachable nodes, and remap indices.
             let mut nodes_after_pruning: Vec<Node<E::Act>> = Vec::with_capacity(reachable.len());
-            let mut table_after_pruning: HashMap<NodeId, usize> = HashMap::with_capacity(reachable.len());
+            let mut table_after_pruning: FxHashMap<NodeId, usize> =
+                FxHashMap::with_capacity_and_hasher(reachable.len(), Default::default());
             for node in self.nodes.drain(..) {
                 if reachable.contains(&node.id) {
                     let new_idx = nodes_after_pruning.len();
@@ -307,7 +320,7 @@ impl<E: Environment> MCTS<E> {
         let node = if env.done() {
             Node::new_terminal(node_id, value, repr)
         } else {
-            Node::new(priors, value.clamp(-1.0, 1.0), node_id, repr)
+            Node::new(env.num_actions(), priors, value.clamp(-1.0, 1.0), node_id, repr)
         };
         self.insert_node(node_id, node);
         node_id
@@ -345,12 +358,23 @@ impl<E: Environment> MCTS<E> {
                 Some(p) => p,
                 None => return,
             };
-            let vl: usize = parent.virtual_losses.values().copied().sum();
-            let data: Vec<(NodeId, usize, f32)> = parent.children.iter().map(|(&a, &child_id)| {
-                let ev = parent.edge_visits.get(&a).copied().unwrap_or(0);
-                let ep = parent.edge_penalties.get(&a).copied().unwrap_or(0.0);
-                (child_id, ev, ep)
-            }).collect();
+            // Sum the entire dense Vec — invalid slots are zero so they
+            // contribute nothing to the total.
+            let vl: usize = parent.virtual_losses.iter().sum();
+            // Walk valid_actions and collect (child_id, edge_visits, penalty)
+            // for each slot whose child is expanded. Iterating the dense
+            // children Vec works too, but valid_actions short-circuits the
+            // None slots without bounds checks.
+            let data: Vec<(NodeId, usize, f32)> = parent.valid_actions.iter()
+                .filter_map(|&a| {
+                    let idx = a.to_action_index();
+                    parent.children.get(idx).and_then(|c| *c).map(|child_id| {
+                        let ev = parent.edge_visits.get(idx).copied().unwrap_or(0);
+                        let ep = parent.edge_penalties.get(idx).copied().unwrap_or(0.0);
+                        (child_id, ev, ep)
+                    })
+                })
+                .collect();
             (vl, parent.value_estimate, data)
         };  // Immutable borrows end here
 
@@ -429,13 +453,13 @@ impl<E: Environment> MCTS<E> {
         c_puct: f32,
         is_root: bool,
         apply_forced: bool,
-    ) -> HashMap<E::Act, f32> {
+    ) -> Vec<f32> {
         let node = match self.get_node_immut(node_id) {
             Some(n) => n,
-            None => return HashMap::new(),
+            None => return Vec::new(),
         };
 
-        let total_visits: usize = node.edge_visits.values().copied().sum::<usize>();
+        let total_visits: usize = node.edge_visits.iter().sum();
         let sqrt_total = (total_visits as f32).sqrt() + 1e-8;
 
         // --- FPU ---
@@ -443,73 +467,87 @@ impl<E: Environment> MCTS<E> {
         // At the root c_fpu is 0: Dirichlet noise handles exploration there.
         // Reference: [Wu 2020, §2, footnote 3].
         let c_fpu_eff: f32 = if is_root { 0.0 } else { self.c_fpu };
-        let p_explored: f32 = node.prior_probs
+        let p_explored: f32 = node.valid_actions
             .iter()
-            .filter(|&(&a, _)| node.edge_visits.get(&a).copied().unwrap_or(0) > 0)
-            .map(|(_, &p)| p)
+            .filter(|&&a| node.edge_visits[a.to_action_index()] > 0)
+            .map(|&a| node.prior_probs[a.to_action_index()])
             .sum();
         let fpu_q = node.value - c_fpu_eff * p_explored.sqrt();
 
         // --- Root softmax temperature + transient Dirichlet noise ---
-        // At the root we apply two transformations in sequence:
-        //   1. Blend in the stored noise: P′(c) = (1−ε)·P(c) + ε·noise(c)
-        //   2. Apply softmax temperature: P″(c) ∝ P′(c)^(1/T), renormalised
-        // Noise is read from `self.root_noise` (set by `perturb_root_prior`)
-        // rather than baked into `node.prior_probs`, so it never permanently
-        // alters the transposition table.  References: [Wu 2020, §2].
-        let effective_priors: HashMap<E::Act, f32> = if is_root {
-            // Step 1: blend noise if present.
-            let noisy: HashMap<E::Act, f32> = if let Some(noise) = &self.root_noise {
-                let eps = self.root_noise_epsilon;
-                let mut blended: HashMap<E::Act, f32> = node.prior_probs
-                    .iter()
-                    .map(|(&a, &p)| {
-                        let n = noise.get(&a).copied().unwrap_or(0.0);
-                        (a, (1.0 - eps) * p + eps * n)
-                    })
-                    .collect();
-                let total: f32 = blended.values().sum();
-                if total > 0.0 {
-                    for v in blended.values_mut() { *v /= total; }
-                }
-                blended
-            } else {
-                node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
-            };
+        // For root nodes that need either Dirichlet noise blending or a
+        // softmax temperature != 1, allocate ONE owned buffer indexed by
+        // action.to_action_index() and apply both transforms in place.
+        // For all other nodes, read priors directly from
+        // `node.prior_probs` — no allocation needed.
+        // Reference: [Wu 2020, §2].
+        let needs_noise = is_root && self.root_noise.is_some();
+        let needs_softmax = is_root && (self.root_softmax_temp - 1.0).abs() > 1e-6;
+        let effective_buf: Option<Vec<f32>> = if needs_noise || needs_softmax {
+            let mut buf = node.prior_probs.clone();
 
-            // Step 2: apply softmax temperature.
-            if (self.root_softmax_temp - 1.0).abs() > 1e-6 {
-                let inv_temp = 1.0 / self.root_softmax_temp;
-                let raw: HashMap<E::Act, f32> = noisy
-                    .iter()
-                    .map(|(&a, &p)| (a, p.max(1e-30).powf(inv_temp)))
-                    .collect();
-                let sum: f32 = raw.values().sum();
-                raw.into_iter().map(|(a, p)| (a, p / sum)).collect()
-            } else {
-                noisy
+            if let Some(noise) = &self.root_noise {
+                let eps = self.root_noise_epsilon;
+                for &a in &node.valid_actions {
+                    let idx = a.to_action_index();
+                    let n = noise.get(&a).copied().unwrap_or(0.0);
+                    buf[idx] = (1.0 - eps) * node.prior_probs[idx] + eps * n;
+                }
+                let total: f32 = node.valid_actions.iter()
+                    .map(|&a| buf[a.to_action_index()])
+                    .sum();
+                if total > 0.0 {
+                    for &a in &node.valid_actions {
+                        buf[a.to_action_index()] /= total;
+                    }
+                }
             }
+
+            if needs_softmax {
+                let inv_temp = 1.0 / self.root_softmax_temp;
+                for &a in &node.valid_actions {
+                    let idx = a.to_action_index();
+                    buf[idx] = buf[idx].max(1e-30).powf(inv_temp);
+                }
+                let sum: f32 = node.valid_actions.iter()
+                    .map(|&a| buf[a.to_action_index()])
+                    .sum();
+                if sum > 0.0 {
+                    for &a in &node.valid_actions {
+                        buf[a.to_action_index()] /= sum;
+                    }
+                }
+            }
+            Some(buf)
         } else {
-            node.prior_probs.iter().map(|(&a, &p)| (a, p)).collect()
+            None
         };
 
-        let mut scores = HashMap::new();
+        // Score Vec indexed by action.to_action_index(). Invalid action
+        // slots stay at NEG_INFINITY so a downstream argmax over the
+        // dense Vec can never pick an invalid action.
+        let mut scores = vec![f32::NEG_INFINITY; node.num_actions];
 
-        for (&action, &prior) in &effective_priors {
-            let this_edge_visits = node.edge_visits.get(&action).copied().unwrap_or(0);
-            let num_virtual_losses = node.virtual_losses.get(&action).copied().unwrap_or(0);
+        for &action in &node.valid_actions {
+            let idx = action.to_action_index();
+            let this_edge_visits = node.edge_visits[idx];
+            let num_virtual_losses = node.virtual_losses[idx];
             let adjusted_visits = this_edge_visits + num_virtual_losses;
-            let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
+            let penalty = node.edge_penalties[idx];
+            let prior = match &effective_buf {
+                Some(buf) => buf[idx],
+                None => node.prior_probs[idx],
+            };
 
             // --- Forced playouts ---
             // If this root child is under-visited, force selection by returning ∞.
-            // Only applies during full (forced_playouts = true) searches to avoid wasting fast
-            // search playouts on exploratory moves.
+            // Only applies during full (forced_playouts = true) searches to avoid
+            // wasting fast search playouts on exploratory moves.
             // Reference: [Wu 2020, §3.2].
             if is_root && apply_forced && total_visits > 0 {
                 let n_forced = (self.k_forced * prior * total_visits as f32).sqrt();
                 if (this_edge_visits as f32) < n_forced {
-                    scores.insert(action, f32::INFINITY);
+                    scores[idx] = f32::INFINITY;
                     continue;
                 }
             }
@@ -518,7 +556,7 @@ impl<E: Environment> MCTS<E> {
             // Use the child's backed-up value when it is in the transposition table.
             // If the child has never been reached at all, apply the FPU fallback.
             // Reference: [Wu 2020, §2, footnote 3].
-            let q_value = match node.children.get(&action).copied() {
+            let q_value = match node.children.get(idx).and_then(|c| *c) {
                 Some(child_id) => self.get_node_immut(child_id)
                     .map(|c| c.value + penalty)
                     .unwrap_or(fpu_q + penalty),
@@ -526,7 +564,7 @@ impl<E: Environment> MCTS<E> {
             };
 
             let u_value = c_puct * prior * (sqrt_total / (1.0 + adjusted_visits as f32));
-            scores.insert(action, q_value + u_value);
+            scores[idx] = q_value + u_value;
         }
         scores
     }
@@ -539,7 +577,21 @@ impl<E: Environment> MCTS<E> {
         apply_forced: bool,
     ) -> Option<E::Act> {
         let scores = self.puct_scores(node_id, c_puct, is_root, apply_forced);
-        scores.into_iter().max_by(|a, b| a.1.partial_cmp(&b.1).unwrap()).map(|(action, _)| action)
+        if scores.is_empty() {
+            return None;
+        }
+        // Iterate valid_actions and look up dense scores. Invalid action
+        // slots are NEG_INFINITY, so a global argmax over the Vec would
+        // also work — but iterating valid_actions is cheaper at branching
+        // factor 251 with typically all-valid actions.
+        let node = self.get_node_immut(node_id)?;
+        node.valid_actions.iter()
+            .copied()
+            .max_by(|&a, &b| {
+                let sa = scores[a.to_action_index()];
+                let sb = scores[b.to_action_index()];
+                sa.partial_cmp(&sb).unwrap_or(std::cmp::Ordering::Equal)
+            })
     }
 
     pub fn select_action(&self, node: &Node<E::Act>) -> Option<E::Act> {
@@ -548,7 +600,10 @@ impl<E: Environment> MCTS<E> {
 
     pub fn add_child(&mut self, parent_id: NodeId, action: E::Act, child_id: NodeId) {
         if let Some(parent) = self.get_node_mut(parent_id) {
-            parent.children.insert(action, child_id);
+            let idx = action.to_action_index();
+            if idx < parent.children.len() {
+                parent.children[idx] = Some(child_id);
+            }
         }
     }
 
@@ -639,10 +694,10 @@ impl<E: Environment> MCTS<E> {
 
             // lookup child id from the parent snapshot
             if let Some(parent_node) = self.get_node_immut(node_id) {
-                if let Some(cid) = parent_node.children.get(&action.unwrap()).copied() {
-                    node_id = cid;
-                } else {
-                    break;
+                let idx = action.unwrap().to_action_index();
+                match parent_node.children.get(idx).and_then(|c| *c) {
+                    Some(cid) => { node_id = cid; }
+                    None => break,
                 }
             } else {
                 break;
@@ -671,16 +726,29 @@ impl<E: Environment> MCTS<E> {
         }
 
         if let Some(parent) = self.get_node_mut(parent_id) {
-            if parent.children.contains_key(&action) {
-                let existing_id = parent.children.get(&action).copied().unwrap();
-                if existing_id != leaf_id {
-                    eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id);
-                }
-            } else {
-                parent.children.insert(action, leaf_id);
-                for (&a, &cid) in &parent.children {
-                    if cid == leaf_id && a != action {
-                        eprintln!("[Alias detected] actions {:?} - {:?}", a, action);
+            let idx = action.to_action_index();
+            if idx < parent.children.len() {
+                match parent.children[idx] {
+                    Some(existing_id) => {
+                        if existing_id != leaf_id {
+                            eprintln!("[Mismatched IDs] existing {} != leaf {}", existing_id, leaf_id);
+                        }
+                    }
+                    None => {
+                        parent.children[idx] = Some(leaf_id);
+                        // Alias detection: warn if any other slot already
+                        // points at the same leaf_id (would mean two
+                        // actions in the same parent transposed to a
+                        // single state).
+                        for (i, slot) in parent.children.iter().enumerate() {
+                            if i != idx {
+                                if let Some(cid) = *slot {
+                                    if cid == leaf_id {
+                                        eprintln!("[Alias detected] action index {} - {}", i, idx);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -711,7 +779,10 @@ impl<E: Environment> MCTS<E> {
         // Backpropagate visits and recompute values in both cases
         for &(node_hash, action) in search_path.iter().rev() {
             if let Some(node) = self.get_node_mut(node_hash) {
-                *node.edge_visits.entry(action).or_insert(0) += 1;
+                let idx = action.to_action_index();
+                if idx < node.edge_visits.len() {
+                    node.edge_visits[idx] += 1;
+                }
             }
             self.recompute_value(node_hash);
         }
@@ -749,7 +820,7 @@ impl<E: Environment> MCTS<E> {
         let root_id = self.root_id?;
         let node = self.get_node_immut(root_id)?;
 
-        let n_total: usize = node.edge_visits.values().copied().sum();
+        let n_total: usize = node.edge_visits.iter().sum();
         if n_total == 0 {
             return None;
         }
@@ -760,9 +831,10 @@ impl<E: Environment> MCTS<E> {
 
         // Pre-compute Q(c) for each action using the transposition table.
         // Q(c) = backed-up child value if available, otherwise the FPU fallback.
-        let q_values: HashMap<E::Act, f32> = node.prior_probs.keys().map(|&action| {
-            let penalty = node.edge_penalties.get(&action).copied().unwrap_or(0.0);
-            let q = match node.children.get(&action).copied() {
+        let q_values: HashMap<E::Act, f32> = node.valid_actions.iter().map(|&action| {
+            let idx = action.to_action_index();
+            let penalty = node.edge_penalties[idx];
+            let q = match node.children.get(idx).and_then(|c| *c) {
                 Some(child_id) => self.get_node_immut(child_id)
                     .map(|c| c.value + penalty)
                     .unwrap_or(fpu_q + penalty),
@@ -775,25 +847,40 @@ impl<E: Environment> MCTS<E> {
         // apply_forced=false so we get clean finite scores for the comparison.
         let puct_scores = self.puct_scores(root_id, c_puct, true, false);
 
-        // Step 1: find c* – the most-visited root child.
-        let (&best_action, _) = node.edge_visits.iter().max_by_key(|&(_, &v)| v)?;
+        // Step 1: find c* — the most-visited root child. Iterate
+        // valid_actions and look up dense visit counts.
+        let best_action = {
+            let mut best: Option<(E::Act, usize)> = None;
+            for &a in &node.valid_actions {
+                let v = node.edge_visits[a.to_action_index()];
+                match best {
+                    Some((_, bv)) if bv >= v => {}
+                    _ => best = Some((a, v)),
+                }
+            }
+            best.map(|(a, _)| a)?
+        };
         let puct_best = puct_scores
-            .get(&best_action)
+            .get(best_action.to_action_index())
             .copied()
             .unwrap_or(f32::NEG_INFINITY);
 
         // Step 2: build the pruned visit map, starting from all visited children.
-        let mut pruned: HashMap<E::Act, usize> = node.edge_visits
-            .iter()
-            .filter(|&(_, &v)| v > 0)
-            .map(|(&a, &v)| (a, v))
+        let mut pruned: HashMap<E::Act, usize> = node.valid_actions.iter()
+            .filter_map(|&a| {
+                let v = node.edge_visits[a.to_action_index()];
+                if v > 0 { Some((a, v)) } else { None }
+            })
             .collect();
 
         for (&action, visits) in pruned.iter_mut() {
             if action == best_action {
                 continue; // never modify the best child's count
             }
-            let prior = node.prior_probs.get(&action).copied().unwrap_or(0.0);
+            let prior = node.prior_probs
+                .get(action.to_action_index())
+                .copied()
+                .unwrap_or(0.0);
             if prior == 0.0 {
                 continue;
             }
@@ -933,6 +1020,8 @@ pub mod test_env {
             }
         }
 
+        fn num_actions(&self) -> usize { 2 }
+
         fn done(&self) -> bool {
             self.position == self.target
         }
@@ -989,7 +1078,7 @@ mod tests {
     fn test_insert_and_get_node() {
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let priors = HashMap::from([(0u8, 0.5), (1u8, 0.5)]);
-        let node = Node::new(priors, 0.42, 1, None);
+        let node = Node::new(2, priors, 0.42, 1, None);
         mcts.insert_node(1, node);
         let node = mcts.get_node_immut(1).unwrap();
         assert!((node.value - 0.42).abs() < 1e-6);
@@ -1017,10 +1106,10 @@ mod tests {
     /// Parent value = 0.5.
     fn build_fpu_node() -> MCTS<NumberLineEnv> {
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
-        let node = Node::new(HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.5, 1, None);
+        let node = Node::new(2, HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.5, 1, None);
         mcts.insert_node(1, node);
         if let Some(n) = mcts.get_node_mut(1) {
-            *n.edge_visits.entry(0).or_insert(0) = 1;
+            n.edge_visits[0] = 1;
         }
         mcts.root_id = Some(1);
         mcts
@@ -1039,10 +1128,10 @@ mod tests {
         let scores_no_fpu = mcts.puct_scores(1, 1.0, false, false);
 
         assert!(
-            scores_fpu[&1u8] < scores_no_fpu[&1u8],
+            scores_fpu[1] < scores_no_fpu[1],
             "FPU should lower the Q-fallback for unvisited children: {} vs {}",
-            scores_fpu[&1u8],
-            scores_no_fpu[&1u8],
+            scores_fpu[1],
+            scores_no_fpu[1],
         );
     }
 
@@ -1057,7 +1146,7 @@ mod tests {
         let scores_no_fpu = mcts.puct_scores(1, 1.0, true, false);
 
         // Scores should be identical (within float precision).
-        let diff = (scores_root[&1u8] - scores_no_fpu[&1u8]).abs();
+        let diff = (scores_root[1] - scores_no_fpu[1]).abs();
         assert!(diff < 1e-5, "FPU should be inactive at root: diff = {}", diff);
     }
 
@@ -1066,20 +1155,20 @@ mod tests {
         // n_forced(action 1) = √(2.0 × 0.4 × 11) ≈ 2.97
         // Action 1 has only 1 visit, so it should receive INFINITY.
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
-        let node = Node::new(HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.0, 1, None);
+        let node = Node::new(2, HashMap::from([(0u8, 0.6), (1u8, 0.4)]), 0.0, 1, None);
         mcts.insert_node(1, node);
         if let Some(n) = mcts.get_node_mut(1) {
-            *n.edge_visits.entry(0).or_insert(0) = 10;
-            *n.edge_visits.entry(1).or_insert(0) = 1;
+            n.edge_visits[0] = 10;
+            n.edge_visits[1] = 1;
         }
         mcts.root_id = Some(1);
 
         let scores = mcts.puct_scores(1, 1.0, true, true);
-        assert_eq!(scores[&1u8], f32::INFINITY, "under-visited root child should get ∞");
+        assert_eq!(scores[1], f32::INFINITY, "under-visited root child should get ∞");
 
         // With apply_forced = false, no infinity should appear.
         let scores_no_forced = mcts.puct_scores(1, 1.0, true, false);
-        assert!(scores_no_forced[&1u8].is_finite(), "forced playouts disabled — should be finite");
+        assert!(scores_no_forced[1].is_finite(), "forced playouts disabled — should be finite");
     }
 
     #[test]
@@ -1089,7 +1178,7 @@ mod tests {
         // to T = 1.0 (identity).
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         // Strongly skewed prior: action 0 = 0.9, action 1 = 0.1.
-        let node = Node::new(HashMap::from([(0u8, 0.9), (1u8, 0.1)]), 0.0, 1, None);
+        let node = Node::new(2, HashMap::from([(0u8, 0.9), (1u8, 0.1)]), 0.0, 1, None);
         mcts.insert_node(1, node);
         mcts.root_id = Some(1);
 
@@ -1101,15 +1190,15 @@ mod tests {
 
         // Flatter prior → lower score for action 0 (dominant prior shaved down).
         assert!(
-            scores_t2[&0u8] < scores_t1[&0u8],
+            scores_t2[0] < scores_t1[0],
             "higher temperature should reduce score for dominant action: {} vs {}",
-            scores_t2[&0u8], scores_t1[&0u8]
+            scores_t2[0], scores_t1[0]
         );
         // Flatter prior → higher score for action 1 (minority prior boosted).
         assert!(
-            scores_t2[&1u8] > scores_t1[&1u8],
+            scores_t2[1] > scores_t1[1],
             "higher temperature should increase score for minority action: {} vs {}",
-            scores_t2[&1u8], scores_t1[&1u8]
+            scores_t2[1], scores_t1[1]
         );
     }
 
@@ -1136,7 +1225,7 @@ mod tests {
 
         let root_id = mcts.root_id.unwrap();
         let raw_actions = mcts.get_node_immut(root_id).unwrap()
-            .edge_visits.iter().filter(|&(_, &v)| v > 0).count();
+            .edge_visits.iter().filter(|&&v| v > 0).count();
         let pruned_actions = mcts.policy_target(1.4).unwrap().len();
         assert!(pruned_actions <= raw_actions,
             "pruning should not add actions: {} > {}", pruned_actions, raw_actions);
@@ -1162,15 +1251,15 @@ mod tests {
         let (root_id, child_a_id, child_b_id, grandchild_id): (NodeId, NodeId, NodeId, NodeId) =
             (10, 20, 30, 40);
 
-        let mut root = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
-        root.children.insert(0, child_a_id);
-        root.children.insert(1, child_b_id);
+        let mut root = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
+        root.children[0] = Some(child_a_id);
+        root.children[1] = Some(child_b_id);
 
-        let mut child_a = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
-        child_a.children.insert(0, grandchild_id);
+        let mut child_a = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
+        child_a.children[0] = Some(grandchild_id);
 
-        let child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
-        let grandchild = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, grandchild_id, None);
+        let child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        let grandchild = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, grandchild_id, None);
 
         mcts.insert_node(root_id, root);
         mcts.insert_node(child_a_id, child_a);
@@ -1220,17 +1309,17 @@ mod tests {
         let (root_id, child_a_id, child_b_id, shared_id): (NodeId, NodeId, NodeId, NodeId) =
             (10, 20, 30, 40);
 
-        let mut root = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
-        root.children.insert(0, child_a_id);
-        root.children.insert(1, child_b_id);
+        let mut root = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, root_id, None);
+        root.children[0] = Some(child_a_id);
+        root.children[1] = Some(child_b_id);
 
-        let mut child_a = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
-        child_a.children.insert(0, shared_id);
+        let mut child_a = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_a_id, None);
+        child_a.children[0] = Some(shared_id);
 
-        let mut child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
-        child_b.children.insert(0, shared_id);
+        let mut child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        child_b.children[0] = Some(shared_id);
 
-        let shared = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, shared_id, None);
+        let shared = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, shared_id, None);
 
         mcts.insert_node(root_id, root);
         mcts.insert_node(child_a_id, child_a);
@@ -1257,14 +1346,14 @@ mod tests {
         let mut mcts: MCTS<NumberLineEnv> = MCTS::new(4);
         let (root_id, child_a_id, child_b_id): (NodeId, NodeId, NodeId) = (10, 20, 30);
 
-        let mut root = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, root_id, None);
-        root.children.insert(0, child_a_id);
+        let mut root = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, root_id, None);
+        root.children[0] = Some(child_a_id);
 
-        let mut child_a = Node::new(HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, child_a_id, None);
-        child_a.children.insert(1, child_b_id);
+        let mut child_a = Node::new(2, HashMap::from([(0u8, 0.5), (1u8, 0.5)]), 0.0, child_a_id, None);
+        child_a.children[1] = Some(child_b_id);
 
-        let mut child_b = Node::new(HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
-        child_b.children.insert(0, child_a_id); // back-edge
+        let mut child_b = Node::new(1, HashMap::from([(0u8, 1.0)]), 0.0, child_b_id, None);
+        child_b.children[0] = Some(child_a_id); // back-edge
 
         mcts.insert_node(root_id, root);
         mcts.insert_node(child_a_id, child_a);

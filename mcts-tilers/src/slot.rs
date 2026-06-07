@@ -8,6 +8,12 @@ use tilers::rl::board::BoardCell;
 use crate::constants::*;
 use crate::environment::TilersObs;
 
+// Note: the pre-PauliProduct env exposed `Orientation::from_u8` and
+// `Operation::from_u8` for the placement/objective wire format used by
+// the old slot layout.  Both helpers + that wire format are gone — the
+// observation is now `Vec<Vec<BoardCell>>` (the 10-channel board) and
+// the slot serializes those cells directly as i16 channels.
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Slot states
 // ─────────────────────────────────────────────────────────────────────────────
