@@ -114,3 +114,25 @@ class TestPyMcts:
             steps += 1
 
         assert steps > 0, "the game should take at least one action"
+
+
+class TestRealAgentInProcess:
+    """The real `tile.Agent.infer_from_obs` (batched: obs-list in, prior +
+    value lists out) drives in-process MCTS — the same contract `MctsAgent`
+    calls, exercised with the actual network rather than a dummy."""
+
+    def test_real_agent_drives_search(self) -> None:
+        import pytest
+
+        Agent = pytest.importorskip("tile.agent").Agent
+
+        # lookahead=1 matches the board the mcts side builds (2 layers).
+        agent = Agent(embedding_dim=32, num_layers=2, lookahead=1)
+        agent.to("cpu")
+
+        env = make_env()
+        node = PyMcts(batch_size=1).run(env, MctsAgent(agent), num_steps=16)
+        visits = node.edge_visits()
+        assert sum(visits.values()) > 0, "real agent should expand the root"
+        # Priors came back keyed by valid action ids in [0, num_actions).
+        assert all(isinstance(a, int) for a in visits)
