@@ -14,25 +14,11 @@ from mcts_tilers import LOOKAHEAD_MAX, GRID_MAX, CELL_FIELDS
 # module (and `do_work`, which takes the agent as a parameter) can be
 # driven by a lightweight dummy agent in tests without a GPU / checkpoint.
 
-# Rust opt-in for the build_boards / unpack_* hot path. The actual
-# rebinding happens at the bottom of this file once the Python defs
-# exist; this constant just controls which branch wins. Set
-# MCTS_HANDLER_RUST=1 to flip the handler over to the Rust
-# implementations exposed by the mcts_tilers PyO3 module.
-_USE_RUST_HANDLER = os.environ.get("MCTS_HANDLER_RUST", "0") == "1"
-
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
 BATCH_TIMEOUT = 0.002
 MAX_SLOTS_PER_BATCH = 64  # max slots to gather before one GPU call
-
-# Note: main carried `_bucket_bs` / `_pad_to_bs` helpers for
-# torch.compile(mode='reduce-overhead') static-shape bucketing on the
-# GPU inference path.  Those belong with the perf machinery that the
-# board-migration merge intentionally dropped — they pair with
-# bf16 autocast + h_int/w_int kwargs + handler metrics, all of which
-# need re-applying as a follow-up.
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -129,7 +115,14 @@ def build_board_batch(slot_views, lookahead: int):
 # ------------------------------------------------------------------------------
 # Inference loop
 # ------------------------------------------------------------------------------
-def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
+def do_work(
+    arena: PyArena,
+    agent,
+    device: str,
+    lookahead: int,
+    *,
+    metrics_path: Path | None = None,
+) -> None:
     """Pump the arena: batch ready slots, run ``agent.infer`` over the board,
     write priors/values back.
 
@@ -137,70 +130,101 @@ def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
     ``infer(boards, heights, widths, num_ancillas, action_masks) ->
     (priors, values)`` (tensors), matching ``tile.Agent`` — a dummy agent
     with the same signature works for tests.
+
+    Args:
+        metrics_path: If set, append one JSON line per inference batch with
+            ``{ts, num_slots, num_obs, fill_ms, build_ms, gpu_ms}`` for
+            calibrating ``MAX_BATCH`` / ``BATCH_TIMEOUT`` against real
+            workloads.  Parent dir is created if missing.
     """
-    while True:
-        try:
-            first_sv = arena.pop_ready_view(clear_outputs=True)
-            first_sv.set_handler_start_time()
-        except KeyboardInterrupt:
-            break
+    metrics_fh = None
+    if metrics_path is not None:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        # line-buffered so a kill mid-loop still leaves complete lines.
+        metrics_fh = open(metrics_path, "a", buffering=1)
 
-        slot_views = [first_sv]
+    try:
+        while True:
+            try:
+                first_sv = arena.pop_ready_view(clear_outputs=True)
+                first_sv.set_handler_start_time()
+            except KeyboardInterrupt:
+                break
 
-        fill_start = time.monotonic()
-        while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - fill_start) < BATCH_TIMEOUT:
-            sv = arena.try_pop_ready_view(clear_outputs=True)
-            if sv is None:
-                time.sleep(0.0005)
-                continue
-            sv.set_handler_start_time()
-            slot_views.append(sv)
+            slot_views = [first_sv]
 
-        try:
-            batched = build_board_batch(slot_views, lookahead)
-            if batched is None:
-                continue
-            (boards, heights, widths, num_ancillas,
-             action_masks, slot_batch_sizes, valid_slot_views) = batched
+            fill_start = time.monotonic()
+            while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - fill_start) < BATCH_TIMEOUT:
+                sv = arena.try_pop_ready_view(clear_outputs=True)
+                if sv is None:
+                    time.sleep(0.0005)
+                    continue
+                sv.set_handler_start_time()
+                slot_views.append(sv)
+            fill_ms = (time.monotonic() - fill_start) * 1000.0
 
-            priors_np, values_np = agent.infer(
-                boards=boards,
-                heights=heights,
-                widths=widths,
-                num_ancillas=num_ancillas,
-                action_masks=action_masks,
-                device=device,
-            )
+            try:
+                build_start = time.monotonic()
+                batched = build_board_batch(slot_views, lookahead)
+                if batched is None:
+                    continue
+                (boards, heights, widths, num_ancillas,
+                 action_masks, slot_batch_sizes, valid_slot_views) = batched
+                build_ms = (time.monotonic() - build_start) * 1000.0
 
-            # Write back per-slot.
-            idx = 0
-            for slot_len, sv in zip(slot_batch_sizes, valid_slot_views):
-                pri_slice = np.ascontiguousarray(priors_np[idx: idx + slot_len])
-                val_slice = np.ascontiguousarray(values_np[idx: idx + slot_len])
-                idx += slot_len
-                sv.write_priors_values(
-                    pri_slice.astype(np.float32, copy=False),
-                    val_slice.astype(np.float32, copy=False),
+                gpu_start = time.monotonic()
+                priors_np, values_np = agent.infer(
+                    boards=boards,
+                    heights=heights,
+                    widths=widths,
+                    num_ancillas=num_ancillas,
+                    action_masks=action_masks,
+                    device=device,
                 )
-                sv.mark_done()
+                gpu_ms = (time.monotonic() - gpu_start) * 1000.0
 
-        except KeyboardInterrupt:
-            for sv in slot_views:
-                try:
+                # Write back per-slot.
+                idx = 0
+                for slot_len, sv in zip(slot_batch_sizes, valid_slot_views):
+                    pri_slice = np.ascontiguousarray(priors_np[idx: idx + slot_len])
+                    val_slice = np.ascontiguousarray(values_np[idx: idx + slot_len])
+                    idx += slot_len
+                    sv.write_priors_values(
+                        pri_slice.astype(np.float32, copy=False),
+                        val_slice.astype(np.float32, copy=False),
+                    )
                     sv.mark_done()
-                except Exception:
-                    pass
-            break
 
-        except Exception as e:
-            # Never leave a slot un-marked: a requester blocking on this
-            # slot would hang forever.  Log and release every slot.
-            logging.error("handler inference failed: %s", e, exc_info=True)
-            for sv in slot_views:
-                try:
-                    sv.mark_done()
-                except Exception:
-                    pass
+                if metrics_fh is not None:
+                    metrics_fh.write(json.dumps({
+                        "ts":        time.time(),
+                        "num_slots": len(valid_slot_views),
+                        "num_obs":   int(boards.shape[0]),
+                        "fill_ms":   round(fill_ms,  3),
+                        "build_ms":  round(build_ms, 3),
+                        "gpu_ms":    round(gpu_ms,   3),
+                    }) + "\n")
+
+            except KeyboardInterrupt:
+                for sv in slot_views:
+                    try:
+                        sv.mark_done()
+                    except Exception:
+                        pass
+                break
+
+            except Exception as e:
+                # Never leave a slot un-marked: a requester blocking on this
+                # slot would hang forever.  Log and release every slot.
+                logging.error("handler inference failed: %s", e, exc_info=True)
+                for sv in slot_views:
+                    try:
+                        sv.mark_done()
+                    except Exception:
+                        pass
+    finally:
+        if metrics_fh is not None:
+            metrics_fh.close()
 
 
 # ------------------------------------------------------------------------------
@@ -208,30 +232,178 @@ def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
 # contract `do_work` uses.
 # ------------------------------------------------------------------------------
 class TorchAgentRunner:
-    def __init__(self, model):
-        import torch  # noqa: F401
+    # Static-shape buckets for the model input batch dim.  With these,
+    # `torch.compile(mode='reduce-overhead')` builds one CUDA graph per
+    # bucket; every subsequent call rounds bs up to its bucket and
+    # replays that bucket's graph.  Eliminates per-kernel-launch
+    # overhead, which dominated `gpu_ms` in production profiling.
+    BS_BUCKETS: tuple[int, ...] = (16, 32, 64, 128, 256, 512)
+
+    def __init__(
+        self,
+        model,
+        *,
+        board_height: int = 10,
+        board_width: int = 10,
+        compile_model: bool = True,
+    ):
+        """Adapt `tile.Agent` to the numpy-in / numpy-out contract `do_work` uses.
+
+        Args:
+            model: A `tile.Agent` (or compatible).  Must expose
+                ``infer(boards, heights, widths, num_ancillas, action_masks,
+                h_int, w_int, max_actions_int)``.
+            board_height / board_width: Static env grid dims.  Passed as
+                Python ints into ``model.infer`` so ``forward`` skips the
+                ``.item()`` calls that break the ``torch.compile`` graph
+                (see `tile/agent.py::forward`'s ``h_int`` / ``w_int``
+                kwargs).  Defaults match the 10x10 production envs; pass
+                different values for other shapes.
+            compile_model: If True (the default), replace
+                ``model.forward`` with a ``torch.compile``'d version in
+                ``reduce-overhead`` mode.  Set False to bypass — useful
+                for tests + debugging compile failures.
+        """
+        import torch
         self.model = model
         self.lookahead = model.lookahead
+        self.board_height = board_height
+        self.board_width = board_width
+        self.max_actions_int = model.num_outputs
+
+        if compile_model:
+            # Compile `model.forward` via attribute assignment instead of
+            # wrapping `model` in `OptimizedModule`.  Reason: `do_work`
+            # calls `model.infer(...)`, and `OptimizedModule.__getattr__`
+            # returns the underlying module's `infer` method whose
+            # `self.forward(...)` resolves back to the *original* forward —
+            # bypassing the compiled wrapper entirely.  Replacing the
+            # bound method directly makes every `self.forward(...)` lookup
+            # (including the one inside `infer`) pick up the compiled
+            # version.
+            self.model.forward = torch.compile(
+                self.model.forward, mode="reduce-overhead", dynamic=False,
+            )
+
+    @classmethod
+    def _bucket_bs(cls, n: int) -> int:
+        """Smallest bucket ≥ n.  Anything above the largest is clamped
+        (rare in practice; we'd rather pay one extra graph hit than let
+        one giant outlier blow the compile cache)."""
+        for b in cls.BS_BUCKETS:
+            if n <= b:
+                return b
+        return cls.BS_BUCKETS[-1]
+
+    @staticmethod
+    def _pad_to_bs(t, bs_padded: int, fill_value):
+        """Pad tensor along dim 0 (batch) to length bs_padded with fill_value."""
+        import torch
+        bs = t.shape[0]
+        if bs >= bs_padded:
+            return t
+        pad_shape = (bs_padded - bs,) + tuple(t.shape[1:])
+        pad_tensor = torch.full(pad_shape, fill_value, dtype=t.dtype, device=t.device)
+        return torch.cat([t, pad_tensor], dim=0)
+
+    def prewarm(self, device, *, log_prefix: str = "[handler]") -> None:
+        """Compile every bucket eagerly so a previously-unseen bs never
+        arrives during real inference (a cold compile takes 10–30s per
+        bucket and would block one inference call entirely).  Synthetic
+        zero inputs are fine — the compile cache is shape-keyed, not
+        value-keyed.  Each iteration also exercises the bf16 autocast +
+        static-shape kwargs path so the cache entries match what
+        production calls produce.
+        """
+        import torch
+        from contextlib import nullcontext
+        from torch import no_grad
+
+        autocast_ctx_factory = (
+            (lambda: torch.autocast("cuda", dtype=torch.bfloat16))
+            if str(device).startswith("cuda") else (lambda: nullcontext())
+        )
+        hw = self.board_height * self.board_width
+        n_layers = self.lookahead + 1
+        print(f"{log_prefix} pre-warming compile cache for buckets {self.BS_BUCKETS}...", flush=True)
+        for bs in self.BS_BUCKETS:
+            t0 = time.monotonic()
+            boards = torch.zeros((bs, n_layers, hw, CELL_FIELDS), dtype=torch.int32, device=device)
+            heights = torch.full((bs,), self.board_height, dtype=torch.int32, device=device)
+            widths = torch.full((bs,), self.board_width, dtype=torch.int32, device=device)
+            ancillas = torch.full((bs,), 1, dtype=torch.int32, device=device)
+            mask = torch.ones((bs, self.max_actions_int), dtype=torch.bool, device=device)
+            with no_grad(), autocast_ctx_factory():
+                _ = self.model.infer(
+                    boards=boards, heights=heights, widths=widths,
+                    num_ancillas=ancillas, action_masks=mask,
+                    h_int=self.board_height,
+                    w_int=self.board_width,
+                    max_actions_int=self.max_actions_int,
+                )
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize()
+            print(f"{log_prefix}   bs={bs:>4} compiled in {time.monotonic() - t0:.1f}s", flush=True)
+        print(f"{log_prefix} pre-warm done.", flush=True)
 
     def infer(self, boards, heights, widths, num_ancillas, action_masks, device):
         import torch
+        from contextlib import nullcontext
         from torch import no_grad
-        boards_t = torch.from_numpy(np.ascontiguousarray(boards)).to(device)
-        masks_t = torch.from_numpy(np.ascontiguousarray(action_masks)).to(device)
-        h_t = torch.from_numpy(heights).to(device)
-        w_t = torch.from_numpy(widths).to(device)
-        na_t = torch.from_numpy(num_ancillas).to(device)
-        with no_grad():
+
+        # non_blocking H2D lets each copy overlap with the next Python op
+        # (the model's own setup); pinned source memory isn't used since
+        # the numpy arrays are backed by the shared-memory arena, but the
+        # flag still skips an unnecessary cudaStreamSynchronize.
+        boards_t = torch.from_numpy(np.ascontiguousarray(boards)).to(device, non_blocking=True)
+        masks_t = torch.from_numpy(np.ascontiguousarray(action_masks)).to(device, non_blocking=True)
+        h_t = torch.from_numpy(heights).to(device, non_blocking=True)
+        w_t = torch.from_numpy(widths).to(device, non_blocking=True)
+        na_t = torch.from_numpy(num_ancillas).to(device, non_blocking=True)
+
+        # Pad the batch dim to a fixed bucket so the model sees one of
+        # only ~6 distinct shapes.  Padded entries get safe defaults
+        # (height=1, width=1, num_ancillas=1, action_mask=all-False); we
+        # slice them off after inference so they don't leak into outputs.
+        # action_mask=all-False is safe for softmax — the legal entries
+        # on real rows are unaffected.
+        real_bs = boards_t.shape[0]
+        bs_padded = self._bucket_bs(real_bs)
+        if bs_padded > real_bs:
+            boards_t = self._pad_to_bs(boards_t, bs_padded, 0)
+            h_t      = self._pad_to_bs(h_t,      bs_padded, 1)
+            w_t      = self._pad_to_bs(w_t,      bs_padded, 1)
+            na_t     = self._pad_to_bs(na_t,     bs_padded, 1)
+            masks_t  = self._pad_to_bs(masks_t,  bs_padded, False)
+
+        # bf16 autocast for forward — trainer trains in bf16
+        # (tile/trainer.py), so weights + activations have been exposed
+        # to this precision throughout training.  Outputs may come back
+        # in bf16; cast to fp32 before numpy (numpy has no bf16 support).
+        autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                        if str(device).startswith("cuda") else nullcontext())
+        with no_grad(), autocast_ctx:
+            # Static-shape kwargs (h_int / w_int / max_actions_int) skip
+            # the .item() graph-breaks under torch.compile.  The model's
+            # ``action_mask`` is already full-size (num_outputs), so
+            # passing num_outputs as max_actions_int makes the trim a
+            # no-op and avoids the .item() on `num_ancillas`.
             priors_t, values_t = self.model.infer(
                 boards=boards_t,
                 heights=h_t,
                 widths=w_t,
                 num_ancillas=na_t,
                 action_masks=masks_t,
+                h_int=self.board_height,
+                w_int=self.board_width,
+                max_actions_int=self.max_actions_int,
             )
+
+        # Slice off padded rows BEFORE the D2H copy — saves transferring
+        # the dead pad entries.
         return (
-            priors_t.detach().cpu().numpy(),
-            values_t.squeeze(-1).detach().cpu().numpy(),
+            priors_t[:real_bs].detach().to(torch.float32).cpu().numpy(),
+            values_t[:real_bs].squeeze(-1).detach().to(torch.float32).cpu().numpy(),
         )
 
 
@@ -250,10 +422,11 @@ if __name__ == "__main__":
     parser.add_argument("--num_handlers", type=int, default=1)
     parser.add_argument("--handler_id", type=int, default=0)
     parser.add_argument("--metrics_dir", type=str, default=None,
-        help="If set, the handler writes one JSON line per inference batch "
+        help="If set, the handler appends one JSON line per inference batch "
              "to {metrics_dir}/handler_{arena_tag}_{handler_id}.jsonl with "
-             "fill / build / gpu wallclock breakdown. Used to calibrate "
-             "MAX_BATCH and BATCH_TIMEOUT from real workload distributions.")
+             "{ts, num_slots, num_obs, fill_ms, build_ms, gpu_ms}.  Used "
+             "to calibrate MAX_BATCH and BATCH_TIMEOUT from real workload "
+             "distributions.")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -280,57 +453,16 @@ if __name__ == "__main__":
             print(f"[handler {args.handler_id}] No --weights given and no checkpoint found; using random weights.")
     model.to(device)
 
-    # torch.compile the model in CUDA-graph mode. Inputs are padded to one
-    # of _BS_BUCKETS before inference, so TorchInductor sees only a small
-    # fixed set of shapes — one CUDA graph per bucket. `reduce-overhead`
-    # captures the kernel launch sequence per shape and replays it as a
-    # single submission, eliminating the ~50us-per-launch overhead that
-    # dominated gpu_ms in the profile (15ms of 17ms wallclock was launch
-    # overhead, only 2.5ms was actual GPU compute).
-    #
-    # We compile MODEL.forward via attribute assignment instead of wrapping
-    # MODEL in OptimizedModule. Reason: do_work calls MODEL.infer(...), and
-    # OptimizedModule.__getattr__ returns the underlying module's `infer`
-    # method whose `self.forward(...)` resolves back to the *original*
-    # forward — bypassing the compiled wrapper entirely. By replacing the
-    # bound method directly, every `self.forward(...)` lookup (including
-    # the one inside infer) picks up the compiled version.
-    #
-    # First call per bucket pays a compile cost (10-30s). With ~6 buckets,
-    # the first ~minute of inference is compile-heavy; after that, every
-    # call replays its bucket's graph. Handler warmup should absorb this.
-    MODEL.forward = torch.compile(
-        MODEL.forward, mode="reduce-overhead", dynamic=False)
-
-    # Pre-compile every bucket eagerly so a previously-unseen bs never
-    # arrives during real inference (a cold compile takes 10-30s and
-    # would block one inference call entirely — observed as a ~15s
-    # gpu_ms outlier in production). Synthetic zero inputs are fine
-    # because the compile cache is shape-keyed, not value-keyed.
-    print(f"[handler {args.handler_id}] pre-warming compile cache for "
-          f"buckets {_BS_BUCKETS}...", flush=True)
-    for _bs in _BS_BUCKETS:
-        _t0 = time.monotonic()
-        _boards = torch.zeros((_bs, MODEL.lookahead + 1, 100, 4),
-                              dtype=torch.int32, device=device)
-        _heights = torch.full((_bs,), 10, dtype=torch.int32, device=device)
-        _widths = torch.full((_bs,), 10, dtype=torch.int32, device=device)
-        _ancillas = torch.full((_bs,), 1, dtype=torch.int32, device=device)
-        _mask = torch.ones((_bs, MODEL.num_outputs), dtype=torch.bool,
-                           device=device)
-        with no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            _ = MODEL.infer(
-                boards=_boards, heights=_heights, widths=_widths,
-                num_ancillas=_ancillas, action_masks=_mask,
-                h_int=10, w_int=10,
-                max_actions_int=MODEL.num_outputs,
-            )
-        torch.cuda.synchronize()
-        print(f"[handler {args.handler_id}]   bs={_bs:>4} compiled in "
-              f"{time.monotonic() - _t0:.1f}s", flush=True)
-    print(f"[handler {args.handler_id}] pre-warm done.", flush=True)
+    runner = TorchAgentRunner(model)
+    runner.prewarm(device, log_prefix=f"[handler {args.handler_id}]")
 
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
     arena_name = f"{args.arena_name}{tag}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
-    do_work(arena, TorchAgentRunner(model), device, model.lookahead)
+
+    metrics_path = None
+    if args.metrics_dir:
+        atag = args.arena_tag or "default"
+        metrics_path = Path(args.metrics_dir) / f"handler_{atag}_{args.handler_id}.jsonl"
+
+    do_work(arena, runner, device, model.lookahead, metrics_path=metrics_path)
