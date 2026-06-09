@@ -201,13 +201,26 @@ class TorchAgentRunner:
 
     def infer(self, boards, heights, widths, num_ancillas, action_masks, device):
         import torch
+        from contextlib import nullcontext
         from torch import no_grad
-        boards_t = torch.from_numpy(np.ascontiguousarray(boards)).to(device)
-        masks_t = torch.from_numpy(np.ascontiguousarray(action_masks)).to(device)
-        h_t = torch.from_numpy(heights).to(device)
-        w_t = torch.from_numpy(widths).to(device)
-        na_t = torch.from_numpy(num_ancillas).to(device)
-        with no_grad():
+
+        # non_blocking H2D lets each copy overlap with the next Python op
+        # (the model's own setup); pinned source memory isn't used since
+        # the numpy arrays are backed by the shared-memory arena, but the
+        # flag still skips an unnecessary cudaStreamSynchronize.
+        boards_t = torch.from_numpy(np.ascontiguousarray(boards)).to(device, non_blocking=True)
+        masks_t = torch.from_numpy(np.ascontiguousarray(action_masks)).to(device, non_blocking=True)
+        h_t = torch.from_numpy(heights).to(device, non_blocking=True)
+        w_t = torch.from_numpy(widths).to(device, non_blocking=True)
+        na_t = torch.from_numpy(num_ancillas).to(device, non_blocking=True)
+
+        # bf16 autocast for forward — trainer trains in bf16
+        # (tile/trainer.py), so weights + activations have been exposed
+        # to this precision throughout training.  Outputs may come back
+        # in bf16; cast to fp32 before numpy (numpy has no bf16 support).
+        autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
+                        if str(device).startswith("cuda") else nullcontext())
+        with no_grad(), autocast_ctx:
             priors_t, values_t = self.model.infer(
                 boards=boards_t,
                 heights=h_t,
@@ -216,8 +229,8 @@ class TorchAgentRunner:
                 action_masks=masks_t,
             )
         return (
-            priors_t.detach().cpu().numpy(),
-            values_t.squeeze(-1).detach().cpu().numpy(),
+            priors_t.detach().to(torch.float32).cpu().numpy(),
+            values_t.squeeze(-1).detach().to(torch.float32).cpu().numpy(),
         )
 
 
