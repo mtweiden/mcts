@@ -194,10 +194,26 @@ def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
 # contract `do_work` uses.
 # ------------------------------------------------------------------------------
 class TorchAgentRunner:
-    def __init__(self, model):
+    def __init__(self, model, *, board_height: int = 10, board_width: int = 10):
+        """Adapt `tile.Agent` to the numpy-in / numpy-out contract `do_work` uses.
+
+        Args:
+            model: A `tile.Agent` (or compatible).  Must expose
+                ``infer(boards, heights, widths, num_ancillas, action_masks,
+                h_int, w_int, max_actions_int)``.
+            board_height / board_width: Static env grid dims.  Passed as
+                Python ints into ``model.infer`` so ``forward`` skips the
+                ``.item()`` calls that break the ``torch.compile`` graph
+                (see `tile/agent.py::forward`'s ``h_int`` / ``w_int``
+                kwargs).  Defaults match the 10x10 production envs; pass
+                different values for other shapes.
+        """
         import torch  # noqa: F401
         self.model = model
         self.lookahead = model.lookahead
+        self.board_height = board_height
+        self.board_width = board_width
+        self.max_actions_int = model.num_outputs
 
     def infer(self, boards, heights, widths, num_ancillas, action_masks, device):
         import torch
@@ -221,12 +237,20 @@ class TorchAgentRunner:
         autocast_ctx = (torch.autocast("cuda", dtype=torch.bfloat16)
                         if str(device).startswith("cuda") else nullcontext())
         with no_grad(), autocast_ctx:
+            # Static-shape kwargs (h_int / w_int / max_actions_int) skip
+            # the .item() graph-breaks under torch.compile.  The model's
+            # ``action_mask`` is already full-size (num_outputs), so
+            # passing num_outputs as max_actions_int makes the trim a
+            # no-op and avoids the .item() on `num_ancillas`.
             priors_t, values_t = self.model.infer(
                 boards=boards_t,
                 heights=h_t,
                 widths=w_t,
                 num_ancillas=na_t,
                 action_masks=masks_t,
+                h_int=self.board_height,
+                w_int=self.board_width,
+                max_actions_int=self.max_actions_int,
             )
         return (
             priors_t.detach().to(torch.float32).cpu().numpy(),
