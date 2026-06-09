@@ -28,7 +28,7 @@ fn main() {
     let mut num_handlers = 1;
     let mut num_shuffles = 0;
     let num_slots = 2048;
-    let num_objective_layers = DEFAULT_LOOKAHEAD;
+    let lookahead = DEFAULT_LOOKAHEAD;
     let mut max_generated_depth = 10_000;
     let mut c_puct = 1.4;
     let mut mcts_steps: usize = 800;
@@ -123,7 +123,7 @@ fn main() {
         output_path,
         0.20,               // action-selection noise strength
         dirichlet_epsilon,  // Dirichlet epsilon for MCTS root noise
-        num_objective_layers,
+        lookahead,
         worker_id as usize,
         trajectory_dir,
         Some(reward_saturation_temperature),
@@ -157,9 +157,9 @@ fn main() {
         }
 
         env.random_start(no, false);
-        if env.valid_actions().contains(&0) {
+        if env.valid_actions().contains(&tilers::enums::Action::AutoExecute) {
             let mut tmp_env = env.clone();
-            let _ = tmp_env.step(0);
+            let _ = tmp_env.step(tilers::enums::Action::AutoExecute);
             if tmp_env.done() {
                 continue;
             }

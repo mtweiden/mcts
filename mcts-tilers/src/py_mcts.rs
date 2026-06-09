@@ -22,42 +22,37 @@ use crate::environment::{TilersObs, TilersEnv};
 fn obs_to_pydict<'py>(py: Python<'py>, obs: &TilersObs) -> PyResult<Bound<'py, PyDict>> {
     let dict = PyDict::new(py);
 
-    // placement: list of (i32, u8) tuples
-    let placement: Vec<(i32, u8)> = obs
-        .placement
-        .iter()
-        .map(|q| (q.id.as_i32(), q.orientation as u8))
-        .collect();
-    dict.set_item("placement", &placement)?;
-
-    // objectives: list of list of (i32, i32, i32) or (i32, i32) tuples
-    let objectives: Vec<Vec<Py<PyAny>>> = obs
-        .objectives
+    // board: list[layer] of list[cell] of [CELL_FIELDS i16] — the 10-channel
+    // observation (see TILERS_MIGRATION.md §4 / tilers::rl::board).
+    let board: Vec<Vec<[i16; CELL_FIELDS]>> = obs
+        .board
         .iter()
         .map(|layer| {
             layer
                 .iter()
-                .map(|o| {
-                    if o.opcode.is_single_qubit() {
-                        PyTuple::new(py, &[o.opcode as i32, o.arg_0.as_i32()])
-                            .unwrap()
-                            .into_any()
-                            .unbind()
-                    } else {
-                        PyTuple::new(py, &[o.opcode as i32, o.arg_0.as_i32(), o.arg_1.as_i32()])
-                            .unwrap()
-                            .into_any()
-                            .unbind()
-                    }
+                .map(|c| {
+                    [
+                        c.qubit_role,
+                        c.factor_kind,
+                        c.resource_kind,
+                        c.pp_group_row,
+                        c.pp_group_col,
+                        c.ancilla_idx,
+                        c.last_move_dir,
+                        c.weight_in_pp,
+                        c.is_hub_for_pp,
+                        c.is_y_ready,
+                    ]
                 })
                 .collect()
         })
         .collect();
-    dict.set_item("objectives", &objectives)?;
+    dict.set_item("board", &board)?;
 
     dict.set_item("height", obs.height)?;
     dict.set_item("width", obs.width)?;
     dict.set_item("num_ancillas", obs.num_ancillas)?;
+    dict.set_item("num_layers", obs.num_layers)?;
 
     let valid_actions: Vec<Action> = obs
         .action_mask
@@ -66,14 +61,6 @@ fn obs_to_pydict<'py>(py: Python<'py>, obs: &TilersObs) -> PyResult<Bound<'py, P
         .filter_map(|(i, &v)| if v { Some(i as Action) } else { None })
         .collect();
     dict.set_item("valid_actions", &valid_actions)?;
-
-    let last_dirs_vertical: HashMap<i32, bool> = obs
-        .last_dir_vertical
-        .iter()
-        .enumerate()
-        .map(|(qid, &is_vertical)| (-((qid + 1) as i32), is_vertical))
-        .collect();
-    dict.set_item("last_dirs_vertical", &last_dirs_vertical)?;
 
     Ok(dict)
 }

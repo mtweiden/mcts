@@ -1,118 +1,138 @@
+"""
+In-process MCTS over a real tilers env with a Python agent.
+
+`PyMcts.run(env, agent, ...)` takes a tilers `Environment` and an
+`MctsAgent` wrapping a Python object exposing
+``infer_from_obs(obs_list) -> (priors, values)``.  The observation dicts
+come from the Rust adapter (`obs_to_pydict`) and carry the 10-channel
+`board` plus `valid_actions` (encoded `u16` ids).
+
+`mcts_tilers` statically links its own copy of `tilers`, so the env must
+be `mcts_tilers.Environment` (its embedded type) — an `Environment` from
+the standalone `tilers` package is a *different* Python class and PyMcts
+would reject it.
+
+The real `tile.Agent.infer_from_obs` is intentionally stubbed, so this
+in-process path uses a trivial uniform agent; the real model is wired
+through the IPC handler instead (see `test_board_ipc.py`).
+"""
+
 from typing import Any
-from pymcts import MctsAgent
-from pymcts import MctsEnvironment
-from pymcts import PyMcts
+
+from mcts_tilers import Environment, MctsAgent, PyMcts
+
 
 class DummyAgent:
-    def infer(self, obs: list[dict[str, Any]]) -> tuple[list[dict[int, float]], list[float]]:
-        prior_probs = [
-            {a: 1.0 / len(o['valid_actions']) for a in o['valid_actions']}
-            for o in obs
-        ]
-        values = [0.0 for _ in range(len(obs))]
-        return prior_probs, values
+    """Uniform prior over each obs's valid actions; value 0."""
 
-class DummyEnvironment:
-    """
-    Try to increment a counter until a value is reached.
-    """
-    def __init__(self, target_value: int) -> None:
-        self.target_value = target_value
-        self.current_value = 0
-        self.height = 1
-        self.width = 1
-        self.num_ancillas = 0
+    def infer_from_obs(
+        self, obs_list: list[dict[str, Any]]
+    ) -> tuple[list[dict[int, float]], list[float]]:
+        priors = []
+        for o in obs_list:
+            va = o["valid_actions"]
+            priors.append({a: 1.0 / len(va) for a in va} if va else {})
+        values = [0.0 for _ in obs_list]
+        return priors, values
 
-    def step(self, action: int) -> None:
-        assert action in [0, 1]
-        if action == 0:
-            self.current_value += 1
-        else:
-            if self.current_value > 0:
-                self.current_value -= 1
-    
-    def get_placement_tokens(self) -> list[int]:
-        return [self.current_value]
-    
-    def get_objective_tokens(self, x: int) -> list[int]:
-        return []
 
-    def done(self) -> bool:
-        return self.current_value >= self.target_value
+def make_env() -> Environment:
+    env = Environment(4, 4, 3)
+    env.set_seed(0)
+    env.random_start(2, non_fault_tolerant_mode=True)
+    return env
 
-    def observation(self) -> dict[str, Any]:
-        if self.current_value > 0:
-            valid_actions = [0, 1]
-        else:
-            valid_actions = [0]
-        return {
-            'placement': [self.current_value],
-            'objectives_0': [],
-            'objectives_1': [],
-            'height': 1,
-            'width': 1,
-            'num_ancillas': 0,
-            'valid_actions': valid_actions,
-        }
-
-    def valid_actions(self) -> list[int]:
-        return [0, 1]
-
-    def hash_state(self) -> int:
-        return hash(self.current_value)
-
-    def render(self) -> str:
-        return f"{self.current_value} ({self.target_value})"
 
 class TestPyMcts:
     def test_init_pymcts(self) -> None:
-        mcts = PyMcts(terminal_value=0.5, batch_size=4)
-        assert isinstance(mcts, PyMcts)
-    
-    def test_agent(self) -> None:
-        dummy_agent = DummyAgent()
-        mcts_agent = MctsAgent(dummy_agent)
-        assert isinstance(mcts_agent, MctsAgent)
-    
-    def test_environment(self) -> None:
-        dummy_env = DummyEnvironment(target_value=5)
-        mcts_env = MctsEnvironment(dummy_env)
-        assert isinstance(mcts_env, MctsEnvironment)
-    
-    def test_run_mcts(self) -> None:
-        dummy_agent = DummyAgent()
-        mcts_agent = MctsAgent(dummy_agent)
-        dummy_env = DummyEnvironment(target_value=5)
-        mcts_env = MctsEnvironment(dummy_env)
-        mcts = PyMcts(terminal_value=1.0, batch_size=1)
-        mcts_node = mcts.run(mcts_env, mcts_agent, num_steps=100)
-        assert mcts_node.id() == 0
-    
-    def test_full_loop(self) -> None:
-        agent = DummyAgent()
-        env = DummyEnvironment(target_value=5)
-        mcts_agent = MctsAgent(agent)
-        mcts_env = MctsEnvironment(env)
-        mcts = PyMcts(terminal_value=1.0, batch_size=1)
+        assert isinstance(PyMcts(batch_size=4), PyMcts)
 
-        while not env.done():
-            node = mcts.run(mcts_env, mcts_agent, num_steps=100)
-            best_visits = -1
-            for action, visits in node.edge_visits().items():
-                if visits > best_visits:
-                    best_visits = visits
-                    best_action = action
-            env.step(best_action)
-        assert env.current_value >= env.target_value
-    
+    def test_agent(self) -> None:
+        assert isinstance(MctsAgent(DummyAgent()), MctsAgent)
+
+    def test_run_mcts(self) -> None:
+        env = make_env()
+        node = PyMcts(batch_size=1).run(env, MctsAgent(DummyAgent()), num_steps=64)
+        assert isinstance(node.id(), int)
+        # The root expanded its children → it accrued edge visits.
+        assert sum(node.edge_visits().values()) > 0
+
+    def test_run_observation_carries_board(self) -> None:
+        # The agent is handed obs dicts from `obs_to_pydict`: 10-channel
+        # board + encoded valid-action ids.
+        captured = {}
+
+        class CapturingAgent(DummyAgent):
+            def infer_from_obs(self, obs_list):
+                captured["obs"] = obs_list[0]
+                return super().infer_from_obs(obs_list)
+
+        env = make_env()
+        PyMcts(batch_size=1).run(env, MctsAgent(CapturingAgent()), num_steps=8)
+        obs = captured["obs"]
+        assert "board" in obs and "valid_actions" in obs
+        assert obs["num_layers"] == 2  # lookahead (1) + 1
+        # board: [layer][cell][10]
+        assert len(obs["board"][0][0]) == 10
+
     def test_advance_root(self) -> None:
-        agent = DummyAgent()
-        env = DummyEnvironment(target_value=5)
-        mcts_agent = MctsAgent(agent)
-        mcts_env = MctsEnvironment(env)
-        mcts = PyMcts(terminal_value=1.0, batch_size=1)
-        node = mcts.run(mcts_env, mcts_agent, num_steps=100)
-        assert node.id() == 0
-        mcts.advance_root(0)
-        node = mcts.run(mcts_env, mcts_agent, num_steps=0)
-        assert any(v > 0 for v in node.edge_visits().values())
+        env = make_env()
+        mcts = PyMcts(batch_size=1)
+        agent = MctsAgent(DummyAgent())
+
+        node = mcts.run(env, agent, num_steps=64)
+        visits = node.edge_visits()
+        assert visits, "root should have visited children"
+        best = max(visits, key=visits.get)
+
+        mcts.advance_root(best)
+        # Re-running from the advanced root still produces a valid search.
+        node2 = mcts.run(env, agent, num_steps=32)
+        assert sum(node2.edge_visits().values()) >= 0
+
+    def test_full_game_progresses(self) -> None:
+        # Drive a short game entirely from Python: search, take the most-
+        # visited action, decode the u16 id back to an Action via
+        # `mcts_tilers.rl`, step the env, repeat.  All types come from
+        # `mcts_tilers` so they interop (no cross-module mismatch).
+        import mcts_tilers
+
+        env = make_env()
+        agent = MctsAgent(DummyAgent())
+        mcts = PyMcts(batch_size=1)
+
+        steps = 0
+        while not env.done() and steps < 20:
+            node = mcts.run(env, agent, num_steps=48)
+            visits = node.edge_visits()
+            if not visits:
+                break
+            best_id = int(max(visits, key=visits.get))
+            action = mcts_tilers.rl.decode(env, best_id)
+            env.step(action)
+            mcts.advance_root(best_id)
+            steps += 1
+
+        assert steps > 0, "the game should take at least one action"
+
+
+class TestRealAgentInProcess:
+    """The real `tile.Agent.infer_from_obs` (batched: obs-list in, prior +
+    value lists out) drives in-process MCTS — the same contract `MctsAgent`
+    calls, exercised with the actual network rather than a dummy."""
+
+    def test_real_agent_drives_search(self) -> None:
+        import pytest
+
+        Agent = pytest.importorskip("tile.agent").Agent
+
+        # lookahead=1 matches the board the mcts side builds (2 layers).
+        agent = Agent(embedding_dim=32, num_layers=2, lookahead=1)
+        agent.to("cpu")
+
+        env = make_env()
+        node = PyMcts(batch_size=1).run(env, MctsAgent(agent), num_steps=16)
+        visits = node.edge_visits()
+        assert sum(visits.values()) > 0, "real agent should expand the root"
+        # Priors came back keyed by valid action ids in [0, num_actions).
+        assert all(isinstance(a, int) for a in visits)

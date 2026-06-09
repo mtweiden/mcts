@@ -6,6 +6,7 @@ use mcts_core::inference::InferenceClient;
 use mcts_core::mcts::MCTS;
 
 use tilers::env::Environment;
+use tilers::rl;
 use tilers::solver::Solver;
 
 use crate::constants::*;
@@ -17,7 +18,7 @@ use crate::client::TilersIpcClient;
 // Configuration
 // =============================================================================
 const NUM_SLOTS: usize = 2048;
-const NUM_OBJECTIVE_LAYERS: usize = DEFAULT_LOOKAHEAD;
+const LOOKAHEAD: usize = DEFAULT_LOOKAHEAD;
 
 // =============================================================================
 // HoldoutEnvironment
@@ -124,7 +125,7 @@ impl Evaluator {
         client: &dyn InferenceClient<TilersEnv>,
     ) -> (Vec<Action>, Option<f32>) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
-        let mut tilers_env = TilersEnv::new(env.clone(), NUM_OBJECTIVE_LAYERS);
+        let mut tilers_env = TilersEnv::new(env.clone(), LOOKAHEAD);
         tilers_env.inner.set_cultivation_time(10);
 
         let reference_depth = self.solve_with_heuristic(&tilers_env.inner);
@@ -179,14 +180,23 @@ impl Evaluator {
                 false,
             );
 
-            // Greedy: pick the action with the most visits.
-            let action = *valid_actions
+            // Greedy: pick the action with the most visits.  `valid_actions`
+            // is `Vec<tilers::Action>`; encode to the flat `u16` id space the
+            // tree/visits are keyed by.
+            // `valid_actions` is `Vec<tilers::Action>` (new tilers API);
+            // encode each to the u16 id space that the tree/visits are
+            // keyed by, then look up against main's dense-Vec
+            // `edge_visits`.
+            let action = valid_actions
                 .iter()
-                .max_by_key(|&&a| root.edge_visits.get(a as usize).copied().unwrap_or(0))
-                .unwrap() as Action;
+                .map(|&a| rl::encode(&tilers_env.inner, a) as Action)
+                .max_by_key(|&id| root.edge_visits.get(id as usize).copied().unwrap_or(0))
+                .unwrap();
 
             actions_taken.push(action);
-            let _ = tilers_env.inner.step(action as usize);
+            let a = rl::decode(&tilers_env.inner, action as usize)
+                .expect("evaluator produced an invalid action id");
+            let _ = tilers_env.inner.step(a);
             tilers_env.inner.finish_cultivating(None, None);
             mcts.advance_root(action);
         }
@@ -331,7 +341,8 @@ mod tests {
     fn make_holdout(id: i64, env: &TilersEnvInner) -> HoldoutEnvironment {
         HoldoutEnvironment {
             environment_id: id,
-            json: env.to_json(NUM_OBJECTIVE_LAYERS),
+            // `to_json` takes a layer count, not a lookahead.
+            json: env.to_json(LOOKAHEAD + 1),
             num_objectives: 1,
         }
     }
