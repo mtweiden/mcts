@@ -14,25 +14,11 @@ from mcts_tilers import LOOKAHEAD_MAX, GRID_MAX, CELL_FIELDS
 # module (and `do_work`, which takes the agent as a parameter) can be
 # driven by a lightweight dummy agent in tests without a GPU / checkpoint.
 
-# Rust opt-in for the build_boards / unpack_* hot path. The actual
-# rebinding happens at the bottom of this file once the Python defs
-# exist; this constant just controls which branch wins. Set
-# MCTS_HANDLER_RUST=1 to flip the handler over to the Rust
-# implementations exposed by the mcts_tilers PyO3 module.
-_USE_RUST_HANDLER = os.environ.get("MCTS_HANDLER_RUST", "0") == "1"
-
 # ------------------------------------------------------------------------------
 # Constants
 # ------------------------------------------------------------------------------
 BATCH_TIMEOUT = 0.002
 MAX_SLOTS_PER_BATCH = 64  # max slots to gather before one GPU call
-
-# Note: main carried `_bucket_bs` / `_pad_to_bs` helpers for
-# torch.compile(mode='reduce-overhead') static-shape bucketing on the
-# GPU inference path.  Those belong with the perf machinery that the
-# board-migration merge intentionally dropped — they pair with
-# bf16 autocast + h_int/w_int kwargs + handler metrics, all of which
-# need re-applying as a follow-up.
 
 # ------------------------------------------------------------------------------
 # Logging setup
@@ -249,11 +235,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_slots", type=int, default=2048)
     parser.add_argument("--num_handlers", type=int, default=1)
     parser.add_argument("--handler_id", type=int, default=0)
-    parser.add_argument("--metrics_dir", type=str, default=None,
-        help="If set, the handler writes one JSON line per inference batch "
-             "to {metrics_dir}/handler_{arena_tag}_{handler_id}.jsonl with "
-             "fill / build / gpu wallclock breakdown. Used to calibrate "
-             "MAX_BATCH and BATCH_TIMEOUT from real workload distributions.")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -279,56 +260,6 @@ if __name__ == "__main__":
         else:
             print(f"[handler {args.handler_id}] No --weights given and no checkpoint found; using random weights.")
     model.to(device)
-
-    # torch.compile the model in CUDA-graph mode. Inputs are padded to one
-    # of _BS_BUCKETS before inference, so TorchInductor sees only a small
-    # fixed set of shapes — one CUDA graph per bucket. `reduce-overhead`
-    # captures the kernel launch sequence per shape and replays it as a
-    # single submission, eliminating the ~50us-per-launch overhead that
-    # dominated gpu_ms in the profile (15ms of 17ms wallclock was launch
-    # overhead, only 2.5ms was actual GPU compute).
-    #
-    # We compile MODEL.forward via attribute assignment instead of wrapping
-    # MODEL in OptimizedModule. Reason: do_work calls MODEL.infer(...), and
-    # OptimizedModule.__getattr__ returns the underlying module's `infer`
-    # method whose `self.forward(...)` resolves back to the *original*
-    # forward — bypassing the compiled wrapper entirely. By replacing the
-    # bound method directly, every `self.forward(...)` lookup (including
-    # the one inside infer) picks up the compiled version.
-    #
-    # First call per bucket pays a compile cost (10-30s). With ~6 buckets,
-    # the first ~minute of inference is compile-heavy; after that, every
-    # call replays its bucket's graph. Handler warmup should absorb this.
-    MODEL.forward = torch.compile(
-        MODEL.forward, mode="reduce-overhead", dynamic=False)
-
-    # Pre-compile every bucket eagerly so a previously-unseen bs never
-    # arrives during real inference (a cold compile takes 10-30s and
-    # would block one inference call entirely — observed as a ~15s
-    # gpu_ms outlier in production). Synthetic zero inputs are fine
-    # because the compile cache is shape-keyed, not value-keyed.
-    print(f"[handler {args.handler_id}] pre-warming compile cache for "
-          f"buckets {_BS_BUCKETS}...", flush=True)
-    for _bs in _BS_BUCKETS:
-        _t0 = time.monotonic()
-        _boards = torch.zeros((_bs, MODEL.lookahead + 1, 100, 4),
-                              dtype=torch.int32, device=device)
-        _heights = torch.full((_bs,), 10, dtype=torch.int32, device=device)
-        _widths = torch.full((_bs,), 10, dtype=torch.int32, device=device)
-        _ancillas = torch.full((_bs,), 1, dtype=torch.int32, device=device)
-        _mask = torch.ones((_bs, MODEL.num_outputs), dtype=torch.bool,
-                           device=device)
-        with no_grad(), torch.autocast("cuda", dtype=torch.bfloat16):
-            _ = MODEL.infer(
-                boards=_boards, heights=_heights, widths=_widths,
-                num_ancillas=_ancillas, action_masks=_mask,
-                h_int=10, w_int=10,
-                max_actions_int=MODEL.num_outputs,
-            )
-        torch.cuda.synchronize()
-        print(f"[handler {args.handler_id}]   bs={_bs:>4} compiled in "
-              f"{time.monotonic() - _t0:.1f}s", flush=True)
-    print(f"[handler {args.handler_id}] pre-warm done.", flush=True)
 
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
     arena_name = f"{args.arena_name}{tag}_{args.num_slots}_{args.num_handlers}"
