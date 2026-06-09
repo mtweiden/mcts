@@ -115,7 +115,14 @@ def build_board_batch(slot_views, lookahead: int):
 # ------------------------------------------------------------------------------
 # Inference loop
 # ------------------------------------------------------------------------------
-def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
+def do_work(
+    arena: PyArena,
+    agent,
+    device: str,
+    lookahead: int,
+    *,
+    metrics_path: Path | None = None,
+) -> None:
     """Pump the arena: batch ready slots, run ``agent.infer`` over the board,
     write priors/values back.
 
@@ -123,70 +130,101 @@ def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
     ``infer(boards, heights, widths, num_ancillas, action_masks) ->
     (priors, values)`` (tensors), matching ``tile.Agent`` — a dummy agent
     with the same signature works for tests.
+
+    Args:
+        metrics_path: If set, append one JSON line per inference batch with
+            ``{ts, num_slots, num_obs, fill_ms, build_ms, gpu_ms}`` for
+            calibrating ``MAX_BATCH`` / ``BATCH_TIMEOUT`` against real
+            workloads.  Parent dir is created if missing.
     """
-    while True:
-        try:
-            first_sv = arena.pop_ready_view(clear_outputs=True)
-            first_sv.set_handler_start_time()
-        except KeyboardInterrupt:
-            break
+    metrics_fh = None
+    if metrics_path is not None:
+        metrics_path.parent.mkdir(parents=True, exist_ok=True)
+        # line-buffered so a kill mid-loop still leaves complete lines.
+        metrics_fh = open(metrics_path, "a", buffering=1)
 
-        slot_views = [first_sv]
+    try:
+        while True:
+            try:
+                first_sv = arena.pop_ready_view(clear_outputs=True)
+                first_sv.set_handler_start_time()
+            except KeyboardInterrupt:
+                break
 
-        fill_start = time.monotonic()
-        while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - fill_start) < BATCH_TIMEOUT:
-            sv = arena.try_pop_ready_view(clear_outputs=True)
-            if sv is None:
-                time.sleep(0.0005)
-                continue
-            sv.set_handler_start_time()
-            slot_views.append(sv)
+            slot_views = [first_sv]
 
-        try:
-            batched = build_board_batch(slot_views, lookahead)
-            if batched is None:
-                continue
-            (boards, heights, widths, num_ancillas,
-             action_masks, slot_batch_sizes, valid_slot_views) = batched
+            fill_start = time.monotonic()
+            while len(slot_views) < MAX_SLOTS_PER_BATCH and (time.monotonic() - fill_start) < BATCH_TIMEOUT:
+                sv = arena.try_pop_ready_view(clear_outputs=True)
+                if sv is None:
+                    time.sleep(0.0005)
+                    continue
+                sv.set_handler_start_time()
+                slot_views.append(sv)
+            fill_ms = (time.monotonic() - fill_start) * 1000.0
 
-            priors_np, values_np = agent.infer(
-                boards=boards,
-                heights=heights,
-                widths=widths,
-                num_ancillas=num_ancillas,
-                action_masks=action_masks,
-                device=device,
-            )
+            try:
+                build_start = time.monotonic()
+                batched = build_board_batch(slot_views, lookahead)
+                if batched is None:
+                    continue
+                (boards, heights, widths, num_ancillas,
+                 action_masks, slot_batch_sizes, valid_slot_views) = batched
+                build_ms = (time.monotonic() - build_start) * 1000.0
 
-            # Write back per-slot.
-            idx = 0
-            for slot_len, sv in zip(slot_batch_sizes, valid_slot_views):
-                pri_slice = np.ascontiguousarray(priors_np[idx: idx + slot_len])
-                val_slice = np.ascontiguousarray(values_np[idx: idx + slot_len])
-                idx += slot_len
-                sv.write_priors_values(
-                    pri_slice.astype(np.float32, copy=False),
-                    val_slice.astype(np.float32, copy=False),
+                gpu_start = time.monotonic()
+                priors_np, values_np = agent.infer(
+                    boards=boards,
+                    heights=heights,
+                    widths=widths,
+                    num_ancillas=num_ancillas,
+                    action_masks=action_masks,
+                    device=device,
                 )
-                sv.mark_done()
+                gpu_ms = (time.monotonic() - gpu_start) * 1000.0
 
-        except KeyboardInterrupt:
-            for sv in slot_views:
-                try:
+                # Write back per-slot.
+                idx = 0
+                for slot_len, sv in zip(slot_batch_sizes, valid_slot_views):
+                    pri_slice = np.ascontiguousarray(priors_np[idx: idx + slot_len])
+                    val_slice = np.ascontiguousarray(values_np[idx: idx + slot_len])
+                    idx += slot_len
+                    sv.write_priors_values(
+                        pri_slice.astype(np.float32, copy=False),
+                        val_slice.astype(np.float32, copy=False),
+                    )
                     sv.mark_done()
-                except Exception:
-                    pass
-            break
 
-        except Exception as e:
-            # Never leave a slot un-marked: a requester blocking on this
-            # slot would hang forever.  Log and release every slot.
-            logging.error("handler inference failed: %s", e, exc_info=True)
-            for sv in slot_views:
-                try:
-                    sv.mark_done()
-                except Exception:
-                    pass
+                if metrics_fh is not None:
+                    metrics_fh.write(json.dumps({
+                        "ts":        time.time(),
+                        "num_slots": len(valid_slot_views),
+                        "num_obs":   int(boards.shape[0]),
+                        "fill_ms":   round(fill_ms,  3),
+                        "build_ms":  round(build_ms, 3),
+                        "gpu_ms":    round(gpu_ms,   3),
+                    }) + "\n")
+
+            except KeyboardInterrupt:
+                for sv in slot_views:
+                    try:
+                        sv.mark_done()
+                    except Exception:
+                        pass
+                break
+
+            except Exception as e:
+                # Never leave a slot un-marked: a requester blocking on this
+                # slot would hang forever.  Log and release every slot.
+                logging.error("handler inference failed: %s", e, exc_info=True)
+                for sv in slot_views:
+                    try:
+                        sv.mark_done()
+                    except Exception:
+                        pass
+    finally:
+        if metrics_fh is not None:
+            metrics_fh.close()
 
 
 # ------------------------------------------------------------------------------
@@ -383,6 +421,12 @@ if __name__ == "__main__":
     parser.add_argument("--num_slots", type=int, default=2048)
     parser.add_argument("--num_handlers", type=int, default=1)
     parser.add_argument("--handler_id", type=int, default=0)
+    parser.add_argument("--metrics_dir", type=str, default=None,
+        help="If set, the handler appends one JSON line per inference batch "
+             "to {metrics_dir}/handler_{arena_tag}_{handler_id}.jsonl with "
+             "{ts, num_slots, num_obs, fill_ms, build_ms, gpu_ms}.  Used "
+             "to calibrate MAX_BATCH and BATCH_TIMEOUT from real workload "
+             "distributions.")
     args = parser.parse_args()
 
     if torch.cuda.is_available():
@@ -415,4 +459,10 @@ if __name__ == "__main__":
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
     arena_name = f"{args.arena_name}{tag}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
-    do_work(arena, runner, device, model.lookahead)
+
+    metrics_path = None
+    if args.metrics_dir:
+        atag = args.arena_tag or "default"
+        metrics_path = Path(args.metrics_dir) / f"handler_{atag}_{args.handler_id}.jsonl"
+
+    do_work(arena, runner, device, model.lookahead, metrics_path=metrics_path)
