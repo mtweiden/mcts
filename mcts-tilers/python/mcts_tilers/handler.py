@@ -194,7 +194,21 @@ def do_work(arena: PyArena, agent, device: str, lookahead: int) -> None:
 # contract `do_work` uses.
 # ------------------------------------------------------------------------------
 class TorchAgentRunner:
-    def __init__(self, model, *, board_height: int = 10, board_width: int = 10):
+    # Static-shape buckets for the model input batch dim.  With these,
+    # `torch.compile(mode='reduce-overhead')` builds one CUDA graph per
+    # bucket; every subsequent call rounds bs up to its bucket and
+    # replays that bucket's graph.  Eliminates per-kernel-launch
+    # overhead, which dominated `gpu_ms` in production profiling.
+    BS_BUCKETS: tuple[int, ...] = (16, 32, 64, 128, 256, 512)
+
+    def __init__(
+        self,
+        model,
+        *,
+        board_height: int = 10,
+        board_width: int = 10,
+        compile_model: bool = True,
+    ):
         """Adapt `tile.Agent` to the numpy-in / numpy-out contract `do_work` uses.
 
         Args:
@@ -207,13 +221,92 @@ class TorchAgentRunner:
                 (see `tile/agent.py::forward`'s ``h_int`` / ``w_int``
                 kwargs).  Defaults match the 10x10 production envs; pass
                 different values for other shapes.
+            compile_model: If True (the default), replace
+                ``model.forward`` with a ``torch.compile``'d version in
+                ``reduce-overhead`` mode.  Set False to bypass — useful
+                for tests + debugging compile failures.
         """
-        import torch  # noqa: F401
+        import torch
         self.model = model
         self.lookahead = model.lookahead
         self.board_height = board_height
         self.board_width = board_width
         self.max_actions_int = model.num_outputs
+
+        if compile_model:
+            # Compile `model.forward` via attribute assignment instead of
+            # wrapping `model` in `OptimizedModule`.  Reason: `do_work`
+            # calls `model.infer(...)`, and `OptimizedModule.__getattr__`
+            # returns the underlying module's `infer` method whose
+            # `self.forward(...)` resolves back to the *original* forward —
+            # bypassing the compiled wrapper entirely.  Replacing the
+            # bound method directly makes every `self.forward(...)` lookup
+            # (including the one inside `infer`) pick up the compiled
+            # version.
+            self.model.forward = torch.compile(
+                self.model.forward, mode="reduce-overhead", dynamic=False,
+            )
+
+    @classmethod
+    def _bucket_bs(cls, n: int) -> int:
+        """Smallest bucket ≥ n.  Anything above the largest is clamped
+        (rare in practice; we'd rather pay one extra graph hit than let
+        one giant outlier blow the compile cache)."""
+        for b in cls.BS_BUCKETS:
+            if n <= b:
+                return b
+        return cls.BS_BUCKETS[-1]
+
+    @staticmethod
+    def _pad_to_bs(t, bs_padded: int, fill_value):
+        """Pad tensor along dim 0 (batch) to length bs_padded with fill_value."""
+        import torch
+        bs = t.shape[0]
+        if bs >= bs_padded:
+            return t
+        pad_shape = (bs_padded - bs,) + tuple(t.shape[1:])
+        pad_tensor = torch.full(pad_shape, fill_value, dtype=t.dtype, device=t.device)
+        return torch.cat([t, pad_tensor], dim=0)
+
+    def prewarm(self, device, *, log_prefix: str = "[handler]") -> None:
+        """Compile every bucket eagerly so a previously-unseen bs never
+        arrives during real inference (a cold compile takes 10–30s per
+        bucket and would block one inference call entirely).  Synthetic
+        zero inputs are fine — the compile cache is shape-keyed, not
+        value-keyed.  Each iteration also exercises the bf16 autocast +
+        static-shape kwargs path so the cache entries match what
+        production calls produce.
+        """
+        import torch
+        from contextlib import nullcontext
+        from torch import no_grad
+
+        autocast_ctx_factory = (
+            (lambda: torch.autocast("cuda", dtype=torch.bfloat16))
+            if str(device).startswith("cuda") else (lambda: nullcontext())
+        )
+        hw = self.board_height * self.board_width
+        n_layers = self.lookahead + 1
+        print(f"{log_prefix} pre-warming compile cache for buckets {self.BS_BUCKETS}...", flush=True)
+        for bs in self.BS_BUCKETS:
+            t0 = time.monotonic()
+            boards = torch.zeros((bs, n_layers, hw, CELL_FIELDS), dtype=torch.int32, device=device)
+            heights = torch.full((bs,), self.board_height, dtype=torch.int32, device=device)
+            widths = torch.full((bs,), self.board_width, dtype=torch.int32, device=device)
+            ancillas = torch.full((bs,), 1, dtype=torch.int32, device=device)
+            mask = torch.ones((bs, self.max_actions_int), dtype=torch.bool, device=device)
+            with no_grad(), autocast_ctx_factory():
+                _ = self.model.infer(
+                    boards=boards, heights=heights, widths=widths,
+                    num_ancillas=ancillas, action_masks=mask,
+                    h_int=self.board_height,
+                    w_int=self.board_width,
+                    max_actions_int=self.max_actions_int,
+                )
+            if str(device).startswith("cuda"):
+                torch.cuda.synchronize()
+            print(f"{log_prefix}   bs={bs:>4} compiled in {time.monotonic() - t0:.1f}s", flush=True)
+        print(f"{log_prefix} pre-warm done.", flush=True)
 
     def infer(self, boards, heights, widths, num_ancillas, action_masks, device):
         import torch
@@ -229,6 +322,21 @@ class TorchAgentRunner:
         h_t = torch.from_numpy(heights).to(device, non_blocking=True)
         w_t = torch.from_numpy(widths).to(device, non_blocking=True)
         na_t = torch.from_numpy(num_ancillas).to(device, non_blocking=True)
+
+        # Pad the batch dim to a fixed bucket so the model sees one of
+        # only ~6 distinct shapes.  Padded entries get safe defaults
+        # (height=1, width=1, num_ancillas=1, action_mask=all-False); we
+        # slice them off after inference so they don't leak into outputs.
+        # action_mask=all-False is safe for softmax — the legal entries
+        # on real rows are unaffected.
+        real_bs = boards_t.shape[0]
+        bs_padded = self._bucket_bs(real_bs)
+        if bs_padded > real_bs:
+            boards_t = self._pad_to_bs(boards_t, bs_padded, 0)
+            h_t      = self._pad_to_bs(h_t,      bs_padded, 1)
+            w_t      = self._pad_to_bs(w_t,      bs_padded, 1)
+            na_t     = self._pad_to_bs(na_t,     bs_padded, 1)
+            masks_t  = self._pad_to_bs(masks_t,  bs_padded, False)
 
         # bf16 autocast for forward — trainer trains in bf16
         # (tile/trainer.py), so weights + activations have been exposed
@@ -252,9 +360,12 @@ class TorchAgentRunner:
                 w_int=self.board_width,
                 max_actions_int=self.max_actions_int,
             )
+
+        # Slice off padded rows BEFORE the D2H copy — saves transferring
+        # the dead pad entries.
         return (
-            priors_t.detach().to(torch.float32).cpu().numpy(),
-            values_t.squeeze(-1).detach().to(torch.float32).cpu().numpy(),
+            priors_t[:real_bs].detach().to(torch.float32).cpu().numpy(),
+            values_t[:real_bs].squeeze(-1).detach().to(torch.float32).cpu().numpy(),
         )
 
 
@@ -298,7 +409,10 @@ if __name__ == "__main__":
             print(f"[handler {args.handler_id}] No --weights given and no checkpoint found; using random weights.")
     model.to(device)
 
+    runner = TorchAgentRunner(model)
+    runner.prewarm(device, log_prefix=f"[handler {args.handler_id}]")
+
     tag = f"_{args.arena_tag}" if args.arena_tag else ""
     arena_name = f"{args.arena_name}{tag}_{args.num_slots}_{args.num_handlers}"
     arena = PyArena(arena_name, args.num_slots, args.num_handlers)
-    do_work(arena, TorchAgentRunner(model), device, model.lookahead)
+    do_work(arena, runner, device, model.lookahead)
