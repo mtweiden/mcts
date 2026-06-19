@@ -189,7 +189,7 @@ impl Evaluator {
             // `edge_visits`.
             let action = valid_actions
                 .iter()
-                .map(|&a| rl::encode(&tilers_env.inner, a) as Action)
+                .map(|&a| rl::encode(&tilers_env.inner, a).expect("valid_actions ids always encode") as Action)
                 .max_by_key(|&id| root.edge_visits.get(id as usize).copied().unwrap_or(0))
                 .unwrap();
 

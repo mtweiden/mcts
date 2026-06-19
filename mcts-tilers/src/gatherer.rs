@@ -146,7 +146,7 @@ impl Gatherer {
         let actions = solver.solve(&mut solved_env, true)
             .unwrap()
             .into_iter()
-            .map(|a| rl::encode(&solved_env, a) as Action)
+            .map(|a| rl::encode(&solved_env, a).expect("valid_actions ids always encode") as Action)
             .collect();
         let depth = solved_env.depth(true, true);
         (depth, actions)
@@ -213,7 +213,7 @@ impl Gatherer {
         let ids: Vec<Action> = env
             .valid_actions()
             .iter()
-            .map(|&a| rl::encode(env, a) as Action)
+            .map(|&a| rl::encode(env, a).expect("valid_actions ids always encode") as Action)
             .collect();
         let num_actions = ids.len();
         if num_actions == 0 {
@@ -383,7 +383,7 @@ impl Gatherer {
                 let raw_noise = self._dirichlet_noise(valid.len(), rng);
                 let noise_map: HashMap<Action, f32> = valid.iter()
                     .zip(raw_noise.iter())
-                    .map(|(&a, &n)| (rl::encode(&tilers_env.inner, a) as Action, n as f32))
+                    .map(|(&a, &n)| (rl::encode(&tilers_env.inner, a).expect("valid_actions ids always encode") as Action, n as f32))
                     .collect();
                 mcts.perturb_root_prior(&noise_map, self.dirichlet_epsilon);
             }
@@ -438,7 +438,7 @@ impl Gatherer {
                 .inner
                 .valid_actions()
                 .iter()
-                .map(|&a| rl::encode(&tilers_env.inner, a) as Action)
+                .map(|&a| rl::encode(&tilers_env.inner, a).expect("valid_actions ids always encode") as Action)
                 .collect();
             let step_height = tilers_env.inner.height;
             let step_width = tilers_env.inner.width;
@@ -768,9 +768,9 @@ pub fn run_gatherer(
     }
     env.random_start(no, false);
 
-    if env.valid_actions().contains(&tilers::enums::Action::AutoExecute) {
+    if env.valid_actions().contains(&tilers::core::enums::Action::AutoExecute) {
         let mut tmp_env = env.clone();
-        let _ = tmp_env.step(tilers::enums::Action::AutoExecute);
+        let _ = tmp_env.step(tilers::core::enums::Action::AutoExecute);
         if tmp_env.done() {
             return Ok(None);
         }
@@ -965,7 +965,7 @@ mod tests {
         let g = default_gatherer("/dev/null");
         let env = TilersEnvInner::new(3, 3, 1);
         let ids: Vec<Action> = env.valid_actions().iter()
-            .map(|&a| tilers::rl::encode(&env, a) as Action)
+            .map(|&a| tilers::rl::encode(&env, a).expect("valid_actions ids always encode") as Action)
             .collect();
         assert!(!ids.is_empty());
 
@@ -984,7 +984,7 @@ mod tests {
         let g = default_gatherer("/dev/null");
         let env = TilersEnvInner::new(3, 3, 1);
         let ids: Vec<Action> = env.valid_actions().iter()
-            .map(|&a| tilers::rl::encode(&env, a) as Action)
+            .map(|&a| tilers::rl::encode(&env, a).expect("valid_actions ids always encode") as Action)
             .collect();
         assert!(ids.len() >= 2, "need ≥2 valid actions");
 

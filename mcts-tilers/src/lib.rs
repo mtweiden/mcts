@@ -42,12 +42,12 @@ fn mcts_tilers(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // into *this* extension, so they are distinct Python types from the
     // standalone `tilers` package — always use `mcts_tilers.{Environment,
     // Action, ...}` together (a `tilers.Environment` won't interop here).
-    m.add_class::<tilers::enums::PyOrientation>()?;
-    m.add_class::<tilers::enums::PyDirection>()?;
-    m.add_class::<tilers::enums::PyAction>()?;
-    m.add_class::<tilers::enums::PyOperation>()?;
-    m.add_class::<tilers::enums::PyPosition>()?;
-    m.add_class::<tilers::qubit::PyQubit>()?;
+    m.add_class::<tilers::core::enums::PyOrientation>()?;
+    m.add_class::<tilers::core::enums::PyDirection>()?;
+    m.add_class::<tilers::core::enums::PyAction>()?;
+    m.add_class::<tilers::core::enums::PyOperation>()?;
+    m.add_class::<tilers::core::enums::PyPosition>()?;
+    m.add_class::<tilers::core::qubit::PyQubit>()?;
     m.add_class::<tilers::objective::PyObjective>()?;
     m.add_class::<tilers::env::PyEnvironment>()?;
 

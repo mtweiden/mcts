@@ -100,7 +100,7 @@ impl Environment for TilersEnv {
         self.inner
             .valid_actions()
             .into_iter()
-            .map(|a| rl::encode(&self.inner, a) as u16)
+            .map(|a| rl::encode(&self.inner, a).expect("valid_actions ids always encode") as u16)
             .collect()
     }
 

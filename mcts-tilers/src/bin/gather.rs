@@ -157,9 +157,9 @@ fn main() {
         }
 
         env.random_start(no, false);
-        if env.valid_actions().contains(&tilers::enums::Action::AutoExecute) {
+        if env.valid_actions().contains(&tilers::core::enums::Action::AutoExecute) {
             let mut tmp_env = env.clone();
-            let _ = tmp_env.step(tilers::enums::Action::AutoExecute);
+            let _ = tmp_env.step(tilers::core::enums::Action::AutoExecute);
             if tmp_env.done() {
                 continue;
             }
