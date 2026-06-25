@@ -41,6 +41,13 @@ pub struct Gatherer {
     /// Reference: [Wu 2020, §3.1].
     p_full_search: f32,
     max_actions: Option<usize>,
+    /// Per-episode action budget as a multiple of the heuristic solution
+    /// length: `max_actions = reference_actions.len() * max_action_multiplier`
+    /// (used only when `max_actions` above is `None`). 1.2 is the historical
+    /// default. Lowering it shortens the post-progress flailing tail of a stuck
+    /// agent — faster gather, and fewer HER episodes whose reward saturates to
+    /// -1 from that wasted tail.
+    max_action_multiplier: f32,
     output_path: String,
     noise_strength: f64,
     /// Mixing weight for Dirichlet noise injected into the MCTS root prior on
@@ -80,6 +87,14 @@ pub struct Gatherer {
     /// resign (effectively disables the feature, equivalent to
     /// `resign_consecutive_moves = 0`).
     no_resign_rate: f32,
+    /// Probability of KEEPING a zero-progress ("floor", reward = -1) episode's
+    /// records. 1.0 writes every floor episode (historical behavior); lower
+    /// values randomly drop that fraction so the corpus isn't dominated by
+    /// uninformative -1s. Only "floor" episodes are subsampled — "done" and
+    /// graded "her" episodes are always written. This rebalances the training
+    /// distribution toward the rare non-floored signal without changing the
+    /// reward of any kept record.
+    floor_keep_fraction: f32,
     /// If set, winning trajectories are written here as pretraining data.
     trajectory_dir: Option<String>,
     /// If set, the gatherer writes one JSON line per episode summarising
@@ -105,10 +120,12 @@ impl Gatherer {
         trajectory_dir: Option<String>,
         reward_saturation_temperature: Option<f32>,
         max_actions: Option<usize>,
+        max_action_multiplier: Option<f32>,
         resign_value_threshold: Option<f32>,
         resign_consecutive_moves: Option<usize>,
         no_resign_rate: Option<f32>,
         resignation_log_dir: Option<String>,
+        floor_keep_fraction: Option<f32>,
     ) -> Self {
         Self {
             batch_size,
@@ -116,6 +133,7 @@ impl Gatherer {
             fast_steps,
             p_full_search,
             max_actions,
+            max_action_multiplier: max_action_multiplier.unwrap_or(1.2),
             output_path,
             noise_strength,
             dirichlet_epsilon,
@@ -134,6 +152,8 @@ impl Gatherer {
             resign_value_threshold: resign_value_threshold.unwrap_or(-0.9),
             resign_consecutive_moves: resign_consecutive_moves.unwrap_or(5),
             no_resign_rate: no_resign_rate.unwrap_or(0.1),
+            // 1.0 = keep every floor episode (unchanged default).
+            floor_keep_fraction: floor_keep_fraction.unwrap_or(1.0),
             trajectory_dir,
             resignation_log_dir,
         }
@@ -291,8 +311,12 @@ impl Gatherer {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
         let mut game = env.clone();
-        // Keep objective layers 0..=lookahead (lookahead + 1 layers total).
-        game.drop_objectives_beyond_nth_layer(self.lookahead);
+        // The played game keeps its FULL objective set — the agent must solve
+        // the entire problem, and the heuristic reference below is the
+        // full-problem depth. The observation board is windowed to
+        // `lookahead + 1` layers by `construct_board` via
+        // `TilersEnv::new(.., self.lookahead)` below, so the agent sees a
+        // sliding window without the future objectives being deleted.
         game.set_cultivation_time(10);
         let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
 
@@ -329,7 +353,7 @@ impl Gatherer {
         let max_actions = if let Some(max) = self.max_actions {
             max
         } else {
-            (reference_actions.len() as f32 * 1.2) as usize
+            (reference_actions.len() as f32 * self.max_action_multiplier) as usize
         };
 
         // Resignation bookkeeping. resign_allowed is decided once per
@@ -487,16 +511,52 @@ impl Gatherer {
         tilers_env.inner.set_cultivation_time(10);
         let solution_depth = tilers_env.inner.depth(true, true);
 
-        // Must match `terminal_evaluator` above so recorded value targets
-        // match the leaf evaluations MCTS used during the producing search.
-        let score: f32 = if !tilers_env.inner.done() {
-            -1.0
-        } else {
-            let d = solution_depth as f32;
-            let ref_d = reference_depth as f32;
-            let ratio = (ref_d - d) / (ref_d + 1e-6);
-            (ratio / self.reward_saturation_temperature).tanh()
-        };
+        // Terminal value target. A finished episode scores against the full
+        // heuristic reference. An UNFINISHED episode is relabeled via Hindsight
+        // Experience Replay: we rebuild the goal as exactly what the agent did
+        // execute (achieved_goal_env, from the pristine S0 `game`), solve THAT
+        // with the heuristic, and score the agent's actual depth against it — so
+        // every episode that made any progress yields a graded, non-floor
+        // signal instead of a flat -1. Zero-progress (or an unsolvable hindsight
+        // goal) still floors to -1.
+        // `reward_kind` records the provenance of `score` so the trainer/analysis
+        // can tell natural completions from HER-relabeled partials from the
+        // residual floor (and reweight or filter on it): "done" = finished the
+        // full goal, "her" = partial, scored against the achieved sub-goal,
+        // "floor" = zero progress or a hindsight goal the heuristic couldn't
+        // solve. `achieved_objectives` is how many objectives the agent actually
+        // completed (the HER goal size), for the flywheel metric.
+        let (score, reward_kind, achieved_objectives): (f32, &'static str, usize) =
+            if tilers_env.inner.done() {
+                let d = solution_depth as f32;
+                let ref_d = reference_depth as f32;
+                let ratio = (ref_d - d) / (ref_d + 1e-6);
+                (
+                    (ratio / self.reward_saturation_temperature).tanh(),
+                    "done",
+                    game.num_objectives(),
+                )
+            } else {
+                match game.achieved_goal_env(&tilers_env.inner) {
+                    Ok(mut her_env) => {
+                        // Capture the achieved-goal size before solving consumes it.
+                        let k = her_env.num_objectives();
+                        let her_ref = Solver::new()
+                            .solve(&mut her_env, true)
+                            .ok()
+                            .map(|_| her_env.depth(true, true) as f32);
+                        match her_ref {
+                            Some(ref_d) => {
+                                let d = solution_depth as f32;
+                                let ratio = (ref_d - d) / (ref_d + 1e-6);
+                                ((ratio / self.reward_saturation_temperature).tanh(), "her", k)
+                            }
+                            None => (-1.0, "floor", k),
+                        }
+                    }
+                    Err(_) => (-1.0, "floor", 0),
+                }
+            };
 
         // Resignation calibration log (one JSON line per episode).
         // The no-resign sample (resign_allowed=false) provides the
@@ -525,6 +585,7 @@ impl Gatherer {
                             "w": env.width,
                             "num_ancillas": env.num_ancillas(),
                             "num_objectives": env.num_objectives(),
+                            "achieved_objectives": achieved_objectives,
                             "reference_depth": reference_depth,
                             "final_depth": solution_depth,
                             "final_score": score,
@@ -614,6 +675,31 @@ impl Gatherer {
             }
         }
 
+        // Drop HER episodes whose relabeled reward still saturates to the -1
+        // floor: the agent did make partial progress, but compared against the
+        // heuristic's depth on the achieved goal it was so inefficient that
+        // tanh pinned to -1. Such a record would mislabel partial progress as
+        // zero-progress and just dilutes the corpus with another uninformative
+        // -1, so we don't write it. We keep the honest heuristic-achieved-depth
+        // comparison (the true efficiency signal) — only the saturated examples
+        // are filtered. "floor" (genuine zero-progress) and "done" are unaffected.
+        const HER_SATURATION_FLOOR: f32 = -0.999;
+        if reward_kind == "her" && score <= HER_SATURATION_FLOOR {
+            return (solution_depth as f32, reference_depth as f32, tilers_env.inner.done());
+        }
+
+        // Subsample zero-progress "floor" episodes so the corpus isn't dominated
+        // by uninformative -1s. With floor_keep_fraction < 1.0 we keep only that
+        // fraction of floor episodes (chosen at random), skewing the written
+        // distribution toward the rare "done"/"her" signal the trainer can learn
+        // from. "done" and graded "her" episodes are never dropped here.
+        if reward_kind == "floor"
+            && self.floor_keep_fraction < 1.0
+            && rng.random::<f32>() >= self.floor_keep_fraction
+        {
+            return (solution_depth as f32, reference_depth as f32, tilers_env.inner.done());
+        }
+
         // Write full-search data to output_path as normal.
         // BufWriter batches the per-record writes into one syscall per
         // ~64 KB on flush — important on Lustre where every individual
@@ -642,6 +728,8 @@ impl Gatherer {
                 "valid_actions": valid_actions_json,
                 "edge_visits": visits_json,
                 "reward": score,
+                "reward_kind": reward_kind,
+                "achieved_objectives": achieved_objectives,
             });
 
             writeln!(file, "{}", record).expect("Failed to write record");
@@ -689,6 +777,9 @@ use pyo3::exceptions::PyRuntimeError;
     resign_consecutive_moves = 5,
     no_resign_rate = 0.1,
     resignation_log_dir = None,
+    max_action_multiplier = 1.2,
+    max_pp_weight = None,
+    floor_keep_fraction = 1.0,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -714,6 +805,9 @@ pub fn run_gatherer(
     resign_consecutive_moves: usize,
     no_resign_rate: f32,
     resignation_log_dir: Option<String>,
+    max_action_multiplier: f32,
+    max_pp_weight: Option<usize>,
+    floor_keep_fraction: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -743,10 +837,12 @@ pub fn run_gatherer(
         trajectory_dir,
         Some(reward_saturation_temperature),
         None,
+        Some(max_action_multiplier),
         Some(resign_value_threshold),
         Some(resign_consecutive_moves),
         Some(no_resign_rate),
         resignation_log_dir,
+        Some(floor_keep_fraction),
     );
 
     let mut rng = if let Some(s) = seed {
@@ -766,22 +862,33 @@ pub fn run_gatherer(
     if let Some(s) = seed {
         env.set_seed(Some(s as u64));
     }
+    // Cap PauliProduct weight (easy-env curriculum) BEFORE random_start so the
+    // generated objectives respect it. None = unbounded (historical behavior).
+    env.set_max_pp_weight(max_pp_weight);
     env.random_start(no, false);
-
-    if env.valid_actions().contains(&tilers::core::enums::Action::AutoExecute) {
-        let mut tmp_env = env.clone();
-        let _ = tmp_env.step(tilers::core::enums::Action::AutoExecute);
-        if tmp_env.done() {
-            return Ok(None);
-        }
-    }
 
     env.shuffle(num_shuffles);
 
+    // Solve the POST-shuffle env (the one we actually gather on) once: it
+    // gates both the max-depth cap and the trivial-env reject. Checking the
+    // pre-shuffle env was a bug — shuffle advances the state, so a non-trivial
+    // start can become auto-execute-only after shuffling and slip through.
     let solver = Solver::new();
     let mut temp_env = env.clone();
     if let Ok(solution) = solver.solve(&mut temp_env, false) {
-        if solution.len() > max_generated_depth {
+        let n = solution.len();
+        if n > max_generated_depth {
+            return Ok(None);
+        }
+        // Reject trivial envs — ones the heuristic clears with the global
+        // AutoExecute action alone (no real placement/movement decision). The
+        // agent "solves" these just by selecting auto-execute, so they carry no
+        // training signal. Mirrors the init_db.py holdout filter.
+        if n == 0
+            || solution
+                .into_iter()
+                .all(|a| matches!(a, tilers::core::enums::Action::AutoExecute))
+        {
             return Ok(None);
         }
     }
@@ -819,10 +926,12 @@ mod tests {
             None,                 // trajectory_dir
             Some(1.0),            // reward_saturation_temperature
             None,                 // max_actions
+            None,                 // max_action_multiplier (default 1.2)
             Some(2.0),            // resign_value_threshold (>1.0 disables)
             Some(0),              // resign_consecutive_moves (0 disables)
             Some(0.0),            // no_resign_rate
             None,                 // resignation_log_dir
+            None,                 // floor_keep_fraction (default 1.0)
         )
     }
 
@@ -832,7 +941,7 @@ mod tests {
     fn test_new_sets_explicit_reward_saturation_temperature() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1,
-            None, Some(0.3), Some(100), None, None, None, None,
+            None, Some(0.3), Some(100), None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
         assert_eq!(g.mcts_steps, 10);
@@ -845,7 +954,7 @@ mod tests {
         // default (reward_ratio_limit = 0.3 → slope 1/0.3); see Gatherer::new.
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
     }
@@ -854,7 +963,7 @@ mod tests {
     fn test_new_defaults_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None,
         );
         assert!((g.resign_value_threshold - (-0.9)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 5);
@@ -865,7 +974,7 @@ mod tests {
     fn test_new_sets_explicit_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, Some(-0.5), Some(8), Some(0.2), None,
+            None, None, None, None, Some(-0.5), Some(8), Some(0.2), None, None,
         );
         assert!((g.resign_value_threshold - (-0.5)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 8);
@@ -1039,8 +1148,10 @@ mod tests {
         let g = Gatherer::new(
             1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0,
             None, Some(1.0), None,
+            None,                            // max_action_multiplier (default 1.2)
             Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
             None,                            // resignation_log_dir
+            None,                            // floor_keep_fraction
         );
 
         let mut env = TilersEnvInner::new(3, 3, 1);

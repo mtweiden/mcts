@@ -128,10 +128,12 @@ fn main() {
         trajectory_dir,
         Some(reward_saturation_temperature),
         None,                 // max actions
+        None,                 // max_action_multiplier (default 1.2)
         None,                 // resign_value_threshold (default)
         None,                 // resign_consecutive_moves (default)
         None,                 // no_resign_rate (default)
         None,                 // resignation_log_dir (off in standalone binary)
+        None,                 // floor_keep_fraction (default 1.0 — keep all)
     );
 
     loop {
