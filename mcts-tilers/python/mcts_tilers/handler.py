@@ -438,17 +438,6 @@ if __name__ == "__main__":
     parser.add_argument("--num_heads", type=int, default=4)
     args = parser.parse_args()
 
-    # Re-instantiate MODEL with the requested architecture. Replaces the
-    # module-level default so do_work / pre-warm / autocast wrappers all
-    # see the right model. Keeps backward compat with the module-level
-    # MODEL for any importer that doesn't go through this entry point.
-    MODEL = Agent(
-        embedding_dim=args.embedding_dim,
-        num_layers=args.num_layers,
-        lookahead=args.lookahead,
-        num_heads=args.num_heads,
-    )
-
     if torch.cuda.is_available():
         print(f"CUDA is available. {torch.cuda.device_count()} devices found.")
         ngpu = torch.cuda.device_count()
@@ -459,7 +448,12 @@ if __name__ == "__main__":
         print("CUDA is not available. Using CPU.")
         device = "cpu"
 
-    model = Agent(embedding_dim=128, num_layers=10, lookahead=1)
+    model = Agent(
+        embedding_dim=args.embedding_dim,
+        num_layers=args.num_layers,
+        lookahead=args.lookahead,
+        num_heads=args.num_heads,
+    )
     if args.weights is not None:
         print(f"[handler {args.handler_id}] Loading weights from: {args.weights}")
         model.load_state(args.weights)
