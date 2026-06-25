@@ -27,44 +27,52 @@ pub struct HoldoutEnvironment {
     environment_id: i64,
     json: String,
     num_objectives: i64,
+    difficulty_bin: i64,
+    action_count: i64,
 }
 
 /// Load holdout environments from the database, optionally filtered to those
-/// with at most `max_num_objectives` objectives, and round-robin sliced
-/// across nodes by (node_idx, num_nodes). Single-node callers pass
-/// (0, 1) and get every row. Multi-node callers pass distinct node_idx
-/// values and ROW_NUMBER over (num_objectives ASC, environment_id ASC)
-/// distributes envs evenly across difficulty tiers — so each node gets a
-/// balanced mix of easy and hard envs rather than a contiguous block.
+/// in difficulty bin `<= max_difficulty_bin` (the solver-action-count bin set
+/// by init_db.py; see ACTION_BIN_EDGES), and round-robin sliced across nodes
+/// by (node_idx, num_nodes). Single-node callers pass (0, 1) and get every
+/// row. Multi-node callers pass distinct node_idx values and ROW_NUMBER over
+/// (difficulty_bin ASC, environment_id ASC) distributes envs evenly across
+/// difficulty bins — so each node gets a balanced mix of easy and hard envs
+/// rather than a contiguous block.
+///
+/// Difficulty is keyed on the heuristic solver's action count (difficulty_bin),
+/// not num_objectives: two envs with the same objective count can need wildly
+/// different action budgets, and action count is what actually predicts eval
+/// cost (max_actions in evaluate_single scales with the solver solution length).
 fn load_holdout_environments(
     conn: &Connection,
-    max_num_objectives: Option<i64>,
+    max_difficulty_bin: Option<i64>,
     node_idx: i64,
     num_nodes: i64,
 ) -> Result<Vec<HoldoutEnvironment>, rusqlite::Error> {
-    let max_filter = if max_num_objectives.is_some() {
-        "WHERE num_objectives <= ?"
+    let max_filter = if max_difficulty_bin.is_some() {
+        "WHERE difficulty_bin <= ?"
     } else {
         ""
     };
     // Slice via ROW_NUMBER so every node gets a balanced mix across the
-    // difficulty tiers. (rn - 1) % num_nodes = node_idx is the round-robin.
+    // difficulty bins. (rn - 1) % num_nodes = node_idx is the round-robin.
     let sql = format!(
         "WITH ordered AS (
-            SELECT environment_id, json, num_objectives,
-                   ROW_NUMBER() OVER (ORDER BY num_objectives ASC, environment_id ASC) AS rn
+            SELECT environment_id, json, num_objectives, difficulty_bin, action_count,
+                   ROW_NUMBER() OVER (ORDER BY difficulty_bin ASC, environment_id ASC) AS rn
             FROM environments
             {}
          )
-         SELECT environment_id, json, num_objectives
+         SELECT environment_id, json, num_objectives, difficulty_bin, action_count
          FROM ordered
          WHERE (rn - 1) % ? = ?
-         ORDER BY num_objectives ASC",
+         ORDER BY difficulty_bin ASC",
         max_filter
     );
 
     let mut bound: Vec<i64> = Vec::new();
-    if let Some(m) = max_num_objectives {
+    if let Some(m) = max_difficulty_bin {
         bound.push(m);
     }
     bound.push(num_nodes);
@@ -76,6 +84,8 @@ fn load_holdout_environments(
             environment_id: row.get(0)?,
             json: row.get(1)?,
             num_objectives: row.get(2)?,
+            difficulty_bin: row.get(3)?,
+            action_count: row.get(4)?,
         })
     })?;
     Ok(rows.filter_map(|r| r.ok()).collect())
@@ -92,6 +102,11 @@ pub struct Evaluator {
     /// given run so the evaluator's terminal scalars are comparable to the
     /// ones the trained value head saw at gather time.
     reward_saturation_temperature: f32,
+    /// Per-episode action budget as a multiple of the heuristic solution
+    /// length (`max_actions = ceil(reference_actions * multiplier)`). 1.2 is
+    /// the historical default; raising it lets a sub-heuristic policy finish
+    /// (earning a graded reward) instead of being truncated to the -1 floor.
+    max_action_multiplier: f32,
 }
 
 impl Evaluator {
@@ -99,36 +114,49 @@ impl Evaluator {
         mcts_steps: usize,
         c_puct: f32,
         reward_saturation_temperature: f32,
+        max_action_multiplier: f32,
     ) -> Self {
         Self {
             mcts_steps,
             c_puct,
             reward_saturation_temperature,
+            max_action_multiplier,
         }
     }
 
     /// Solve the environment using the heuristic solver to obtain the
-    /// reference depth used in the terminal evaluator.
-    fn solve_with_heuristic(&self, env: &Environment) -> f32 {
+    /// reference depth used in the terminal evaluator. Returns `None` if
+    /// the heuristic planner exhausts its iteration budget — these envs
+    /// are skipped by `evaluate_single` so eval continues instead of
+    /// panicking.
+    fn solve_with_heuristic(&self, env: &Environment) -> Option<f32> {
         let mut solved_env = env.clone();
         let solver = Solver::new();
-        solver.solve(&mut solved_env, true).unwrap();
-        solved_env.depth(true, true) as f32
+        match solver.solve(&mut solved_env, true) {
+            Ok(_) => Some(solved_env.depth(true, true) as f32),
+            Err(_) => None,
+        }
     }
 
-    /// Run MCTS on a single environment and return the action sequence taken
-    /// and the final solution depth. Returns None for depth if the agent did
-    /// not finish.
+    /// Run MCTS on a single environment and return the action sequence taken,
+    /// the final solution depth, and a flag indicating whether the heuristic
+    /// baseline could be computed. The third element is `true` when the env
+    /// was skipped because the heuristic planner exhausted — in that case the
+    /// first two elements are empty / `None` and the caller should record the
+    /// env as unsolvable rather than as "agent did not finish".
     fn evaluate_single(
         &self,
         env: &Environment,
         client: &dyn InferenceClient<TilersEnv>,
-    ) -> (Vec<Action>, Option<f32>) {
+    ) -> (Vec<Action>, Option<f32>, bool) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
         let mut tilers_env = TilersEnv::new(env.clone(), LOOKAHEAD);
         tilers_env.inner.set_cultivation_time(10);
 
-        let reference_depth = self.solve_with_heuristic(&tilers_env.inner);
+        let reference_depth = match self.solve_with_heuristic(&tilers_env.inner) {
+            Some(d) => d,
+            None => return (Vec::new(), None, true),
+        };
         let temperature = self.reward_saturation_temperature;
 
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
@@ -148,7 +176,7 @@ impl Evaluator {
         let solver = Solver::new();
         let mut tmp_env = env.clone();
         let max_actions = match solver.solve(&mut tmp_env, false) {
-            Ok(sol) => (sol.len() as f32 * 1.2) as usize,
+            Ok(sol) => (sol.len() as f32 * self.max_action_multiplier) as usize,
             Err(_) => 1000,
         };
 
@@ -208,7 +236,7 @@ impl Evaluator {
             None
         };
 
-        (actions_taken, solution_depth)
+        (actions_taken, solution_depth, false)
     }
 
     /// Open the arena (which Python has already populated with live handlers)
@@ -252,9 +280,19 @@ impl Evaluator {
                 }
             };
 
-            let (actions, solution_depth) = self.evaluate_single(&env, client);
+            let (actions, solution_depth, heuristic_unsolvable) =
+                self.evaluate_single(&env, client);
 
-            let actions_json = json!(actions).to_string();
+            // Unsolvable envs (heuristic baseline can't be computed) get a
+            // sentinel string in the actions column instead of a JSON array,
+            // so the Python side can pull them out by SQL: solutions WHERE
+            // actions = '"heuristic_unsolvable"'. The row still records the
+            // attempt so resume-after-crash skips it.
+            let actions_json = if heuristic_unsolvable {
+                json!("heuristic_unsolvable").to_string()
+            } else {
+                json!(actions).to_string()
+            };
             let attempted_at = chrono::Utc::now().to_rfc3339();
 
             conn.execute(
@@ -271,15 +309,25 @@ impl Evaluator {
             )
             .expect("Failed to insert solution");
 
-            match solution_depth {
-                Some(d) => println!(
-                    "[Evaluator] Agent {} | Env {} ({} obj) | depth = {:.1}",
-                    agent_id, holdout.environment_id, holdout.num_objectives, d
-                ),
-                None => println!(
-                    "[Evaluator] Agent {} | Env {} ({} obj) | did not finish.",
-                    agent_id, holdout.environment_id, holdout.num_objectives
-                ),
+            if heuristic_unsolvable {
+                println!(
+                    "[Evaluator] Agent {} | Env {} (bin {}, {} actions, {} obj) | UNSOLVABLE (heuristic exhausted).",
+                    agent_id, holdout.environment_id, holdout.difficulty_bin,
+                    holdout.action_count, holdout.num_objectives
+                );
+            } else {
+                match solution_depth {
+                    Some(d) => println!(
+                        "[Evaluator] Agent {} | Env {} (bin {}, {} actions, {} obj) | depth = {:.1}",
+                        agent_id, holdout.environment_id, holdout.difficulty_bin,
+                        holdout.action_count, holdout.num_objectives, d
+                    ),
+                    None => println!(
+                        "[Evaluator] Agent {} | Env {} (bin {}, {} actions, {} obj) | did not finish.",
+                        agent_id, holdout.environment_id, holdout.difficulty_bin,
+                        holdout.action_count, holdout.num_objectives
+                    ),
+                }
             }
         }
     }
@@ -290,7 +338,7 @@ impl Evaluator {
         db_path: &str,
         arena_tag: &str,
         num_handlers: usize,
-        max_num_objectives: Option<i64>,
+        max_difficulty_bin: Option<i64>,
         node_idx: i64,
         num_nodes: i64,
     ) -> Result<(), String> {
@@ -299,7 +347,7 @@ impl Evaluator {
             .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
 
         let environments = load_holdout_environments(
-            &conn, max_num_objectives, node_idx, num_nodes,
+            &conn, max_difficulty_bin, node_idx, num_nodes,
         ).map_err(|e| format!("Failed to query environments: {e}"))?;
 
         let arena_name = format!("mcts_{}_{}_{}", arena_tag, NUM_SLOTS, num_handlers);
@@ -344,6 +392,8 @@ mod tests {
             // `to_json` takes a layer count, not a lookahead.
             json: env.to_json(LOOKAHEAD + 1),
             num_objectives: 1,
+            difficulty_bin: 0,
+            action_count: 0,
         }
     }
 
@@ -358,7 +408,7 @@ mod tests {
 
     #[test]
     fn test_new_stores_params() {
-        let e = Evaluator::new(50, 1.5, 0.4);
+        let e = Evaluator::new(50, 1.5, 0.4, 1.2);
         assert_eq!(e.mcts_steps, 50);
         assert!((e.c_puct - 1.5).abs() < 1e-6);
         assert!((e.reward_saturation_temperature - 0.4).abs() < 1e-6);
@@ -368,9 +418,10 @@ mod tests {
 
     #[test]
     fn test_solve_with_heuristic_nonnegative() {
-        let e = Evaluator::new(5, 1.4, 1.0);
+        let e = Evaluator::new(5, 1.4, 1.0, 1.2);
         let env = small_env();
-        let depth = e.solve_with_heuristic(&env);
+        let depth = e.solve_with_heuristic(&env)
+            .expect("small_env should be solvable by the heuristic");
         assert!(depth >= 0.0, "depth={depth}");
     }
 
@@ -389,7 +440,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let evaluator = Evaluator::new(5, 1.4, 1.0);
+        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2);
         let client = TrivialTilersIpcClient {};
         evaluator.evaluate_agent_with_client(1, &[holdout], &client, &conn);
 
@@ -407,7 +458,7 @@ mod tests {
         let env = small_env();
         let holdout = make_holdout(42, &env);
 
-        let evaluator = Evaluator::new(5, 1.4, 1.0);
+        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2);
         let client = TrivialTilersIpcClient {};
         evaluator.evaluate_agent_with_client(99, &[holdout], &client, &conn);
 
@@ -449,9 +500,10 @@ use pyo3::exceptions::PyRuntimeError;
 ///                         value used by the gatherer that produced this
 ///                         agent's training data, otherwise the value head's
 ///                         outputs are calibrated to a different scale.
-///     max_num_objectives: If set, skip holdout environments whose
-///                         num_objectives exceeds this value. Defaults to
-///                         None (evaluate every environment).
+///     max_difficulty_bin: If set, skip holdout environments whose
+///                         difficulty_bin (solver-action-count bin; see
+///                         init_db.py ACTION_BIN_EDGES) exceeds this value.
+///                         Defaults to None (evaluate every environment).
 ///     node_idx:           This node's 0-based index in the gather/eval
 ///                         allocation. Defaults to 0.
 ///     num_nodes:          Total number of nodes that will collectively
@@ -469,9 +521,10 @@ use pyo3::exceptions::PyRuntimeError;
     mcts_steps = 10_000,
     c_puct = 1.4,
     reward_saturation_temperature = 0.3,
-    max_num_objectives = None,
+    max_difficulty_bin = None,
     node_idx = 0,
     num_nodes = 1,
+    max_action_multiplier = 1.2,
 ))]
 pub fn run_evaluator(
     agent_id: i64,
@@ -481,14 +534,16 @@ pub fn run_evaluator(
     mcts_steps: usize,
     c_puct: f32,
     reward_saturation_temperature: f32,
-    max_num_objectives: Option<i64>,
+    max_difficulty_bin: Option<i64>,
     node_idx: i64,
     num_nodes: i64,
+    max_action_multiplier: f32,
 ) -> PyResult<()> {
     let evaluator = Evaluator::new(
         mcts_steps,
         c_puct,
         reward_saturation_temperature,
+        max_action_multiplier,
     );
 
     let conn = Connection::open(&db_path)
@@ -497,11 +552,11 @@ pub fn run_evaluator(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to set PRAGMAs: {e}")))?;
 
     let environments = load_holdout_environments(
-        &conn, max_num_objectives, node_idx, num_nodes,
+        &conn, max_difficulty_bin, node_idx, num_nodes,
     ).map_err(|e| PyRuntimeError::new_err(format!("Failed to query environments: {e}")))?;
 
-    let max_filter_msg = match max_num_objectives {
-        Some(m) => format!(" (num_objectives <= {})", m),
+    let max_filter_msg = match max_difficulty_bin {
+        Some(m) => format!(" (difficulty_bin <= {})", m),
         None => String::new(),
     };
     let slice_msg = if num_nodes > 1 {

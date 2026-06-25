@@ -32,6 +32,7 @@ fn main() {
     let mut max_num_objectives: Option<i64> = None;
     let mut node_idx: i64 = 0;
     let mut num_nodes: i64 = 1;
+    let mut max_action_multiplier: f32 = 1.2;
 
     let mut i = 1;
     while i < args.len() {
@@ -46,6 +47,7 @@ fn main() {
             "--max_num_objectives"  => { max_num_objectives = Some(args[i+1].parse().unwrap()); i += 2; }
             "--node_idx"            => { node_idx = args[i+1].parse().unwrap(); i += 2; }
             "--num_nodes"           => { num_nodes = args[i+1].parse().unwrap(); i += 2; }
+            "--max_action_multiplier" => { max_action_multiplier = args[i+1].parse().unwrap(); i += 2; }
             _                       => { i += 1; }
         }
     }
@@ -56,6 +58,7 @@ fn main() {
         mcts_steps,
         c_puct,
         reward_saturation_temperature,
+        max_action_multiplier,
     );
 
     evaluator
