@@ -148,14 +148,14 @@ impl Evaluator {
         &self,
         env: &Environment,
         client: &dyn InferenceClient<TilersEnv>,
-    ) -> (Vec<Action>, Option<f32>, bool) {
+    ) -> (Vec<Action>, Option<f32>, i64, Option<f32>, bool) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
         let mut tilers_env = TilersEnv::new(env.clone(), LOOKAHEAD);
         tilers_env.inner.set_cultivation_time(10);
 
         let reference_depth = match self.solve_with_heuristic(&tilers_env.inner) {
             Some(d) => d,
-            None => return (Vec::new(), None, true),
+            None => return (Vec::new(), None, 0, None, true),
         };
         let temperature = self.reward_saturation_temperature;
 
@@ -230,13 +230,39 @@ impl Evaluator {
         }
 
         let done = tilers_env.inner.done();
-        let solution_depth = if done {
-            Some(tilers_env.inner.depth(true, true) as f32)
+        let agent_depth = tilers_env.inner.depth(true, true) as f32;
+        let solution_depth = if done { Some(agent_depth) } else { None };
+
+        // Continuous eval reward + objectives satisfied, mirroring the
+        // gatherer's terminal scoring EXACTLY so eval and gather agree on the
+        // scalar (gatherer.rs:529-559): done -> tanh of depth-margin vs the
+        // heuristic; not-done -> HER partial credit by solving the achieved
+        // sub-goal; floor -> -1. The continuous reward is the promotion signal:
+        // dense and magnitude-aware, so a paired z-test over a large holdout
+        // detects the small per-iteration gains that binary done()/depth and
+        // integer achieved-count comparisons are blind to.
+        let temperature = self.reward_saturation_temperature;
+        let (achieved_objectives, eval_reward): (i64, Option<f32>) = if done {
+            let ratio = (reference_depth - agent_depth) / (reference_depth + 1e-6);
+            (env.num_objectives() as i64, Some((ratio / temperature).tanh()))
         } else {
-            None
+            match env.achieved_goal_env(&tilers_env.inner) {
+                Ok(mut her_env) => {
+                    let k = her_env.num_objectives() as i64;
+                    match Solver::new().solve(&mut her_env, true) {
+                        Ok(_) => {
+                            let her_ref = her_env.depth(true, true) as f32;
+                            let ratio = (her_ref - agent_depth) / (her_ref + 1e-6);
+                            (k, Some((ratio / temperature).tanh()))
+                        }
+                        Err(_) => (k, Some(-1.0)),
+                    }
+                }
+                Err(_) => (0, Some(-1.0)),
+            }
         };
 
-        (actions_taken, solution_depth, false)
+        (actions_taken, solution_depth, achieved_objectives, eval_reward, false)
     }
 
     /// Open the arena (which Python has already populated with live handlers)
@@ -280,7 +306,7 @@ impl Evaluator {
                 }
             };
 
-            let (actions, solution_depth, heuristic_unsolvable) =
+            let (actions, solution_depth, achieved_objectives, eval_reward, heuristic_unsolvable) =
                 self.evaluate_single(&env, client);
 
             // Unsolvable envs (heuristic baseline can't be computed) get a
@@ -297,13 +323,15 @@ impl Evaluator {
 
             conn.execute(
                 "INSERT OR IGNORE INTO solutions
-                    (agent_id, environment_id, actions, solution_depth, attempted_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
+                    (agent_id, environment_id, actions, solution_depth, achieved_objectives, eval_reward, attempted_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 params![
                     agent_id,
                     holdout.environment_id,
                     actions_json,
                     solution_depth,
+                    achieved_objectives,
+                    eval_reward,
                     attempted_at,
                 ],
             )
@@ -375,11 +403,13 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(
             "CREATE TABLE solutions (
-                agent_id       INTEGER NOT NULL,
-                environment_id INTEGER NOT NULL,
-                actions        TEXT,
-                solution_depth REAL,
-                attempted_at   TEXT,
+                agent_id            INTEGER NOT NULL,
+                environment_id      INTEGER NOT NULL,
+                actions             TEXT,
+                solution_depth      REAL,
+                achieved_objectives INTEGER,
+                eval_reward         REAL,
+                attempted_at        TEXT,
                 PRIMARY KEY (agent_id, environment_id)
             );",
         ).unwrap();

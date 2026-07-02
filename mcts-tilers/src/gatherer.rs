@@ -95,6 +95,21 @@ pub struct Gatherer {
     /// distribution toward the rare non-floored signal without changing the
     /// reward of any kept record.
     floor_keep_fraction: f32,
+    /// HER reward baseline margin (fraction of the heuristic reference depth).
+    /// Applies ONLY to "her" (partial, goal-relabeled) episodes — never to
+    /// "done" or to the evaluator, so the value head's done-reward calibration
+    /// stays consistent between gather and eval. The HER terminal reward is
+    /// `tanh(((1 + her_reward_margin) * her_ref_depth - actual_depth)
+    ///       / (her_ref_depth + ε) / temperature)`. With margin = 0.0 (default)
+    /// the zero-reward point is "match the heuristic on the achieved sub-goal"
+    /// (historical behavior). A positive margin moves the zero point to
+    /// `(1 + margin)×` the heuristic depth, so a partial completion that lands
+    /// within `margin` of the heuristic scores slightly positive instead of
+    /// negative. This lifts the large achieved-but-negative HER mass into a
+    /// usable "make progress toward completion" gradient and counteracts the
+    /// full-trajectory-depth penalty that otherwise makes more-objectives
+    /// episodes score *worse* (the observed non-monotonicity in achieved count).
+    her_reward_margin: f32,
     /// If set, winning trajectories are written here as pretraining data.
     trajectory_dir: Option<String>,
     /// If set, the gatherer writes one JSON line per episode summarising
@@ -126,6 +141,7 @@ impl Gatherer {
         no_resign_rate: Option<f32>,
         resignation_log_dir: Option<String>,
         floor_keep_fraction: Option<f32>,
+        her_reward_margin: Option<f32>,
     ) -> Self {
         Self {
             batch_size,
@@ -154,6 +170,8 @@ impl Gatherer {
             no_resign_rate: no_resign_rate.unwrap_or(0.1),
             // 1.0 = keep every floor episode (unchanged default).
             floor_keep_fraction: floor_keep_fraction.unwrap_or(1.0),
+            // 0.0 = zero-reward at exactly the heuristic depth (unchanged default).
+            her_reward_margin: her_reward_margin.unwrap_or(0.0),
             trajectory_dir,
             resignation_log_dir,
         }
@@ -548,7 +566,13 @@ impl Gatherer {
                         match her_ref {
                             Some(ref_d) => {
                                 let d = solution_depth as f32;
-                                let ratio = (ref_d - d) / (ref_d + 1e-6);
+                                // Baseline margin: shift the zero-reward point from
+                                // "match the heuristic" to "(1 + margin)× the heuristic
+                                // depth" so a partial completion close to the heuristic
+                                // scores slightly positive instead of negative. HER-only
+                                // (eval/done untouched → calibration preserved).
+                                let baseline = (1.0 + self.her_reward_margin) * ref_d;
+                                let ratio = (baseline - d) / (ref_d + 1e-6);
                                 ((ratio / self.reward_saturation_temperature).tanh(), "her", k)
                             }
                             None => (-1.0, "floor", k),
@@ -557,6 +581,25 @@ impl Gatherer {
                     Err(_) => (-1.0, "floor", 0),
                 }
             };
+
+        // Finish printout: log every episode that reaches done() (the agent
+        // fully tiled the env), mirroring the "Starting Env" line. Distinct from
+        // the resignation log — this is the positive event (a completion), with
+        // the agent's depth vs the heuristic reference and whether it beat it.
+        if tilers_env.inner.done() {
+            println!(
+                "[Gatherer {}] FINISHED Env(h={}, w={}, nb={}, no={}) | depth={} vs ref={} | score={:.3} (beat_solver={})",
+                self.gather_id,
+                env.height,
+                env.width,
+                env.num_ancillas(),
+                env.num_objectives(),
+                solution_depth,
+                reference_depth,
+                score,
+                solution_depth < reference_depth,
+            );
+        }
 
         // Resignation calibration log (one JSON line per episode).
         // The no-resign sample (resign_allowed=false) provides the
@@ -780,6 +823,7 @@ use pyo3::exceptions::PyRuntimeError;
     max_action_multiplier = 1.2,
     max_pp_weight = None,
     floor_keep_fraction = 1.0,
+    her_reward_margin = 0.0,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -808,6 +852,7 @@ pub fn run_gatherer(
     max_action_multiplier: f32,
     max_pp_weight: Option<usize>,
     floor_keep_fraction: f32,
+    her_reward_margin: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -843,6 +888,7 @@ pub fn run_gatherer(
         Some(no_resign_rate),
         resignation_log_dir,
         Some(floor_keep_fraction),
+        Some(her_reward_margin),
     );
 
     let mut rng = if let Some(s) = seed {
@@ -932,6 +978,7 @@ mod tests {
             Some(0.0),            // no_resign_rate
             None,                 // resignation_log_dir
             None,                 // floor_keep_fraction (default 1.0)
+            None,                 // her_reward_margin (default 0.0)
         )
     }
 
@@ -941,7 +988,7 @@ mod tests {
     fn test_new_sets_explicit_reward_saturation_temperature() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1,
-            None, Some(0.3), Some(100), None, None, None, None, None, None,
+            None, Some(0.3), Some(100), None, None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
         assert_eq!(g.mcts_steps, 10);
@@ -954,7 +1001,7 @@ mod tests {
         // default (reward_ratio_limit = 0.3 → slope 1/0.3); see Gatherer::new.
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
     }
@@ -963,7 +1010,7 @@ mod tests {
     fn test_new_defaults_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None,
         );
         assert!((g.resign_value_threshold - (-0.9)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 5);
@@ -974,7 +1021,7 @@ mod tests {
     fn test_new_sets_explicit_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, Some(-0.5), Some(8), Some(0.2), None, None,
+            None, None, None, None, Some(-0.5), Some(8), Some(0.2), None, None, None,
         );
         assert!((g.resign_value_threshold - (-0.5)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 8);
@@ -1152,6 +1199,7 @@ mod tests {
             Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
             None,                            // resignation_log_dir
             None,                            // floor_keep_fraction
+            None,                            // her_reward_margin
         );
 
         let mut env = TilersEnvInner::new(3, 3, 1);

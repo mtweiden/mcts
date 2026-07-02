@@ -65,6 +65,7 @@ fn e2e_gather_full_game_writes_board_records() {
         Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
         None,
         None,  // floor_keep_fraction
+        None,  // her_reward_margin
     );
     let client = TrivialTilersIpcClient {};
     let mut rng = StdRng::seed_from_u64(0);

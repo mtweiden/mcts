@@ -134,6 +134,7 @@ fn main() {
         None,                 // no_resign_rate (default)
         None,                 // resignation_log_dir (off in standalone binary)
         None,                 // floor_keep_fraction (default 1.0 — keep all)
+        None,                 // her_reward_margin (default 0.0)
     );
 
     loop {
