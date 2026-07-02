@@ -69,14 +69,13 @@ pub struct Gatherer {
     reward_saturation_temperature: f32,
     /// Resignation threshold: end the episode early when the agent's
     /// MCTS-backed Q estimate is at or below this value for
-    /// `resign_consecutive_moves` consecutive moves AND the agent's
-    /// current depth already exceeds the solver's reference depth. Both
-    /// conditions are required so we only resign when the agent is
-    /// confidently losing AND has already overshot — this avoids early
-    /// resignation on positions that look bad but are still recoverable.
-    /// Set `resign_consecutive_moves = 0` to disable resignation
-    /// entirely; values of `resign_value_threshold` above 1.0 also have
-    /// that effect (Q is bounded above by 1).
+    /// `resign_consecutive_moves` consecutive moves. (An earlier variant
+    /// also required the agent to have overshot the solver's reference
+    /// depth; that gate suppressed ~96% of resignations and was removed —
+    /// see the resignation-check comment in `gather`.) Set
+    /// `resign_consecutive_moves = 0` to disable resignation entirely;
+    /// values of `resign_value_threshold` above 1.0 also have that effect
+    /// (Q is bounded above by 1).
     resign_value_threshold: f32,
     resign_consecutive_moves: usize,
     /// Fraction of episodes in which resignation is *disabled* and the
@@ -378,7 +377,7 @@ impl Gatherer {
         // episode so the no-resign sanity sample is a uniform 1 - rate
         // fraction. Episodes that fall into the sanity sample play out
         // to natural termination; the rest may resign once the
-        // (low-Q-streak ∧ over-solver-depth) condition is met.
+        // low-Q-streak condition is met.
         let resignation_enabled =
             self.resign_consecutive_moves > 0 && self.resign_value_threshold < 1.0;
         let resign_allowed =
@@ -435,12 +434,9 @@ impl Gatherer {
             // Resignation check (after the search, before recording or
             // stepping). root.value is the visit-weighted Q estimate at
             // the current state — the agent's best estimate of "how is
-            // this position going". We require Q ≤ threshold AND that
-            // we've already overshot the solver's depth, so the agent
-            // is both confident it's losing and has exhausted its
-            // budget. Both conditions reset the streak when violated;
-            // resignation only fires after the streak hits the
-            // configured length.
+            // this position going". We resign on a sustained low-Q streak
+            // alone: Q ≤ threshold for `resign_consecutive_moves`
+            // consecutive moves. A violating move resets the streak.
             // Always capture root.value + over-solver state (cheap), even
             // when resignation_enabled is false, so the calibration log
             // can compute counterfactuals across any threshold.
@@ -453,7 +449,16 @@ impl Gatherer {
             }
 
             if resignation_enabled {
-                if q <= self.resign_value_threshold && over_solver {
+                // Resign on sustained low Q alone. The former
+                // `&& over_solver` gate (resign only once past the solver's
+                // depth) suppressed ~96% of resignations — on the iter-6
+                // no-resign sample it fired on just 3.3% of episodes.
+                // Dropping it and resigning at Q ≤ -0.9 for K consecutive
+                // moves cuts ~44% of zero-progress episodes ~29 steps early
+                // (≈1.7x gather throughput) while wrongly resigning <3% of
+                // eventual wins — under the AGZ 5% guideline. `over_solver`
+                // is still traced above for the calibration log.
+                if q <= self.resign_value_threshold {
                     low_value_streak += 1;
                 } else {
                     low_value_streak = 0;
