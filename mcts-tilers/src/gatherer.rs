@@ -18,6 +18,7 @@ use tilers::env::Environment;
 use tilers::rl;
 use tilers::rl::board::BoardCell;
 use tilers::solver::Solver;
+use tilers::core::enums::Action as PlanAction; // raw typed heuristic action, for replay
 
 use crate::constants::*;
 use crate::environment::TilersEnv;
@@ -118,6 +119,22 @@ pub struct Gatherer {
     /// `resign_allowed = false`), no more than 5% of episodes that would
     /// have resigned at T actually went on to win.
     resignation_log_dir: Option<String>,
+    reverse_curriculum: bool,
+    reverse_curriculum_min_len: usize,
+    reverse_curriculum_max_probes: usize,
+    reverse_curriculum_k_start_frac: f32,
+}
+
+/// One self-play episode's outcome, decoupled from record-writing so the
+/// reverse-curriculum climb can run several probes and choose which to keep.
+struct EpisodeOutcome {
+    reference_depth: f32, solution_depth: f32, done: bool,
+    score: f32, reward_kind: &'static str, achieved_objectives: usize,
+    temp_data: Vec<(Vec<Vec<BoardCell>>, usize, Vec<Action>, HashMap<Action, usize>)>,
+    all_steps_data: Vec<(Vec<Vec<BoardCell>>, usize, Vec<Action>, Action, usize, usize)>,
+    q_trace: Vec<f32>, over_solver_trace: Vec<bool>,
+    resigned: bool, resign_allowed: bool, resignation_enabled: bool,
+    height: usize, width: usize, num_ancillas: usize, num_objectives: usize,
 }
 
 impl Gatherer {
@@ -173,7 +190,19 @@ impl Gatherer {
             her_reward_margin: her_reward_margin.unwrap_or(0.0),
             trajectory_dir,
             resignation_log_dir,
+            reverse_curriculum: false,
+            reverse_curriculum_min_len: usize::MAX,
+            reverse_curriculum_max_probes: 3,
+            reverse_curriculum_k_start_frac: 0.25,
         }
+    }
+
+    pub fn set_reverse_curriculum(&mut self, enabled: bool, min_len: usize,
+                                  max_probes: usize, k_start_frac: f32) {
+        self.reverse_curriculum = enabled;
+        self.reverse_curriculum_min_len = min_len;
+        self.reverse_curriculum_max_probes = max_probes.max(1);
+        self.reverse_curriculum_k_start_frac = k_start_frac.clamp(0.05, 1.0);
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
@@ -318,6 +347,27 @@ impl Gatherer {
         )
     }
 
+    /// Raw typed heuristic plan for an environment (for reverse-curriculum
+    /// replay). Empty if the solver fails.
+    fn heuristic_typed_plan(&self, env: &Environment) -> Vec<PlanAction> {
+        let mut e = env.clone();
+        Solver::new().solve(&mut e, true).unwrap_or_default()
+    }
+
+    /// Build a reverse-curriculum start state: replay the first `prefix_len`
+    /// heuristic actions from `game`, leaving the remaining `len - prefix_len`
+    /// objectives for the agent. `prefix_len == 0` yields the true start S0;
+    /// `prefix_len == plan.len()` yields the (near-)solved terminal.
+    fn make_reverse_start(&self, game: &Environment, plan: &[PlanAction], prefix_len: usize) -> Environment {
+        let mut sk = game.clone();
+        sk.set_cultivation_time(10);
+        for a in plan.iter().take(prefix_len) {
+            let _ = sk.step(a.clone());
+            sk.finish_cultivating(None, None);
+        }
+        sk
+    }
+
     pub fn gather(
         &self,
         env: &Environment,
@@ -325,9 +375,62 @@ impl Gatherer {
         c_puct: f32,
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
+        let mut game = env.clone();
+        game.set_cultivation_time(10);
+        if self.reverse_curriculum {
+            let plan = self.heuristic_typed_plan(&game);
+            if plan.len() >= self.reverse_curriculum_min_len {
+                return self.gather_reverse_curriculum(&game, &plan, client, c_puct, rng);
+            }
+        }
+        let o = self.run_episode_from(&game, client, c_puct, rng);
+        self.write_episode(&o, false, rng)
+    }
+
+    /// Reverse-curriculum bounded climb: start near the heuristic terminal
+    /// (small remaining suffix `k`) and, whenever the agent solves the reduced
+    /// problem, back off toward the true start S0 by increasing `k`. Keeps the
+    /// hardest solved probe (`best`) and the first failed probe (`failed`), and
+    /// writes both. Bounded by `reverse_curriculum_max_probes`.
+    fn gather_reverse_curriculum(
+        &self,
+        game: &Environment,
+        plan: &[PlanAction],
+        client: &dyn InferenceClient<TilersEnv>,
+        c_puct: f32,
+        rng: &mut impl Rng,
+    ) -> (f32, f32, bool) {
+        let len = plan.len();
+        let mut k = (((len as f32) * self.reverse_curriculum_k_start_frac).ceil() as usize).clamp(1, len);
+        let (mut best, mut failed) = (None, None);
+        let mut ret = (0.0, 0.0, false);
+        for _ in 0..self.reverse_curriculum_max_probes {
+            let sk = self.make_reverse_start(game, plan, len - k);
+            let o = self.run_episode_from(&sk, client, c_puct, rng);
+            ret = (o.solution_depth, o.reference_depth, o.done);
+            if o.done { let full = k >= len; best = Some(o); if full { break; }
+                        k = (k + ((len - k)/2).max(1)).min(len); }
+            else { failed = Some(o); break; }
+        }
+        if let Some(o) = &best   { self.write_episode(o, true, rng); }
+        if let Some(o) = &failed { self.write_episode(o, true, rng); }
+        ret
+    }
+
+    /// Run one self-play MCTS episode from `start_env`, returning its outcome
+    /// (reward, HER provenance, traces, and captured training records) WITHOUT
+    /// writing anything. Record-writing is done separately by `write_episode`
+    /// so the reverse-curriculum climb can run several probes first.
+    fn run_episode_from(
+        &self,
+        start_env: &Environment,
+        client: &dyn InferenceClient<TilersEnv>,
+        c_puct: f32,
+        rng: &mut impl Rng,
+    ) -> EpisodeOutcome {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
-        let mut game = env.clone();
+        let mut game = start_env.clone();
         // The played game keeps its FULL objective set — the agent must solve
         // the entire problem, and the heuristic reference below is the
         // full-problem depth. The observation board is windowed to
@@ -337,10 +440,10 @@ impl Gatherer {
         game.set_cultivation_time(10);
         let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
 
-        let h = env.height;
-        let w = env.width;
-        let nb = env.num_ancillas();
-        let no = env.num_objectives();
+        let h = game.height;
+        let w = game.width;
+        let nb = game.num_ancillas();
+        let no = game.num_objectives();
         println!(
             "[Gatherer {}] Starting Env(h={}, w={}, nb={}, no={})", self.gather_id, h, w, nb, no,
         );
@@ -595,10 +698,10 @@ impl Gatherer {
             println!(
                 "[Gatherer {}] FINISHED Env(h={}, w={}, nb={}, no={}) | depth={} vs ref={} | score={:.3} (beat_solver={})",
                 self.gather_id,
-                env.height,
-                env.width,
-                env.num_ancillas(),
-                env.num_objectives(),
+                game.height,
+                game.width,
+                game.num_ancillas(),
+                game.num_objectives(),
                 solution_depth,
                 reference_depth,
                 score,
@@ -606,6 +709,32 @@ impl Gatherer {
             );
         }
 
+        EpisodeOutcome {
+            reference_depth,
+            solution_depth: solution_depth as f32,
+            done: tilers_env.inner.done(),
+            score,
+            reward_kind,
+            achieved_objectives,
+            temp_data,
+            all_steps_data,
+            q_trace,
+            over_solver_trace,
+            resigned,
+            resign_allowed,
+            resignation_enabled,
+            height: game.height,
+            width: game.width,
+            num_ancillas: game.num_ancillas(),
+            num_objectives: game.num_objectives(),
+        }
+    }
+
+    /// Write one episode's records: resignation calibration log, winning
+    /// trajectory (if score > 0), then the full-search training records —
+    /// preserving the HER-saturation-floor and floor-keep-fraction skips.
+    /// `is_reverse` tags training records with `reverse_curriculum`.
+    fn write_episode(&self, o: &EpisodeOutcome, is_reverse: bool, rng: &mut impl Rng) -> (f32, f32, bool) {
         // Resignation calibration log (one JSON line per episode).
         // The no-resign sample (resign_allowed=false) provides the
         // ground truth for false-positive analysis: any episode whose
@@ -629,23 +758,23 @@ impl Gatherer {
                     Ok(mut f) => {
                         let record = json!({
                             "gather_id": self.gather_id,
-                            "h": env.height,
-                            "w": env.width,
-                            "num_ancillas": env.num_ancillas(),
-                            "num_objectives": env.num_objectives(),
-                            "achieved_objectives": achieved_objectives,
-                            "reference_depth": reference_depth,
-                            "final_depth": solution_depth,
-                            "final_score": score,
-                            "done": tilers_env.inner.done(),
-                            "resign_allowed": resign_allowed,
-                            "resignation_enabled": resignation_enabled,
-                            "resigned": resigned,
+                            "h": o.height,
+                            "w": o.width,
+                            "num_ancillas": o.num_ancillas,
+                            "num_objectives": o.num_objectives,
+                            "achieved_objectives": o.achieved_objectives,
+                            "reference_depth": o.reference_depth,
+                            "final_depth": o.solution_depth,
+                            "final_score": o.score,
+                            "done": o.done,
+                            "resign_allowed": o.resign_allowed,
+                            "resignation_enabled": o.resignation_enabled,
+                            "resigned": o.resigned,
                             "resign_threshold_in_use": self.resign_value_threshold,
                             "resign_consecutive_moves_in_use": self.resign_consecutive_moves,
-                            "num_steps": q_trace.len(),
-                            "q_per_step": q_trace,
-                            "over_solver_per_step": over_solver_trace,
+                            "num_steps": o.q_trace.len(),
+                            "q_per_step": o.q_trace,
+                            "over_solver_per_step": o.over_solver_trace,
                         });
                         if let Err(e) = writeln!(f, "{}", record) {
                             eprintln!(
@@ -663,7 +792,7 @@ impl Gatherer {
         }
 
         // Write the full trajectory to trajectory_dir if we found a win.
-        if score > 0.0 {
+        if o.score > 0.0 {
             if let Some(dir) = &self.trajectory_dir {
                 std::fs::create_dir_all(dir).expect("Failed to create trajectory directory");
 
@@ -681,10 +810,10 @@ impl Gatherer {
                     .expect("Unable to open trajectory file");
                 let mut traj_file = BufWriter::new(traj_file_raw);
 
-                let depth = all_steps_data.len();
+                let depth = o.all_steps_data.len();
                 let gamma = 0.80f32;
 
-                for (step, (board, num_ancillas, valid_actions, action, s_height, s_width)) in all_steps_data.iter().enumerate() {
+                for (step, (board, num_ancillas, valid_actions, action, s_height, s_width)) in o.all_steps_data.iter().enumerate() {
                     let board_json = Self::serialize_board(board);
                     let valid_actions_json = Value::Array(valid_actions.iter().map(|&a| Value::from(a)).collect());
 
@@ -732,8 +861,8 @@ impl Gatherer {
         // comparison (the true efficiency signal) — only the saturated examples
         // are filtered. "floor" (genuine zero-progress) and "done" are unaffected.
         const HER_SATURATION_FLOOR: f32 = -0.999;
-        if reward_kind == "her" && score <= HER_SATURATION_FLOOR {
-            return (solution_depth as f32, reference_depth as f32, tilers_env.inner.done());
+        if o.reward_kind == "her" && o.score <= HER_SATURATION_FLOOR {
+            return (o.solution_depth, o.reference_depth, o.done);
         }
 
         // Subsample zero-progress "floor" episodes so the corpus isn't dominated
@@ -741,11 +870,11 @@ impl Gatherer {
         // fraction of floor episodes (chosen at random), skewing the written
         // distribution toward the rare "done"/"her" signal the trainer can learn
         // from. "done" and graded "her" episodes are never dropped here.
-        if reward_kind == "floor"
+        if o.reward_kind == "floor"
             && self.floor_keep_fraction < 1.0
             && rng.random::<f32>() >= self.floor_keep_fraction
         {
-            return (solution_depth as f32, reference_depth as f32, tilers_env.inner.done());
+            return (o.solution_depth, o.reference_depth, o.done);
         }
 
         // Write full-search data to output_path as normal.
@@ -759,32 +888,33 @@ impl Gatherer {
             .expect("Unable to open output file");
         let mut file = BufWriter::new(file_raw);
 
-        for (board, num_ancillas, va, ev) in temp_data {
-            let board_json = Self::serialize_board(&board);
-            let valid_actions_json = Value::Array(va.into_iter().map(Value::from).collect());
+        for (board, num_ancillas, va, ev) in &o.temp_data {
+            let board_json = Self::serialize_board(board);
+            let valid_actions_json = Value::Array(va.iter().map(|&a| Value::from(a)).collect());
             let mut visits_map = Map::with_capacity(ev.len());
             for (action, count) in ev {
-                visits_map.insert(action.to_string(), Value::from(count));
+                visits_map.insert(action.to_string(), Value::from(*count));
             }
             let visits_json = Value::Object(visits_map);
 
             let record = json!({
-                "height": tilers_env.inner.height,
-                "width": tilers_env.inner.width,
+                "height": o.height,
+                "width": o.width,
                 "num_ancillas": num_ancillas,
                 "board": board_json,
                 "valid_actions": valid_actions_json,
                 "edge_visits": visits_json,
-                "reward": score,
-                "reward_kind": reward_kind,
-                "achieved_objectives": achieved_objectives,
+                "reward": o.score,
+                "reward_kind": o.reward_kind,
+                "achieved_objectives": o.achieved_objectives,
+                "reverse_curriculum": is_reverse,
             });
 
             writeln!(file, "{}", record).expect("Failed to write record");
         }
         file.flush().expect("Failed to flush file");
 
-        (solution_depth as f32, reference_depth as f32, tilers_env.inner.done())
+        (o.solution_depth, o.reference_depth, o.done)
     }
 }
 
@@ -829,6 +959,10 @@ use pyo3::exceptions::PyRuntimeError;
     max_pp_weight = None,
     floor_keep_fraction = 1.0,
     her_reward_margin = 0.0,
+    reverse_curriculum = false,
+    reverse_curriculum_min_len = 50,
+    reverse_curriculum_max_probes = 3,
+    reverse_curriculum_k_start_frac = 0.25,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -858,6 +992,10 @@ pub fn run_gatherer(
     max_pp_weight: Option<usize>,
     floor_keep_fraction: f32,
     her_reward_margin: f32,
+    reverse_curriculum: bool,
+    reverse_curriculum_min_len: usize,
+    reverse_curriculum_max_probes: usize,
+    reverse_curriculum_k_start_frac: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -874,7 +1012,7 @@ pub fn run_gatherer(
     let client = TilersIpcClient::new(arena, worker_id);
 
     let output_path = format!("{}/output-{}.jsonl", output_dir, worker_id);
-    let gatherer = Gatherer::new(
+    let mut gatherer = Gatherer::new(
         8,
         mcts_steps,
         fast_steps,
@@ -894,6 +1032,12 @@ pub fn run_gatherer(
         resignation_log_dir,
         Some(floor_keep_fraction),
         Some(her_reward_margin),
+    );
+    gatherer.set_reverse_curriculum(
+        reverse_curriculum,
+        reverse_curriculum_min_len,
+        reverse_curriculum_max_probes,
+        reverse_curriculum_k_start_frac,
     );
 
     let mut rng = if let Some(s) = seed {
@@ -1187,6 +1331,49 @@ mod tests {
         let (depth, actions) = g.solve_with_heuristic(&env);
         assert!(depth >= 0.0, "depth={depth}");
         assert!(!actions.is_empty(), "heuristic solution should be non-empty");
+    }
+
+    // ─── reverse curriculum ──────────────────────────────────────────────────
+
+    #[test]
+    fn test_make_reverse_start_objectives_monotone() {
+        let g = default_gatherer("/dev/null");
+        let mut env = TilersEnvInner::new(4, 4, 1);
+        env.set_seed(Some(7));
+        env.random_start(3, false);
+        env.set_cultivation_time(10);
+
+        let plan = g.heuristic_typed_plan(&env);
+        assert!(!plan.is_empty(), "heuristic plan should be non-empty");
+
+        // prefix_len = 0 reproduces the true start S0 (all objectives remain).
+        let s0 = g.make_reverse_start(&env, &plan, 0);
+        assert_eq!(
+            s0.num_objectives(),
+            env.num_objectives(),
+            "prefix_len=0 must equal the true start's objective count",
+        );
+
+        // num_objectives() is monotonically non-increasing as prefix_len grows:
+        // each replayed heuristic action can only complete objectives, never add.
+        let mut prev = s0.num_objectives();
+        for prefix_len in 1..=plan.len() {
+            let sk = g.make_reverse_start(&env, &plan, prefix_len);
+            let cur = sk.num_objectives();
+            assert!(
+                cur <= prev,
+                "num_objectives increased at prefix_len={prefix_len}: {cur} > {prev}",
+            );
+            prev = cur;
+        }
+
+        // prefix_len = plan.len() replays the entire heuristic solution ⇒
+        // done / near-done: no more remaining objectives than the true start.
+        let full = g.make_reverse_start(&env, &plan, plan.len());
+        assert!(
+            full.num_objectives() <= s0.num_objectives(),
+            "full replay should not have more objectives than S0",
+        );
     }
 
     // ─── gather integration ──────────────────────────────────────────────────
