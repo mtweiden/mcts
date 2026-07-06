@@ -685,6 +685,27 @@ impl Gatherer {
                     "done",
                     game.num_objectives(),
                 )
+            } else if reference_override.is_some() {
+                // REVERSE-CURRICULUM partial. The agent stopped short from a
+                // mid-solution S_k. HER's achieved_goal_env would rebuild the
+                // goal on S_k's mid-transport layout (set_layout wipes runtime,
+                // keeps packed positions) — a layout the greedy solver cannot
+                // re-plan (every factor has 0 valid edge cells → no_ready_pp
+                // give-up; see hindsight.rs:107 / solver/transport.rs). That
+                // both spams `[stuck]` and floors recoverable partials. So for
+                // reverse-curriculum episodes we do NOT re-solve: grade by
+                // objective-completion fraction against the S_k sub-problem.
+                // No solver call → no spam, and partial progress is credited.
+                let start_objs = game.num_objectives();
+                let remaining = tilers_env.inner.num_objectives();
+                let achieved = start_objs.saturating_sub(remaining);
+                if achieved == 0 || start_objs == 0 {
+                    (-1.0, "floor", 0)
+                } else {
+                    // frac ∈ (0,1): completed none → -1, all-but-one → ~0.
+                    let frac = achieved as f32 / start_objs as f32;
+                    (frac - 1.0, "her", achieved)
+                }
             } else {
                 match game.achieved_goal_env(&tilers_env.inner) {
                     Ok(mut her_env) => {
@@ -1397,6 +1418,159 @@ mod tests {
             full.num_objectives() <= s0.num_objectives(),
             "full replay should not have more objectives than S0",
         );
+    }
+
+    /// Minimal reproduction: does replaying the heuristic plan reconstruct the
+    /// solver's real intermediate state, and can the solver finish from S_k?
+    /// Run with: cargo test --features python --lib diagnose_reverse_start -- --nocapture
+    #[test]
+    fn diagnose_reverse_start_replay() {
+        let g = default_gatherer("/dev/null");
+        let mut env = TilersEnvInner::new(10, 10, 8);
+        env.set_seed(Some(3));
+        env.random_start(4, false);
+        env.set_cultivation_time(10);
+
+        let (d_full, plan) = g.heuristic_typed_plan(&env);
+        eprintln!("PLAN len={} d_full={} objectives={}", plan.len(), d_full, env.num_objectives());
+        assert!(!plan.is_empty(), "need a non-empty plan");
+
+        // (1) Replay the FULL plan exactly as make_reverse_start does, but CHECK
+        // each step's Result and whether the replay actually reaches done().
+        // If step_errors>0 or done=false, the replay diverges from the solver's
+        // real state — that (not the solver) is the breakdown.
+        let mut sk = env.clone();
+        sk.set_cultivation_time(10);
+        let mut step_errs = 0;
+        for (i, a) in plan.iter().enumerate() {
+            if let Err(e) = sk.step(a.clone()) {
+                step_errs += 1;
+                if step_errs <= 5 { eprintln!("  REPLAY step {i} REJECTED: {e:?}"); }
+            }
+            sk.finish_cultivating(None, None);
+        }
+        eprintln!(
+            "FULL REPLAY: step_errors={} done={} remaining_objectives={}",
+            step_errs, sk.done(), sk.num_objectives(),
+        );
+
+        // (2) Ask the solver to finish from mid-prefix intermediate states.
+        for frac in [0.25f32, 0.5, 0.75] {
+            let prefix = ((plan.len() as f32) * frac) as usize;
+            let mut s_k = g.make_reverse_start(&env, &plan, prefix);
+            let before = s_k.num_objectives();
+            match Solver::new().solve(&mut s_k, true) {
+                Ok(p) => eprintln!("  RE-SOLVE prefix={prefix} obj_remaining={before}: OK tail_len={}", p.len()),
+                Err(e) => eprintln!("  RE-SOLVE prefix={prefix} obj_remaining={before}: STUCK/ERR {e:?}"),
+            }
+        }
+    }
+
+    /// Sweep many gather-like envs to find one where the reverse-start breaks
+    /// down: either the replay diverges (step_errs>0 / !done) OR the solver
+    /// gets stuck re-solving an intermediate state.
+    /// RESULT (2026-07-06): 461 envs, ~1844 re-solves → 0 diverged, 0 stuck.
+    /// The solver re-solves clean heuristic-prefix states fine; the gather
+    /// `[stuck] no_ready_pp` is NOT from this path. #[ignore]d (slow, ~465s).
+    /// cargo test --features python --lib sweep_reverse_start -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn sweep_reverse_start_breakdown() {
+        let g = default_gatherer("/dev/null");
+        let mut diverged = 0;
+        let mut stuck = 0;
+        let mut total = 0;
+        let mut first_stuck_reported = false;
+        for seed in 0u64..40 {
+            for &no in &[2usize, 3, 4, 6] {
+                for &nb in &[6usize, 12, 18] {
+                    let mut env = TilersEnvInner::new(10, 10, nb);
+                    env.set_seed(Some(seed));
+                    env.random_start(no, false);
+                    env.set_cultivation_time(10);
+                    let (_d, plan) = g.heuristic_typed_plan(&env);
+                    if plan.len() < 35 { continue; }
+                    total += 1;
+
+                    // replay fidelity
+                    let mut sk = env.clone(); sk.set_cultivation_time(10);
+                    let mut errs = 0;
+                    for a in plan.iter() {
+                        if sk.step(a.clone()).is_err() { errs += 1; }
+                        sk.finish_cultivating(None, None);
+                    }
+                    if errs > 0 || !sk.done() { diverged += 1; }
+
+                    // re-solve intermediate states
+                    for frac in [0.2f32, 0.4, 0.6, 0.8] {
+                        let prefix = ((plan.len() as f32) * frac) as usize;
+                        let mut s_k = g.make_reverse_start(&env, &plan, prefix);
+                        if let Err(e) = Solver::new().solve(&mut s_k, true) {
+                            stuck += 1;
+                            if !first_stuck_reported {
+                                first_stuck_reported = true;
+                                eprintln!("FIRST STUCK: seed={seed} no={no} nb={nb} plan_len={} prefix={prefix} obj_remaining={} err={e:?}",
+                                    plan.len(), s_k.num_objectives());
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        eprintln!("SWEEP: {total} qualifying envs | replay diverged in {diverged} | re-solve STUCK events {stuck}");
+    }
+
+    /// Reproduce the REAL [stuck] source: the HER relabel-solve on a state the
+    /// AGENT reaches (random, non-heuristic play) from a MID-SOLUTION S_k
+    /// (partial-circuit layout) vs from a clean S0. If S_k stuck-rate >> S0
+    /// stuck-rate, the HER path on mid-solution layouts is the culprit.
+    /// RESULT (2026-07-06): S_k(mid-solution) 24/87 stuck vs S0(clean) 0/7 —
+    /// confirms the HER relabel-solve on S_k's mid-transport layout is the
+    /// no_ready_pp source (fixed by grading reverse partials without re-solving).
+    /// #[ignore]d (slow, ~32s). cargo test ... diagnose_her_stuck -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn diagnose_her_stuck_midstate_vs_s0() {
+        let g = default_gatherer("/dev/null");
+        let (mut sk_stuck, mut s0_stuck, mut sk_n, mut s0_n) = (0, 0, 0, 0);
+
+        // Random (non-heuristic) play from `start`, then HER-relabel + solve.
+        // Returns Some(is_stuck) when HER produced a goal, None if zero-achieved.
+        let try_her = |start: &TilersEnvInner, seed: u64| -> Option<bool> {
+            let mut fin = start.clone();
+            fin.set_cultivation_time(10);
+            let mut rng = StdRng::seed_from_u64(seed);
+            for _ in 0..40 {
+                if fin.done() { break; }
+                let va = fin.valid_actions();
+                if va.is_empty() { break; }
+                let a = va[rng.random_range(0..va.len())];
+                let _ = fin.step(a);
+                fin.finish_cultivating(None, None);
+            }
+            match start.achieved_goal_env(&fin) {
+                Ok(mut her_env) => Some(Solver::new().solve(&mut her_env, true).is_err()),
+                Err(_) => None,
+            }
+        };
+
+        for seed in 0u64..30 {
+            for &no in &[3usize, 4, 6] {
+                let mut env = TilersEnvInner::new(10, 10, 12);
+                env.set_seed(Some(seed));
+                env.random_start(no, false);
+                env.set_cultivation_time(10);
+                let (_d, plan) = g.heuristic_typed_plan(&env);
+                if plan.len() < 50 { continue; }
+
+                let s_k = g.make_reverse_start(&env, &plan, plan.len() / 2);
+                let pseed = seed * 7 + 1;
+                if let Some(st) = try_her(&s_k, pseed) { sk_n += 1; if st { sk_stuck += 1;
+                    if sk_stuck <= 3 { eprintln!("S_k HER STUCK: seed={seed} no={no}"); } } }
+                if let Some(st) = try_her(&env, pseed) { s0_n += 1; if st { s0_stuck += 1; } }
+            }
+        }
+        eprintln!("HER-solve STUCK rate — S_k(mid-solution): {sk_stuck}/{sk_n} | S0(clean): {s0_stuck}/{s0_n}");
     }
 
     // ─── gather integration ──────────────────────────────────────────────────
