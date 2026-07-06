@@ -122,7 +122,7 @@ pub struct Gatherer {
     reverse_curriculum: bool,
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
-    reverse_curriculum_k_start_frac: f32,
+    reverse_curriculum_k_start_actions: usize,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -193,16 +193,16 @@ impl Gatherer {
             reverse_curriculum: false,
             reverse_curriculum_min_len: usize::MAX,
             reverse_curriculum_max_probes: 3,
-            reverse_curriculum_k_start_frac: 0.25,
+            reverse_curriculum_k_start_actions: 16,
         }
     }
 
     pub fn set_reverse_curriculum(&mut self, enabled: bool, min_len: usize,
-                                  max_probes: usize, k_start_frac: f32) {
+                                  max_probes: usize, k_start_actions: usize) {
         self.reverse_curriculum = enabled;
         self.reverse_curriculum_min_len = min_len;
         self.reverse_curriculum_max_probes = max_probes.max(1);
-        self.reverse_curriculum_k_start_frac = k_start_frac.clamp(0.05, 1.0);
+        self.reverse_curriculum_k_start_actions = k_start_actions.max(1);
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
@@ -406,7 +406,12 @@ impl Gatherer {
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
         let len = plan.len();
-        let mut k = (((len as f32) * self.reverse_curriculum_k_start_frac).ceil() as usize).clamp(1, len);
+        // Start the agent a SMALL absolute number of actions from the goal
+        // (an easy near-terminal tail), independent of plan length, and grow
+        // k geometrically on each solve — the climb finds the per-instance
+        // frontier. A fraction of len made the first tail hundreds of actions
+        // (past the agent frontier) for the long plans that fire at min_len.
+        let mut k = self.reverse_curriculum_k_start_actions.clamp(1, len);
         let (mut best, mut failed) = (None, None);
         let mut ret = (0.0, 0.0, false);
         for _ in 0..self.reverse_curriculum_max_probes {
@@ -418,7 +423,7 @@ impl Gatherer {
             let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, k)));
             ret = (o.solution_depth, o.reference_depth, o.done);
             if o.done { let full = k >= len; best = Some(o); if full { break; }
-                        k = (k + ((len - k)/2).max(1)).min(len); }
+                        k = (k * 2).min(len); }
             else { failed = Some(o); break; }
         }
         if let Some(o) = &best   { self.write_episode(o, true, rng); }
@@ -1006,7 +1011,7 @@ use pyo3::exceptions::PyRuntimeError;
     reverse_curriculum = false,
     reverse_curriculum_min_len = 50,
     reverse_curriculum_max_probes = 3,
-    reverse_curriculum_k_start_frac = 0.25,
+    reverse_curriculum_k_start_actions = 16,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1039,7 +1044,7 @@ pub fn run_gatherer(
     reverse_curriculum: bool,
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
-    reverse_curriculum_k_start_frac: f32,
+    reverse_curriculum_k_start_actions: usize,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1081,7 +1086,7 @@ pub fn run_gatherer(
         reverse_curriculum,
         reverse_curriculum_min_len,
         reverse_curriculum_max_probes,
-        reverse_curriculum_k_start_frac,
+        reverse_curriculum_k_start_actions,
     );
 
     let mut rng = if let Some(s) = seed {
