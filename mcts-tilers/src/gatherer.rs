@@ -192,7 +192,7 @@ impl Gatherer {
             resignation_log_dir,
             reverse_curriculum: false,
             reverse_curriculum_min_len: usize::MAX,
-            reverse_curriculum_max_probes: 3,
+            reverse_curriculum_max_probes: 5,
             reverse_curriculum_k_start_actions: 16,
         }
     }
@@ -392,10 +392,31 @@ impl Gatherer {
     }
 
     /// Reverse-curriculum bounded climb: start near the heuristic terminal
-    /// (small remaining suffix `k`) and, whenever the agent solves the reduced
-    /// problem, back off toward the true start S0 by increasing `k`. Keeps the
-    /// hardest solved probe (`best`) and the first failed probe (`failed`), and
-    /// writes both. Bounded by `reverse_curriculum_max_probes`.
+    /// Next tail length to probe in the reverse-curriculum edge search, given
+    /// the current `k` and bracket [`lo`, `hi`] (lo = largest solved, hi =
+    /// smallest failed, or `len+1` if nothing has failed yet). Phase 1: while no
+    /// failure (`hi > len`), double toward `len` to bracket the frontier fast.
+    /// Phase 2: once bracketed, bisect (lo, hi). Returns `None` when the edge is
+    /// pinned (`hi == lo + 1`) or there is no new candidate. Pure → unit-tested.
+    fn next_probe_k(k: usize, lo: usize, hi: usize, len: usize) -> Option<usize> {
+        let next = if hi > len {
+            (k * 2).min(len)
+        } else if hi - lo > 1 {
+            lo + (hi - lo) / 2
+        } else {
+            return None;
+        };
+        if next == lo { None } else { Some(next) }
+    }
+
+    /// Find the agent's per-instance frontier via exponential-bracket then
+    /// binary-search refine, keeping the barely-solvable probe (`best`) and the
+    /// barely-too-hard probe (`failed`) — the sharpest training signal at the
+    /// ability boundary. Bounded by `reverse_curriculum_max_probes` (the
+    /// precision dial). Phase 1: start a small absolute `k` actions from the
+    /// goal and DOUBLE until the first failure (brackets the frontier fast,
+    /// independent of plan length). Phase 2: bisect between the largest solved
+    /// (`lo`) and smallest failed (`hi`) to pin the edge.
     fn gather_reverse_curriculum(
         &self,
         game: &Environment,
@@ -406,14 +427,12 @@ impl Gatherer {
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
         let len = plan.len();
-        // Start the agent a SMALL absolute number of actions from the goal
-        // (an easy near-terminal tail), independent of plan length, and grow
-        // k geometrically on each solve — the climb finds the per-instance
-        // frontier. A fraction of len made the first tail hundreds of actions
-        // (past the agent frontier) for the long plans that fire at min_len.
-        let mut k = self.reverse_curriculum_k_start_actions.clamp(1, len);
-        let (mut best, mut failed) = (None, None);
+        let mut lo = 0usize;          // largest tail SOLVED (0 = none yet)
+        let mut hi = len + 1;         // smallest tail FAILED (len+1 = none yet)
+        let mut best: Option<EpisodeOutcome> = None;
+        let mut failed: Option<EpisodeOutcome> = None;
         let mut ret = (0.0, 0.0, false);
+        let mut k = self.reverse_curriculum_k_start_actions.clamp(1, len);
         for _ in 0..self.reverse_curriculum_max_probes {
             let sk = self.make_reverse_start(game, plan, len - k);
             // Reference for S_k = D_full (heuristic finishes S_k via its
@@ -422,9 +441,18 @@ impl Gatherer {
             // `[stuck] no_ready_pp` panics from the greedy solver on mid-states.
             let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, k)));
             ret = (o.solution_depth, o.reference_depth, o.done);
-            if o.done { let full = k >= len; best = Some(o); if full { break; }
-                        k = (k * 2).min(len); }
-            else { failed = Some(o); break; }
+            if o.done {
+                lo = k;
+                best = Some(o);
+                if k >= len { break; }        // solved the whole problem
+            } else {
+                hi = k;
+                failed = Some(o);
+            }
+            match Self::next_probe_k(k, lo, hi, len) {
+                Some(next) => k = next,
+                None => break,                // edge pinned / nothing new
+            }
         }
         if let Some(o) = &best   { self.write_episode(o, true, rng); }
         if let Some(o) = &failed { self.write_episode(o, true, rng); }
@@ -1010,7 +1038,7 @@ use pyo3::exceptions::PyRuntimeError;
     her_reward_margin = 0.0,
     reverse_curriculum = false,
     reverse_curriculum_min_len = 50,
-    reverse_curriculum_max_probes = 3,
+    reverse_curriculum_max_probes = 5,
     reverse_curriculum_k_start_actions = 16,
 ))]
 pub fn run_gatherer(
@@ -1423,6 +1451,36 @@ mod tests {
             full.num_objectives() <= s0.num_objectives(),
             "full replay should not have more objectives than S0",
         );
+    }
+
+    #[test]
+    fn test_next_probe_k_brackets_and_pins_frontier() {
+        // Simulate the reverse-curriculum edge search against a known frontier F
+        // (the "agent" solves a tail k iff k <= F). Invariants: lo (largest
+        // solved) stays <= F and hi (smallest failed) stays > F throughout, and
+        // with enough budget the edge is pinned (hi - lo == 1).
+        for &(len, f, start, budget, expect_pinned) in &[
+            (1000usize, 40usize, 16usize, 10usize, true),
+            (1000, 3, 16, 10, true),     // frontier BELOW k_start → bisect down
+            (1000, 500, 16, 14, true),   // far frontier
+            (50, 50, 16, 10, false),     // solves everything (edge = len)
+            (1000, 0, 16, 12, true),     // can't solve even k=1
+        ] {
+            let (mut lo, mut hi) = (0usize, len + 1);
+            let mut k = start.clamp(1, len);
+            for _ in 0..budget {
+                if k <= f { lo = k; if k >= len { break; } } else { hi = k; }
+                match Gatherer::next_probe_k(k, lo, hi, len) {
+                    Some(n) => k = n,
+                    None => break,
+                }
+            }
+            assert!(lo <= f, "len={len} F={f}: lo={lo} exceeds frontier");
+            assert!(hi > f, "len={len} F={f}: hi={hi} not above frontier");
+            if expect_pinned {
+                assert_eq!(hi - lo, 1, "len={len} F={f}: edge not pinned (lo={lo} hi={hi})");
+            }
+        }
     }
 
     /// Minimal reproduction: does replaying the heuristic plan reconstruct the
