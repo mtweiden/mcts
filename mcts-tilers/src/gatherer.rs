@@ -349,9 +349,13 @@ impl Gatherer {
 
     /// Raw typed heuristic plan for an environment (for reverse-curriculum
     /// replay). Empty if the solver fails.
-    fn heuristic_typed_plan(&self, env: &Environment) -> Vec<PlanAction> {
+    /// Solve `env` with the heuristic once, returning the full-solution depth
+    /// (D_full) AND the typed plan. D_full is reused as the reverse-curriculum
+    /// sub-problem reference so intermediate states are NEVER re-solved.
+    fn heuristic_typed_plan(&self, env: &Environment) -> (f32, Vec<PlanAction>) {
         let mut e = env.clone();
-        Solver::new().solve(&mut e, true).unwrap_or_default()
+        let plan = Solver::new().solve(&mut e, true).unwrap_or_default();
+        (e.depth(true, true), plan)
     }
 
     /// Build a reverse-curriculum start state: replay the first `prefix_len`
@@ -378,12 +382,12 @@ impl Gatherer {
         let mut game = env.clone();
         game.set_cultivation_time(10);
         if self.reverse_curriculum {
-            let plan = self.heuristic_typed_plan(&game);
+            let (d_full, plan) = self.heuristic_typed_plan(&game);
             if plan.len() >= self.reverse_curriculum_min_len {
-                return self.gather_reverse_curriculum(&game, &plan, client, c_puct, rng);
+                return self.gather_reverse_curriculum(&game, d_full, &plan, client, c_puct, rng);
             }
         }
-        let o = self.run_episode_from(&game, client, c_puct, rng);
+        let o = self.run_episode_from(&game, client, c_puct, rng, None);
         self.write_episode(&o, false, rng)
     }
 
@@ -395,6 +399,7 @@ impl Gatherer {
     fn gather_reverse_curriculum(
         &self,
         game: &Environment,
+        d_full: f32,
         plan: &[PlanAction],
         client: &dyn InferenceClient<TilersEnv>,
         c_puct: f32,
@@ -406,7 +411,11 @@ impl Gatherer {
         let mut ret = (0.0, 0.0, false);
         for _ in 0..self.reverse_curriculum_max_probes {
             let sk = self.make_reverse_start(game, plan, len - k);
-            let o = self.run_episode_from(&sk, client, c_puct, rng);
+            // Reference for S_k = D_full (heuristic finishes S_k via its
+            // remaining actions to the same terminal), with `k` remaining
+            // heuristic actions for the action budget. No S_k re-solve → no
+            // `[stuck] no_ready_pp` panics from the greedy solver on mid-states.
+            let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, k)));
             ret = (o.solution_depth, o.reference_depth, o.done);
             if o.done { let full = k >= len; best = Some(o); if full { break; }
                         k = (k + ((len - k)/2).max(1)).min(len); }
@@ -427,6 +436,7 @@ impl Gatherer {
         client: &dyn InferenceClient<TilersEnv>,
         c_puct: f32,
         rng: &mut impl Rng,
+        reference_override: Option<(f32, usize)>,
     ) -> EpisodeOutcome {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
@@ -438,7 +448,20 @@ impl Gatherer {
         // `TilersEnv::new(.., self.lookahead)` below, so the agent sees a
         // sliding window without the future objectives being deleted.
         game.set_cultivation_time(10);
-        let (reference_depth, reference_actions) = self.solve_with_heuristic(&game);
+        // Reference depth + action budget. For reverse-curriculum probes the
+        // caller passes Some((D_full, k)) — the heuristic's finishing depth from
+        // S_k IS the full-solution depth (it completes S_k via its remaining
+        // actions to the same terminal), with `k` remaining actions for the
+        // budget — so we do NOT re-solve S_k (the greedy solver panics on
+        // `[stuck] no_ready_pp` from arbitrary mid-solution states). None →
+        // solve S0 normally.
+        let (reference_depth, reference_action_count) = match reference_override {
+            Some((d, n)) => (d, n),
+            None => {
+                let (d, acts) = self.solve_with_heuristic(&game);
+                (d, acts.len())
+            }
+        };
 
         let h = game.height;
         let w = game.width;
@@ -473,7 +496,7 @@ impl Gatherer {
         let max_actions = if let Some(max) = self.max_actions {
             max
         } else {
-            (reference_actions.len() as f32 * self.max_action_multiplier) as usize
+            (reference_action_count as f32 * self.max_action_multiplier) as usize
         };
 
         // Resignation bookkeeping. resign_allowed is decided once per
@@ -1343,7 +1366,7 @@ mod tests {
         env.random_start(3, false);
         env.set_cultivation_time(10);
 
-        let plan = g.heuristic_typed_plan(&env);
+        let (_d_full, plan) = g.heuristic_typed_plan(&env);
         assert!(!plan.is_empty(), "heuristic plan should be non-empty");
 
         // prefix_len = 0 reproduces the true start S0 (all objectives remain).
