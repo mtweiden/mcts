@@ -246,19 +246,26 @@ impl Evaluator {
             let ratio = (reference_depth - agent_depth) / (reference_depth + 1e-6);
             (env.num_objectives() as i64, Some((ratio / temperature).tanh()))
         } else {
-            match env.achieved_goal_env(&tilers_env.inner) {
-                Ok(mut her_env) => {
-                    let k = her_env.num_objectives() as i64;
-                    match Solver::new().solve(&mut her_env, true) {
-                        Ok(_) => {
-                            let her_ref = her_env.depth(true, true) as f32;
-                            let ratio = (her_ref - agent_depth) / (her_ref + 1e-6);
-                            (k, Some((ratio / temperature).tanh()))
-                        }
-                        Err(_) => (k, Some(-1.0)),
-                    }
-                }
-                Err(_) => (0, Some(-1.0)),
+            // Unfinished: grade by FACTOR-level progress against the full goal
+            // (merged / total factors), NOT HER's objective-collapse relabel. HER
+            // scored both agents ~equally on hard envs (it relabels to the achieved
+            // sub-goal, ~1-2 objectives regardless of true progress), so the paired
+            // candidate−incumbent diff vanished and the promotion z-test was BLIND
+            // to the frontier — the same collapse we fixed in gather. Factor
+            // granularity is dense and monotonic, so a candidate that merges more
+            // factors than the incumbent yields a real positive diff. No cusp cap
+            // here (unlike gather's shaping reward): eval wants discrimination
+            // across the WHOLE progress range, not a curriculum target. temperature
+            // is unused on this path (linear fraction, already in [-1, 0]).
+            let _ = temperature;
+            let (merged, total) = env.factor_progress(&tilers_env.inner);
+            let achieved = (env.num_objectives() as i64
+                - tilers_env.inner.num_objectives() as i64)
+                .max(0);
+            if merged == 0 || total == 0 {
+                (achieved, Some(-1.0))
+            } else {
+                (achieved, Some(merged as f32 / total as f32 - 1.0))
             }
         };
 
