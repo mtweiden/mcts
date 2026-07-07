@@ -144,6 +144,16 @@ pub struct Gatherer {
     cusp_reward: bool,
     cusp_frontier: usize,
     cusp_margin: usize,
+    /// Q-filtered behavior-cloning demos (Phase 4, HORIZON_EXTENSION_DESIGN.md).
+    /// For a fraction of HARD envs (num_objectives > demo_min_objectives) the
+    /// gatherer replays the heuristic solver's plan and writes one demo training
+    /// record per plan step (one-hot policy = the heuristic action, reward 0.0,
+    /// reward_kind "demo", is_demo=true) INSTEAD of running a self-play episode.
+    /// The trainer applies these under a Q-filter so the agent only imitates the
+    /// heuristic where it currently underestimates the demo state (never capped
+    /// at the heuristic's level). 0.0 = OFF (no demos; default).
+    demo_fraction: f32,
+    demo_min_objectives: usize,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -228,7 +238,15 @@ impl Gatherer {
             cusp_reward: false,
             cusp_frontier: 2,
             cusp_margin: 2,
+            // Q-filtered BC demos OFF by default (fraction 0.0 → never replays).
+            demo_fraction: 0.0,
+            demo_min_objectives: 2,
         }
+    }
+
+    pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize) {
+        self.demo_fraction = demo_fraction.clamp(0.0, 1.0);
+        self.demo_min_objectives = demo_min_objectives;
     }
 
     pub fn set_cusp_reward(&mut self, enabled: bool, frontier: usize, margin: usize) {
@@ -435,7 +453,124 @@ impl Gatherer {
             }
         }
         let o = self.run_episode_from(&game, client, c_puct, rng, None);
-        self.write_episode(&o, false, rng)
+        let ret = self.write_episode(&o, false, rng);
+        // Q-filtered BC demos (Phase 4), FAILURE-TRIGGERED. The agent always
+        // plays its own episode above (its cusp/floor records are written
+        // unchanged). Only when it FAILS a HARD env do we ALSO append the
+        // heuristic solver's corrective demo for that SAME env. Rationale:
+        //   - targets the agent's actual failure distribution (not a random
+        //     pre-selected slice), so BC signal lands where the agent is weak;
+        //   - gives paired signal on the same env (the agent's graded partial
+        //     AND the solver's demo), which the trainer's per-state Q-filter
+        //     then gates so only the weak states get imitated (never capped);
+        //   - reuses the reference solve already done in run_episode_from (see
+        //     the duplicate-solve note in write_demo_episode).
+        // Demos apply ONLY to this normal full-env path — the reverse-curriculum
+        // path returns early above and is never demo-augmented.
+        if self.demo_fraction > 0.0
+            && !o.done
+            && game.num_objectives() > self.demo_min_objectives
+            && rng.random::<f32>() < self.demo_fraction
+        {
+            self.write_demo_episode(&game, rng);
+        }
+        ret
+    }
+
+    /// Replay the heuristic solver's plan on `game` and write ONE demo training
+    /// record per plan step to the normal shard output (NOT the gold dir). Each
+    /// record has the same shape as a normal full-search record EXCEPT:
+    ///   - `edge_visits` is a ONE-HOT { <encoded heuristic action id>: 1.0 },
+    ///     keyed exactly like normal records (via `rl::encode`), so the dataset
+    ///     decodes it into a single policy target at prob 1.0;
+    ///   - `reward` = 0.0 (the heuristic-completion reference the Q-filter reads);
+    ///   - `reward_kind` = "demo", `is_demo` = true.
+    /// The board recorded for each step is the state BEFORE the action (the state
+    /// in which the heuristic chose that action). Returns the same (solution_depth,
+    /// reference_depth, done) tuple shape `gather()` expects; only aggregate stats
+    /// consume it, so (0.0, 0.0, false) is fine.
+    fn write_demo_episode(&self, game: &Environment, _rng: &mut impl Rng) -> (f32, f32, bool) {
+        // NOTE: this re-solves `game` with the heuristic. The caller
+        // (run_episode_from via gather) already solved `game` for the episode
+        // reference, so this is a DUPLICATE solve. It only runs on the small
+        // fraction of FAILED hard envs that pass the demo probe, so the extra
+        // cost is negligible; the typed plan could be threaded out of
+        // run_episode_from later to eliminate it entirely.
+        let (_d_full, plan) = self.heuristic_typed_plan(game);
+        if plan.is_empty() {
+            return (0.0, 0.0, false);
+        }
+
+        // Evolving env, stepped one heuristic action at a time. The wrapper's
+        // build_obs() gives the same windowed 10-channel board write_episode
+        // records emit; `cultivation_time = 10` mirrors run_episode_from.
+        let mut tenv = TilersEnv::new(game.clone(), self.lookahead);
+        tenv.inner.set_cultivation_time(10);
+        let height = tenv.inner.height;
+        let width = tenv.inner.width;
+
+        let file_raw = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.output_path)
+            .expect("Unable to open output file");
+        let mut file = BufWriter::new(file_raw);
+
+        for a in plan.iter() {
+            // Encode the heuristic action against the CURRENT (pre-step) state —
+            // the same mapping normal records key edge_visits by. If the action
+            // can't encode or isn't among the currently-valid actions, skip the
+            // record (its one-hot target would be masked out by the legal mask)
+            // but still step so we stay on the heuristic plan.
+            let encoded = match rl::encode(&tenv.inner, a.clone()) {
+                Ok(id) => id as Action,
+                Err(_) => {
+                    let _ = tenv.inner.step(a.clone());
+                    tenv.inner.finish_cultivating(None, None);
+                    continue;
+                }
+            };
+
+            // Board + valid actions BEFORE stepping (state the heuristic chose in).
+            let board = tenv.build_obs().board;
+            let num_ancillas = tenv.inner.num_ancillas();
+            let valid_actions: Vec<Action> = tenv
+                .inner
+                .valid_actions()
+                .iter()
+                .map(|&va| rl::encode(&tenv.inner, va).expect("valid_actions ids always encode") as Action)
+                .collect();
+
+            if valid_actions.contains(&encoded) {
+                let board_json = Self::serialize_board(&board);
+                let valid_actions_json =
+                    Value::Array(valid_actions.iter().map(|&x| Value::from(x)).collect());
+                // ONE-HOT policy target, keyed like normal edge_visits.
+                let mut visits_map = Map::with_capacity(1);
+                visits_map.insert(encoded.to_string(), Value::from(1.0f64));
+                let visits_json = Value::Object(visits_map);
+
+                let record = json!({
+                    "height": height,
+                    "width": width,
+                    "num_ancillas": num_ancillas,
+                    "board": board_json,
+                    "valid_actions": valid_actions_json,
+                    "edge_visits": visits_json,
+                    "reward": 0.0,
+                    "reward_kind": "demo",
+                    "achieved_objectives": 0,
+                    "reverse_curriculum": false,
+                    "is_demo": true,
+                });
+                writeln!(file, "{}", record).expect("Failed to write demo record");
+            }
+
+            let _ = tenv.inner.step(a.clone());
+            tenv.inner.finish_cultivating(None, None);
+        }
+        file.flush().expect("Failed to flush demo file");
+        (0.0, 0.0, false)
     }
 
     /// Reverse-curriculum bounded climb: start near the heuristic terminal
@@ -1243,6 +1378,8 @@ use pyo3::exceptions::PyRuntimeError;
     cusp_reward = false,
     cusp_frontier = 2,
     cusp_margin = 2,
+    demo_fraction = 0.0,
+    demo_min_objectives = 2,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1283,6 +1420,8 @@ pub fn run_gatherer(
     cusp_reward: bool,
     cusp_frontier: usize,
     cusp_margin: usize,
+    demo_fraction: f32,
+    demo_min_objectives: usize,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1329,6 +1468,7 @@ pub fn run_gatherer(
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
+    gatherer.set_demo(demo_fraction, demo_min_objectives);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
@@ -1949,7 +2089,7 @@ mod tests {
             None,                            // her_reward_margin
         );
         // gold_min_len = 1 → any win with score>0 qualifies for banking.
-        g.set_gold_banking(Some(gold_dir_str.clone()), 1);
+        g.set_gold_banking(Some(gold_dir_str.clone()), 1, 0.0);
 
         let mut env = TilersEnvInner::new(3, 3, 1);
         env.set_seed(Some(99));
@@ -1978,6 +2118,60 @@ mod tests {
                     assert!(v.get(key).is_some(), "gold record missing key '{key}' in: {line}");
                 }
             }
+        }
+    }
+
+    // ─── Q-filtered BC demos (Phase 4) ────────────────────────────────────────
+
+    #[test]
+    fn test_demo_episode_records_shape_and_onehot() {
+        use std::io::BufRead;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.jsonl").to_str().unwrap().to_string();
+
+        let g = default_gatherer(&out);
+
+        let mut env = TilersEnvInner::new(4, 4, 2);
+        env.set_seed(Some(11));
+        env.random_start(2, false);
+
+        // Demos are failure-triggered in gather(); test the write path directly
+        // so the assertions don't depend on whether the trivial client fails.
+        let mut rng = StdRng::seed_from_u64(0);
+        let (score, _ref, done) = g.write_demo_episode(&env, &mut rng);
+        // Demo path returns the sentinel tuple (0.0, 0.0, false).
+        assert_eq!(score, 0.0);
+        assert!(!done);
+
+        let file = std::fs::File::open(&out).expect("demo output file not created");
+        let lines: Vec<String> = std::io::BufReader::new(file)
+            .lines()
+            .filter_map(|l| l.ok())
+            .filter(|l| !l.trim().is_empty())
+            .collect();
+        assert!(!lines.is_empty(), "no demo records written");
+
+        for line in &lines {
+            let v: serde_json::Value = serde_json::from_str(line).expect("invalid demo JSON");
+            for key in &["height", "width", "num_ancillas", "board",
+                         "valid_actions", "edge_visits", "reward"] {
+                assert!(v.get(key).is_some(), "demo record missing key '{key}' in: {line}");
+            }
+            // Demo-specific invariants.
+            assert_eq!(v.get("reward").and_then(|x| x.as_f64()), Some(0.0), "demo reward must be 0.0");
+            assert_eq!(v.get("reward_kind").and_then(|x| x.as_str()), Some("demo"));
+            assert_eq!(v.get("is_demo").and_then(|x| x.as_bool()), Some(true));
+            // edge_visits is a ONE-HOT: exactly one key at weight 1.0, and that
+            // key must be one of the record's valid_actions (so the legal mask
+            // won't zero it out in the trainer).
+            let ev = v.get("edge_visits").and_then(|x| x.as_object()).expect("edge_visits object");
+            assert_eq!(ev.len(), 1, "demo edge_visits must be one-hot");
+            let (k, val) = ev.iter().next().unwrap();
+            assert_eq!(val.as_f64(), Some(1.0), "demo one-hot weight must be 1.0");
+            let onehot_id: u64 = k.parse().expect("edge_visits key is an integer action id");
+            let valid: Vec<u64> = v.get("valid_actions").and_then(|x| x.as_array()).unwrap()
+                .iter().map(|x| x.as_u64().unwrap()).collect();
+            assert!(valid.contains(&onehot_id), "demo one-hot action not in valid_actions");
         }
     }
 }
