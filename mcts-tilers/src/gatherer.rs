@@ -123,6 +123,10 @@ pub struct Gatherer {
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
     reverse_curriculum_k_start_actions: usize,
+    /// Fraction of eligible (plan >= min_len) instances that actually run the
+    /// reverse-curriculum climb; the rest gather the full env normally (so the
+    /// objective-axis cusp reward applies to them). 1.0 = always (old behavior).
+    reverse_curriculum_prob: f32,
     /// Expert-iteration "gold" banking (Phase 2). When Some, genuine HARD wins
     /// (done, score > 0, reference_action_count >= gold_min_len) are ALSO
     /// appended to `<gold_shard_dir>/gold-<gather_id>.jsonl` with a `"gold": true`
@@ -212,6 +216,7 @@ impl Gatherer {
             reverse_curriculum_min_len: usize::MAX,
             reverse_curriculum_max_probes: 5,
             reverse_curriculum_k_start_actions: 16,
+            reverse_curriculum_prob: 1.0,
             // Gold banking OFF by default (no dir → never writes; the sentinel
             // gold_min_len = usize::MAX means nothing qualifies even if a dir slips in).
             gold_shard_dir: None,
@@ -234,8 +239,9 @@ impl Gatherer {
     }
 
     pub fn set_reverse_curriculum(&mut self, enabled: bool, min_len: usize,
-                                  max_probes: usize, k_start_actions: usize) {
+                                  max_probes: usize, k_start_actions: usize, prob: f32) {
         self.reverse_curriculum = enabled;
+        self.reverse_curriculum_prob = prob.clamp(0.0, 1.0);
         self.reverse_curriculum_min_len = min_len;
         self.reverse_curriculum_max_probes = max_probes.max(1);
         self.reverse_curriculum_k_start_actions = k_start_actions.max(1);
@@ -417,7 +423,7 @@ impl Gatherer {
     ) -> (f32, f32, bool) {
         let mut game = env.clone();
         game.set_cultivation_time(10);
-        if self.reverse_curriculum {
+        if self.reverse_curriculum && rng.random::<f32>() < self.reverse_curriculum_prob {
             let (d_full, plan) = self.heuristic_typed_plan(&game);
             if plan.len() >= self.reverse_curriculum_min_len {
                 return self.gather_reverse_curriculum(&game, d_full, &plan, client, c_puct, rng);
@@ -782,8 +788,13 @@ impl Gatherer {
                     (-1.0, "floor", 0)
                 } else {
                     // frac ∈ (0,1): completed none → -1, all-but-one → ~0.
-                    let frac = achieved as f32 / start_objs as f32;
-                    (frac - 1.0, "her", achieved)
+                    // Cusp-cap the reverse partial too (Axis A2): grade against
+                    // min(S_k objectives, frontier+margin) so a large-objective
+                    // S_k doesn't floor-collapse. For the usual small near-goal
+                    // S_k this equals the plain fraction.
+                    let r = Self::cusp_partial_reward(
+                        achieved, start_objs, self.cusp_frontier, self.cusp_margin);
+                    (r, "her", achieved)
                 }
             } else if self.cusp_reward && game.num_objectives() > self.cusp_frontier {
                 // CUSP reward (Axis A2). Vanilla HER relabels a HARD env DOWN to
@@ -1183,6 +1194,7 @@ use pyo3::exceptions::PyRuntimeError;
     reverse_curriculum_min_len = 50,
     reverse_curriculum_max_probes = 5,
     reverse_curriculum_k_start_actions = 16,
+    reverse_curriculum_prob = 1.0,
     gold_shard_dir = None,
     gold_min_len = usize::MAX,
     cusp_reward = false,
@@ -1221,6 +1233,7 @@ pub fn run_gatherer(
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
     reverse_curriculum_k_start_actions: usize,
+    reverse_curriculum_prob: f32,
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
     cusp_reward: bool,
@@ -1268,6 +1281,7 @@ pub fn run_gatherer(
         reverse_curriculum_min_len,
         reverse_curriculum_max_probes,
         reverse_curriculum_k_start_actions,
+        reverse_curriculum_prob,
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
