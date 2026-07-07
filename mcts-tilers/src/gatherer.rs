@@ -123,6 +123,13 @@ pub struct Gatherer {
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
     reverse_curriculum_k_start_actions: usize,
+    /// Expert-iteration "gold" banking (Phase 2). When Some, genuine HARD wins
+    /// (done, score > 0, reference_action_count >= gold_min_len) are ALSO
+    /// appended to `<gold_shard_dir>/gold-<gather_id>.jsonl` with a `"gold": true`
+    /// tag, so they can be pinned into every training set regardless of the
+    /// K-window and compound instead of aging out. None = banking OFF.
+    gold_shard_dir: Option<String>,
+    gold_min_len: usize,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -130,6 +137,10 @@ pub struct Gatherer {
 struct EpisodeOutcome {
     reference_depth: f32, solution_depth: f32, done: bool,
     score: f32, reward_kind: &'static str, achieved_objectives: usize,
+    /// Heuristic action-budget count for this episode: the full heuristic plan
+    /// length for a normal episode, or `k` (the tail length) for a
+    /// reverse-curriculum probe. Used as the "hardness" gate for gold banking.
+    reference_action_count: usize,
     temp_data: Vec<(Vec<Vec<BoardCell>>, usize, Vec<Action>, HashMap<Action, usize>)>,
     all_steps_data: Vec<(Vec<Vec<BoardCell>>, usize, Vec<Action>, Action, usize, usize)>,
     q_trace: Vec<f32>, over_solver_trace: Vec<bool>,
@@ -194,7 +205,16 @@ impl Gatherer {
             reverse_curriculum_min_len: usize::MAX,
             reverse_curriculum_max_probes: 5,
             reverse_curriculum_k_start_actions: 16,
+            // Gold banking OFF by default (no dir → never writes; the sentinel
+            // gold_min_len = usize::MAX means nothing qualifies even if a dir slips in).
+            gold_shard_dir: None,
+            gold_min_len: usize::MAX,
         }
+    }
+
+    pub fn set_gold_banking(&mut self, gold_shard_dir: Option<String>, gold_min_len: usize) {
+        self.gold_shard_dir = gold_shard_dir;
+        self.gold_min_len = gold_min_len;
     }
 
     pub fn set_reverse_curriculum(&mut self, enabled: bool, min_len: usize,
@@ -793,6 +813,7 @@ impl Gatherer {
             score,
             reward_kind,
             achieved_objectives,
+            reference_action_count,
             temp_data,
             all_steps_data,
             q_trace,
@@ -991,6 +1012,78 @@ impl Gatherer {
         }
         file.flush().expect("Failed to flush file");
 
+        // Expert-iteration gold banking (Phase 2). If this episode is a genuine
+        // HARD win — finished the goal (`done`), beat the heuristic (`score > 0`),
+        // and the heuristic action budget cleared the hardness floor
+        // (`reference_action_count >= gold_min_len`) — ALSO append the same
+        // per-record training objects (with an added `"gold": true` tag) to a
+        // persistent gold shard so train.py can pin them into every training set,
+        // never aging them out of the K-window. This is IN ADDITION to the normal
+        // output_path write above; the normal corpus is unchanged.
+        if let Some(gold_dir) = &self.gold_shard_dir {
+            if o.done && o.score > 0.0 && o.reference_action_count >= self.gold_min_len {
+                if let Err(e) = std::fs::create_dir_all(gold_dir) {
+                    eprintln!(
+                        "[Gatherer {}] failed to create gold_shard_dir {}: {}",
+                        self.gather_id, gold_dir, e,
+                    );
+                } else {
+                    let gold_path = format!("{}/gold-{}.jsonl", gold_dir, self.gather_id);
+                    match std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(&gold_path)
+                    {
+                        Ok(gold_raw) => {
+                            let mut gold_file = BufWriter::new(gold_raw);
+                            for (board, num_ancillas, va, ev) in &o.temp_data {
+                                let board_json = Self::serialize_board(board);
+                                let valid_actions_json =
+                                    Value::Array(va.iter().map(|&a| Value::from(a)).collect());
+                                let mut visits_map = Map::with_capacity(ev.len());
+                                for (action, count) in ev {
+                                    visits_map.insert(action.to_string(), Value::from(*count));
+                                }
+                                let visits_json = Value::Object(visits_map);
+
+                                let record = json!({
+                                    "height": o.height,
+                                    "width": o.width,
+                                    "num_ancillas": num_ancillas,
+                                    "board": board_json,
+                                    "valid_actions": valid_actions_json,
+                                    "edge_visits": visits_json,
+                                    "reward": o.score,
+                                    "reward_kind": o.reward_kind,
+                                    "achieved_objectives": o.achieved_objectives,
+                                    "reverse_curriculum": is_reverse,
+                                    "gold": true,
+                                });
+
+                                if let Err(e) = writeln!(gold_file, "{}", record) {
+                                    eprintln!(
+                                        "[Gatherer {}] failed to write gold record: {}",
+                                        self.gather_id, e,
+                                    );
+                                    break;
+                                }
+                            }
+                            if let Err(e) = gold_file.flush() {
+                                eprintln!(
+                                    "[Gatherer {}] failed to flush gold file {}: {}",
+                                    self.gather_id, gold_path, e,
+                                );
+                            }
+                        }
+                        Err(e) => eprintln!(
+                            "[Gatherer {}] failed to open gold file {}: {}",
+                            self.gather_id, gold_path, e,
+                        ),
+                    }
+                }
+            }
+        }
+
         (o.solution_depth, o.reference_depth, o.done)
     }
 }
@@ -1040,6 +1133,8 @@ use pyo3::exceptions::PyRuntimeError;
     reverse_curriculum_min_len = 50,
     reverse_curriculum_max_probes = 5,
     reverse_curriculum_k_start_actions = 16,
+    gold_shard_dir = None,
+    gold_min_len = usize::MAX,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1073,6 +1168,8 @@ pub fn run_gatherer(
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
     reverse_curriculum_k_start_actions: usize,
+    gold_shard_dir: Option<String>,
+    gold_min_len: usize,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1116,6 +1213,7 @@ pub fn run_gatherer(
         reverse_curriculum_max_probes,
         reverse_curriculum_k_start_actions,
     );
+    gatherer.set_gold_banking(gold_shard_dir, gold_min_len);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
@@ -1675,6 +1773,58 @@ mod tests {
             for key in &["height", "width", "num_ancillas", "board",
                          "valid_actions", "edge_visits", "reward"] {
                 assert!(v.get(key).is_some(), "missing key '{key}' in: {line}");
+            }
+        }
+    }
+
+    // ─── gold banking (Phase 2) ──────────────────────────────────────────────
+
+    #[test]
+    fn test_gold_banking_tags_records_and_does_not_panic() {
+        use std::io::BufRead;
+        let tmp = tempfile::tempdir().unwrap();
+        let out = tmp.path().join("out.jsonl").to_str().unwrap().to_string();
+        let gold_dir = tmp.path().join("gold");
+        let gold_dir_str = gold_dir.to_str().unwrap().to_string();
+
+        let mut g = Gatherer::new(
+            1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0,
+            None, Some(1.0), None,
+            None,                            // max_action_multiplier (default 1.2)
+            Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
+            None,                            // resignation_log_dir
+            None,                            // floor_keep_fraction
+            None,                            // her_reward_margin
+        );
+        // gold_min_len = 1 → any win with score>0 qualifies for banking.
+        g.set_gold_banking(Some(gold_dir_str.clone()), 1);
+
+        let mut env = TilersEnvInner::new(3, 3, 1);
+        env.set_seed(Some(99));
+        env.random_start(1, false);
+
+        let client = TrivialTilersIpcClient {};
+        let mut rng = StdRng::seed_from_u64(0);
+        // Must not panic regardless of whether the trivial client happens to win.
+        g.gather(&env, &client, 1.4, &mut rng);
+
+        // If any gold file/records were written, every record MUST carry gold:true
+        // and the normal training keys. (Trivial client may not win → no gold; the
+        // assertion is only over records that were actually banked.)
+        let gold_files: Vec<_> = std::fs::read_dir(&gold_dir)
+            .map(|rd| rd.filter_map(|e| e.ok()).map(|e| e.path()).collect())
+            .unwrap_or_default();
+        for path in &gold_files {
+            let file = std::fs::File::open(path).unwrap();
+            for line in std::io::BufReader::new(file).lines().filter_map(|l| l.ok()) {
+                if line.trim().is_empty() { continue; }
+                let v: serde_json::Value = serde_json::from_str(&line).expect("invalid gold JSON");
+                assert_eq!(v.get("gold").and_then(|x| x.as_bool()), Some(true),
+                           "gold record missing gold:true → {line}");
+                for key in &["height", "width", "num_ancillas", "board",
+                             "valid_actions", "edge_visits", "reward"] {
+                    assert!(v.get(key).is_some(), "gold record missing key '{key}' in: {line}");
+                }
             }
         }
     }
