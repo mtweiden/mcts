@@ -444,6 +444,52 @@ impl Gatherer {
         (achieved.min(cusp) as f32) / (cusp as f32) - 1.0
     }
 
+    /// Factor-level progress against the pristine start S0 (Axis A2). A completed
+    /// objective is REMOVED from the live queue, so the final env alone cannot
+    /// report total/merged factors — exactly like HER (hindsight.rs), we diff S0's
+    /// objectives against the final env by `exec.id`: a PP still pending contributes
+    /// its merged-factor count; a PP gone from the queue is fully merged. Counts
+    /// PauliProducts only (primitives/barriers carry no factors). Returns
+    /// (merged_factors, total_factors).
+    fn factor_progress(s0: &Environment, final_env: &Environment) -> (usize, usize) {
+        // exec.id -> merged-factor count for PPs still pending in the final env.
+        let pending: HashMap<u64, usize> = final_env
+            .objective_queue
+            .objectives_iter()
+            .filter_map(|o| o.as_pauli_product())
+            .map(|pp| (pp.exec.id, pp.exec.merged.len()))
+            .collect();
+        let mut merged = 0usize;
+        let mut total = 0usize;
+        for o in s0.objective_queue.objectives_iter() {
+            if let Some(pp) = o.as_pauli_product() {
+                let w = pp.factors.len();
+                total += w;
+                // Present in final → partially merged; absent → fully completed.
+                merged += pending.get(&pp.exec.id).copied().unwrap_or(w);
+            }
+        }
+        (merged, total)
+    }
+
+    /// Factor-level cusp reward (Axis A2): grade `merged` factors against the cusp
+    /// goal's proportional factor budget = total * min(num_obj, frontier+margin) /
+    /// num_obj. The cusp stays in OBJECTIVE units (env selection unchanged) but the
+    /// grade is in FACTOR units (dense partial credit). Proportional budget assumes
+    /// ~uniform objective weight (true here: objectives are almost all weight-2);
+    /// a wide objective only shifts the zero-point slightly, never the gradient
+    /// direction. Capping at the budget keeps far-past-cusp envs informative.
+    /// Returns a value in [-1, 0]; reaching the cusp budget → 0. Pure → unit-tested.
+    fn cusp_factor_reward(merged: usize, total: usize, num_objectives: usize,
+                          frontier: usize, margin: usize) -> f32 {
+        if total == 0 || num_objectives == 0 {
+            return -1.0;
+        }
+        let cusp_objs = num_objectives.min(frontier + margin).max(1);
+        let budget = (total as f32 * cusp_objs as f32 / num_objectives as f32).max(1.0);
+        (merged as f32).min(budget) / budget - 1.0
+    }
+
     /// Next tail length to probe in the reverse-curriculum edge search, given
     /// the current `k` and bracket [`lo`, `hi`] (lo = largest solved, hi =
     /// smallest failed, or `len+1` if nothing has failed yet). Phase 1: while no
@@ -803,21 +849,29 @@ impl Gatherer {
                 // training targets collapse to trivial goals and the agent gets
                 // NO gradient to complete more (the measured plateau root cause:
                 // 0% done on >=4-objective envs, mean effective target 1.4). For
-                // hard envs (num_objectives > cusp_frontier) we instead grade the
-                // partial against the CUSP goal = min(num_obj, frontier + margin)
-                // — a target just past the agent's current reach. Capping at the
-                // cusp (NOT the full goal) keeps far-past-cusp envs informative
-                // (2/4 = -0.5) instead of floor-collapsing (1/20 = -0.95, which
-                // is indistinguishable from a zero-progress floor). Reaching the
-                // cusp → 0. HER is kept for the easy (<= frontier) band where it
-                // helps. `cusp` reward_kind tags these for analysis.
+                // hard envs (num_objectives > cusp_frontier) we grade the partial
+                // against the CUSP goal = min(num_obj, frontier + margin), a target
+                // just past the agent's current reach, capped so far-past-cusp envs
+                // stay informative instead of floor-collapsing. Reaching the cusp
+                // → 0. HER is kept for the easy (<= frontier) band.
+                //
+                // Grade at the FACTOR level, not the objective level: an objective
+                // (PauliProduct) is a bag of factors, and merging some-but-not-all
+                // is real progress that objective-count throws away (it floors an
+                // episode that merged 15 factors but finished 0 objectives). Factor
+                // grading is far denser and gives partial credit WITHIN an
+                // objective. Completed objectives vanish from the live queue, so —
+                // like HER — factor_progress diffs S0 (`game`) against the final env
+                // by exec.id. `achieved` (objective count) is still the record tag
+                // for metric continuity; only the reward VALUE is factor-based.
                 let start_objs = game.num_objectives();
                 let achieved = start_objs.saturating_sub(tilers_env.inner.num_objectives());
-                if achieved == 0 {
+                let (merged, total) = Self::factor_progress(&game, &tilers_env.inner);
+                if merged == 0 {
                     (-1.0, "floor", 0)
                 } else {
-                    let r = Self::cusp_partial_reward(
-                        achieved, start_objs, self.cusp_frontier, self.cusp_margin);
+                    let r = Self::cusp_factor_reward(
+                        merged, total, start_objs, self.cusp_frontier, self.cusp_margin);
                     (r, "cusp", achieved)
                 }
             } else {
@@ -1637,6 +1691,26 @@ mod tests {
         assert!((f(3, 3) - 0.0).abs() < 1e-6);
         // reward is always in [-1, 0].
         for n in 1..25 { for a in 0..=n { let r = f(a, n); assert!((-1.0..=0.0).contains(&r)); } }
+    }
+
+    #[test]
+    fn test_cusp_factor_reward() {
+        let f = |m, t, n| Gatherer::cusp_factor_reward(m, t, n, 2, 2); // cusp = min(n, 4) objs
+        // 6-obj / 12-factor env: budget = 12 * 4/6 = 8 factors.
+        assert!((f(4, 12, 6) - (-0.5)).abs() < 1e-6);   // 4/8
+        assert!((f(2, 12, 6) - (-0.75)).abs() < 1e-6);  // 2/8
+        assert!((f(8, 12, 6) - 0.0).abs() < 1e-6);      // reached budget → 0
+        assert!((f(10, 12, 6) - 0.0).abs() < 1e-6);     // beyond budget, capped → 0
+        // very hard 20-obj / 40-factor env: budget = 40 * 4/20 = 8, still informative.
+        assert!((f(4, 40, 20) - (-0.5)).abs() < 1e-6);  // NOT ~-0.9 floor
+        // small env (num_obj <= cusp): budget = full total, grade whole env.
+        assert!((f(3, 6, 3) - (-0.5)).abs() < 1e-6);    // budget = 6*3/3 = 6, 3/6
+        // degenerate: no factors → floor.
+        assert!((f(0, 0, 5) - (-1.0)).abs() < 1e-6);
+        // reward always in [-1, 0].
+        for n in 1..12 { for t in 1..30 { for m in 0..=t {
+            let r = f(m, t, n); assert!((-1.0..=0.0).contains(&r));
+        }}}
     }
 
     #[test]
