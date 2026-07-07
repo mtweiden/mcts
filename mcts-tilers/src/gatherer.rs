@@ -148,12 +148,20 @@ pub struct Gatherer {
     /// For a fraction of HARD envs (num_objectives > demo_min_objectives) the
     /// gatherer replays the heuristic solver's plan and writes one demo training
     /// record per plan step (one-hot policy = the heuristic action, reward 0.0,
-    /// reward_kind "demo", is_demo=true) INSTEAD of running a self-play episode.
+    /// reward_kind "demo", is_demo=true) IN ADDITION to the agent's own failed
+    /// episode records (failure-triggered; see gather()).
     /// The trainer applies these under a Q-filter so the agent only imitates the
     /// heuristic where it currently underestimates the demo state (never capped
     /// at the heuristic's level). 0.0 = OFF (no demos; default).
     demo_fraction: f32,
     demo_min_objectives: usize,
+    /// Keep-probability per demo STATE. Each demo emits one record per plan
+    /// step, and hard-env plans run 35 to hundreds of actions — unthrottled,
+    /// demos flooded 64% of the corpus (measured 2026-07-07), drowning the
+    /// agent's own MCTS-derived policy targets. Each state-action pair is
+    /// independent supervision, so random subsampling is legitimate and keeps
+    /// coverage of deep states (unlike truncation). 1.0 = keep all.
+    demo_subsample: f32,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -240,12 +248,14 @@ impl Gatherer {
             cusp_margin: 2,
             // Q-filtered BC demos OFF by default (fraction 0.0 → never replays).
             demo_fraction: 0.0,
+            demo_subsample: 1.0,
             demo_min_objectives: 2,
         }
     }
 
-    pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize) {
+    pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize, demo_subsample: f32) {
         self.demo_fraction = demo_fraction.clamp(0.0, 1.0);
+        self.demo_subsample = demo_subsample.clamp(0.0, 1.0);
         self.demo_min_objectives = demo_min_objectives;
     }
 
@@ -489,7 +499,7 @@ impl Gatherer {
     /// in which the heuristic chose that action). Returns the same (solution_depth,
     /// reference_depth, done) tuple shape `gather()` expects; only aggregate stats
     /// consume it, so (0.0, 0.0, false) is fine.
-    fn write_demo_episode(&self, game: &Environment, _rng: &mut impl Rng) -> (f32, f32, bool) {
+    fn write_demo_episode(&self, game: &Environment, rng: &mut impl Rng) -> (f32, f32, bool) {
         // NOTE: this re-solves `game` with the heuristic. The caller
         // (run_episode_from via gather) already solved `game` for the episode
         // reference, so this is a DUPLICATE solve. It only runs on the small
@@ -541,7 +551,10 @@ impl Gatherer {
                 .map(|&va| rl::encode(&tenv.inner, va).expect("valid_actions ids always encode") as Action)
                 .collect();
 
-            if valid_actions.contains(&encoded) {
+            // Subsample: keep each demo state with prob demo_subsample. Every
+            // state-action pair is independent supervision, so a random subset
+            // is unbiased and covers deep states (truncation wouldn't).
+            if valid_actions.contains(&encoded) && rng.random::<f32>() < self.demo_subsample {
                 let board_json = Self::serialize_board(&board);
                 let valid_actions_json =
                     Value::Array(valid_actions.iter().map(|&x| Value::from(x)).collect());
@@ -1380,6 +1393,7 @@ use pyo3::exceptions::PyRuntimeError;
     cusp_margin = 2,
     demo_fraction = 0.0,
     demo_min_objectives = 2,
+    demo_subsample = 1.0,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1422,6 +1436,7 @@ pub fn run_gatherer(
     cusp_margin: usize,
     demo_fraction: f32,
     demo_min_objectives: usize,
+    demo_subsample: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1468,7 +1483,7 @@ pub fn run_gatherer(
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
-    gatherer.set_demo(demo_fraction, demo_min_objectives);
+    gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
