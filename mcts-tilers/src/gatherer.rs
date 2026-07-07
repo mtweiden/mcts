@@ -134,6 +134,9 @@ pub struct Gatherer {
     /// K-window and compound instead of aging out. None = banking OFF.
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
+    /// Minimum episode score (margin over the heuristic) to bank as gold.
+    /// Tightened from >0 so only REAL beats compound, not tie-level wins.
+    gold_min_reward: f32,
     /// Cusp reward (Axis A2): when true, HARD envs (num_objectives >
     /// cusp_frontier) grade partials against the cusp goal
     /// min(num_obj, cusp_frontier + cusp_margin) instead of HER relabeling
@@ -221,6 +224,7 @@ impl Gatherer {
             // gold_min_len = usize::MAX means nothing qualifies even if a dir slips in).
             gold_shard_dir: None,
             gold_min_len: usize::MAX,
+            gold_min_reward: 0.0,
             cusp_reward: false,
             cusp_frontier: 2,
             cusp_margin: 2,
@@ -233,8 +237,9 @@ impl Gatherer {
         self.cusp_margin = margin.max(1);
     }
 
-    pub fn set_gold_banking(&mut self, gold_shard_dir: Option<String>, gold_min_len: usize) {
+    pub fn set_gold_banking(&mut self, gold_shard_dir: Option<String>, gold_min_len: usize, gold_min_reward: f32) {
         self.gold_shard_dir = gold_shard_dir;
+        self.gold_min_reward = gold_min_reward;
         self.gold_min_len = gold_min_len;
     }
 
@@ -1127,16 +1132,27 @@ impl Gatherer {
         }
         file.flush().expect("Failed to flush file");
 
-        // Expert-iteration gold banking (Phase 2). If this episode is a genuine
-        // HARD win — finished the goal (`done`), beat the heuristic (`score > 0`),
-        // and the heuristic action budget cleared the hardness floor
-        // (`reference_action_count >= gold_min_len`) — ALSO append the same
-        // per-record training objects (with an added `"gold": true` tag) to a
-        // persistent gold shard so train.py can pin them into every training set,
-        // never aging them out of the K-window. This is IN ADDITION to the normal
-        // output_path write above; the normal corpus is unchanged.
+        // Expert-iteration gold banking (Phase 2). Bank an episode only if it is a
+        // genuine HIGH-QUALITY hard win, then pin it into every training set (with
+        // a `"gold": true` tag) so it never ages out of the K-window. Criteria
+        // (tightened 2026-07-07 after finding the bank was 83% reverse, tie-level
+        // junk that compounded the wrong behavior):
+        //   - `done`: finished the full goal;
+        //   - `!is_reverse`: FULL-env win only — reverse-curriculum wins are on
+        //     scaffolded near-goal sub-problems (they replay the heuristic prefix,
+        //     so they only ~tie it: measured mean margin +0.055 vs +0.315 for
+        //     non-reverse) and must not pollute the compounding bank;
+        //   - `score >= gold_min_reward`: beat the heuristic by a REAL margin, not
+        //     a tie or a sliver (was `> 0.0`, which banked tie-level wins);
+        //   - `reference_action_count >= gold_min_len`: hardness floor.
+        // IN ADDITION to the normal output_path write above; the normal corpus is
+        // unchanged.
         if let Some(gold_dir) = &self.gold_shard_dir {
-            if o.done && o.score > 0.0 && o.reference_action_count >= self.gold_min_len {
+            if o.done
+                && !is_reverse
+                && o.score >= self.gold_min_reward
+                && o.reference_action_count >= self.gold_min_len
+            {
                 if let Err(e) = std::fs::create_dir_all(gold_dir) {
                     eprintln!(
                         "[Gatherer {}] failed to create gold_shard_dir {}: {}",
@@ -1251,6 +1267,7 @@ use pyo3::exceptions::PyRuntimeError;
     reverse_curriculum_prob = 1.0,
     gold_shard_dir = None,
     gold_min_len = usize::MAX,
+    gold_min_reward = 0.0,
     cusp_reward = false,
     cusp_frontier = 2,
     cusp_margin = 2,
@@ -1290,6 +1307,7 @@ pub fn run_gatherer(
     reverse_curriculum_prob: f32,
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
+    gold_min_reward: f32,
     cusp_reward: bool,
     cusp_frontier: usize,
     cusp_margin: usize,
@@ -1337,7 +1355,7 @@ pub fn run_gatherer(
         reverse_curriculum_k_start_actions,
         reverse_curriculum_prob,
     );
-    gatherer.set_gold_banking(gold_shard_dir, gold_min_len);
+    gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
 
     let mut rng = if let Some(s) = seed {
