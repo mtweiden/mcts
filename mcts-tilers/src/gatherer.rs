@@ -130,6 +130,13 @@ pub struct Gatherer {
     /// K-window and compound instead of aging out. None = banking OFF.
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
+    /// Cusp reward (Axis A2): when true, HARD envs (num_objectives >
+    /// cusp_frontier) grade partials against the cusp goal
+    /// min(num_obj, cusp_frontier + cusp_margin) instead of HER relabeling
+    /// down to the achieved subset. See the reward block in run_episode_from.
+    cusp_reward: bool,
+    cusp_frontier: usize,
+    cusp_margin: usize,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -209,7 +216,16 @@ impl Gatherer {
             // gold_min_len = usize::MAX means nothing qualifies even if a dir slips in).
             gold_shard_dir: None,
             gold_min_len: usize::MAX,
+            cusp_reward: false,
+            cusp_frontier: 2,
+            cusp_margin: 2,
         }
+    }
+
+    pub fn set_cusp_reward(&mut self, enabled: bool, frontier: usize, margin: usize) {
+        self.cusp_reward = enabled;
+        self.cusp_frontier = frontier;
+        self.cusp_margin = margin.max(1);
     }
 
     pub fn set_gold_banking(&mut self, gold_shard_dir: Option<String>, gold_min_len: usize) {
@@ -412,6 +428,16 @@ impl Gatherer {
     }
 
     /// Reverse-curriculum bounded climb: start near the heuristic terminal
+    /// Cusp partial reward (Axis A2): grade `achieved` objectives against the
+    /// cusp goal `min(num_objectives, frontier + margin)` (a target just past
+    /// the agent's reach), in [-1, 0]. Capping at the cusp — NOT the full goal —
+    /// keeps far-past-cusp envs informative (1/20 would floor-collapse to -0.95,
+    /// but 1/4 = -0.75); reaching the cusp scores 0. Pure → unit-tested.
+    fn cusp_partial_reward(achieved: usize, num_objectives: usize, frontier: usize, margin: usize) -> f32 {
+        let cusp = num_objectives.min(frontier + margin).max(1);
+        (achieved.min(cusp) as f32) / (cusp as f32) - 1.0
+    }
+
     /// Next tail length to probe in the reverse-curriculum edge search, given
     /// the current `k` and bracket [`lo`, `hi`] (lo = largest solved, hi =
     /// smallest failed, or `len+1` if nothing has failed yet). Phase 1: while no
@@ -758,6 +784,30 @@ impl Gatherer {
                     // frac ∈ (0,1): completed none → -1, all-but-one → ~0.
                     let frac = achieved as f32 / start_objs as f32;
                     (frac - 1.0, "her", achieved)
+                }
+            } else if self.cusp_reward && game.num_objectives() > self.cusp_frontier {
+                // CUSP reward (Axis A2). Vanilla HER relabels a HARD env DOWN to
+                // exactly the (usually 1-2) objectives the agent already executed
+                // and scores it as an efficient success — so ~95% of effective
+                // training targets collapse to trivial goals and the agent gets
+                // NO gradient to complete more (the measured plateau root cause:
+                // 0% done on >=4-objective envs, mean effective target 1.4). For
+                // hard envs (num_objectives > cusp_frontier) we instead grade the
+                // partial against the CUSP goal = min(num_obj, frontier + margin)
+                // — a target just past the agent's current reach. Capping at the
+                // cusp (NOT the full goal) keeps far-past-cusp envs informative
+                // (2/4 = -0.5) instead of floor-collapsing (1/20 = -0.95, which
+                // is indistinguishable from a zero-progress floor). Reaching the
+                // cusp → 0. HER is kept for the easy (<= frontier) band where it
+                // helps. `cusp` reward_kind tags these for analysis.
+                let start_objs = game.num_objectives();
+                let achieved = start_objs.saturating_sub(tilers_env.inner.num_objectives());
+                if achieved == 0 {
+                    (-1.0, "floor", 0)
+                } else {
+                    let r = Self::cusp_partial_reward(
+                        achieved, start_objs, self.cusp_frontier, self.cusp_margin);
+                    (r, "cusp", achieved)
                 }
             } else {
                 match game.achieved_goal_env(&tilers_env.inner) {
@@ -1135,6 +1185,9 @@ use pyo3::exceptions::PyRuntimeError;
     reverse_curriculum_k_start_actions = 16,
     gold_shard_dir = None,
     gold_min_len = usize::MAX,
+    cusp_reward = false,
+    cusp_frontier = 2,
+    cusp_margin = 2,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1170,6 +1223,9 @@ pub fn run_gatherer(
     reverse_curriculum_k_start_actions: usize,
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
+    cusp_reward: bool,
+    cusp_frontier: usize,
+    cusp_margin: usize,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1214,6 +1270,7 @@ pub fn run_gatherer(
         reverse_curriculum_k_start_actions,
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len);
+    gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
@@ -1549,6 +1606,23 @@ mod tests {
             full.num_objectives() <= s0.num_objectives(),
             "full replay should not have more objectives than S0",
         );
+    }
+
+    #[test]
+    fn test_cusp_partial_reward() {
+        let f = |a, n| Gatherer::cusp_partial_reward(a, n, 2, 2); // cusp = min(n, 4)
+        // hard env (6 obj): graded against cusp=4, NOT floor-collapsed.
+        assert!((f(1, 6) - (-0.75)).abs() < 1e-6);
+        assert!((f(2, 6) - (-0.50)).abs() < 1e-6);
+        assert!((f(4, 6) - 0.0).abs() < 1e-6);      // reached the cusp → 0
+        assert!((f(5, 6) - 0.0).abs() < 1e-6);      // beyond cusp, capped → 0
+        // very hard env (20 obj): still informative, not ~-0.95 floor.
+        assert!((f(1, 20) - (-0.75)).abs() < 1e-6);
+        // small env (3 obj): cusp shrinks to the env size.
+        assert!((f(2, 3) - (-1.0 / 3.0)).abs() < 1e-6);
+        assert!((f(3, 3) - 0.0).abs() < 1e-6);
+        // reward is always in [-1, 0].
+        for n in 1..25 { for a in 0..=n { let r = f(a, n); assert!((-1.0..=0.0).contains(&r)); } }
     }
 
     #[test]
