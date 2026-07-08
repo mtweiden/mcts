@@ -148,14 +148,14 @@ impl Evaluator {
         &self,
         env: &Environment,
         client: &dyn InferenceClient<TilersEnv>,
-    ) -> (Vec<Action>, Option<f32>, i64, Option<f32>, bool) {
+    ) -> (Vec<Action>, Option<f32>, i64, Option<f32>, bool, Option<(usize, usize)>) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
         let mut tilers_env = TilersEnv::new(env.clone(), LOOKAHEAD);
         tilers_env.inner.set_cultivation_time(10);
 
         let reference_depth = match self.solve_with_heuristic(&tilers_env.inner) {
             Some(d) => d,
-            None => return (Vec::new(), None, 0, None, true),
+            None => return (Vec::new(), None, 0, None, true, None),
         };
         let temperature = self.reward_saturation_temperature;
 
@@ -242,9 +242,9 @@ impl Evaluator {
         // detects the small per-iteration gains that binary done()/depth and
         // integer achieved-count comparisons are blind to.
         let temperature = self.reward_saturation_temperature;
-        let (achieved_objectives, eval_reward): (i64, Option<f32>) = if done {
+        let (achieved_objectives, eval_reward, factor_prog): (i64, Option<f32>, Option<(usize, usize)>) = if done {
             let ratio = (reference_depth - agent_depth) / (reference_depth + 1e-6);
-            (env.num_objectives() as i64, Some((ratio / temperature).tanh()))
+            (env.num_objectives() as i64, Some((ratio / temperature).tanh()), None)
         } else {
             // Unfinished: grade by FACTOR-level progress against the full goal
             // (merged / total factors), NOT HER's objective-collapse relabel. HER
@@ -263,13 +263,13 @@ impl Evaluator {
                 - tilers_env.inner.num_objectives() as i64)
                 .max(0);
             if merged == 0 || total == 0 {
-                (achieved, Some(-1.0))
+                (achieved, Some(-1.0), Some((merged, total)))
             } else {
-                (achieved, Some(merged as f32 / total as f32 - 1.0))
+                (achieved, Some(merged as f32 / total as f32 - 1.0), Some((merged, total)))
             }
         };
 
-        (actions_taken, solution_depth, achieved_objectives, eval_reward, false)
+        (actions_taken, solution_depth, achieved_objectives, eval_reward, false, factor_prog)
     }
 
     /// Open the arena (which Python has already populated with live handlers)
@@ -313,7 +313,7 @@ impl Evaluator {
                 }
             };
 
-            let (actions, solution_depth, achieved_objectives, eval_reward, heuristic_unsolvable) =
+            let (actions, solution_depth, achieved_objectives, eval_reward, heuristic_unsolvable, factor_prog) =
                 self.evaluate_single(&env, client);
 
             // Unsolvable envs (heuristic baseline can't be computed) get a
@@ -357,11 +357,18 @@ impl Evaluator {
                         agent_id, holdout.environment_id, holdout.difficulty_bin,
                         holdout.action_count, holdout.num_objectives, d
                     ),
-                    None => println!(
-                        "[Evaluator] Agent {} | Env {} (bin {}, {} actions, {} obj) | did not finish.",
-                        agent_id, holdout.environment_id, holdout.difficulty_bin,
-                        holdout.action_count, holdout.num_objectives
-                    ),
+                    None => {
+                        // Failure case: show factor-level progress — the quantity
+                        // the new eval_reward grades — so eval logs reveal HOW far
+                        // the agent got, not just that it failed.
+                        let (m, t) = factor_prog.unwrap_or((0, 0));
+                        println!(
+                            "[Evaluator] Agent {} | Env {} (bin {}, {} actions, {} obj) | did not finish; factors merged {}/{} ({:.0}%).",
+                            agent_id, holdout.environment_id, holdout.difficulty_bin,
+                            holdout.action_count, holdout.num_objectives,
+                            m, t, if t > 0 { 100.0 * m as f32 / t as f32 } else { 0.0 }
+                        )
+                    }
                 }
             }
         }
