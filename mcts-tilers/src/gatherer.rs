@@ -752,7 +752,11 @@ impl Gatherer {
         let max_actions = if let Some(max) = self.max_actions {
             max
         } else {
-            (reference_action_count as f32 * self.max_action_multiplier) as usize
+            // ceil + 2 slack actions: a fixed multiplier alone rounds to zero
+            // margin on short-reference envs (ref=2 at 1.0x-1.2x -> exactly 2
+            // actions), which forbids ever completing sub-optimally. Resignation
+            // bounds the flail cost on genuinely stuck episodes.
+            (reference_action_count as f32 * self.max_action_multiplier).ceil() as usize + 2
         };
 
         // Resignation bookkeeping. resign_allowed is decided once per

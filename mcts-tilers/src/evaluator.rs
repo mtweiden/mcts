@@ -176,7 +176,7 @@ impl Evaluator {
         let solver = Solver::new();
         let mut tmp_env = env.clone();
         let max_actions = match solver.solve(&mut tmp_env, false) {
-            Ok(sol) => (sol.len() as f32 * self.max_action_multiplier) as usize,
+            Ok(sol) => (sol.len() as f32 * self.max_action_multiplier).ceil() as usize,
             Err(_) => 1000,
         };
 
