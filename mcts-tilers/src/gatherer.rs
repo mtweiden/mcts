@@ -1044,6 +1044,28 @@ impl Gatherer {
                 score,
                 solution_depth < reference_depth,
             );
+        } else {
+            // Unfinished printout: mirror the evaluator's failure line — show the
+            // factor-level completion fraction (the quantity the cusp reward
+            // grades) so the gather log reveals HOW far each failed episode got,
+            // not just that it fell short. `game` is the episode start (S0, or
+            // S_k for reverse-curriculum episodes), so the fraction is relative
+            // to the actual sub-problem the agent was handed.
+            let (fm, ft) = game.factor_progress(&tilers_env.inner);
+            println!(
+                "[Gatherer {}] UNFINISHED Env(h={}, w={}, nb={}, no={}) | factors {}/{} ({:.0}%) | score={:.3} kind={}{}",
+                self.gather_id,
+                game.height,
+                game.width,
+                game.num_ancillas(),
+                game.num_objectives(),
+                fm,
+                ft,
+                if ft > 0 { 100.0 * fm as f32 / ft as f32 } else { 0.0 },
+                score,
+                reward_kind,
+                if resigned { " (resigned)" } else { "" },
+            );
         }
 
         EpisodeOutcome {
