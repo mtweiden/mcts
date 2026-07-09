@@ -121,6 +121,14 @@ pub struct Evaluator {
     /// the historical default; raising it lets a sub-heuristic policy finish
     /// (earning a graded reward) instead of being truncated to the -1 floor.
     max_action_multiplier: f32,
+    /// Root prior temperature for eval search: P'(c) ∝ P(c)^(1/T) at the
+    /// root only (mcts-core root_softmax_temp). T < 1 SHARPENS. 0.6 rescued
+    /// 14/24 -> 22/24 of a flat-prior candidate's eval failures (2026-07-09
+    /// probe) — candidates trained on honest post-fix targets carry flatter
+    /// priors at contested states than the stale-sharp incumbent, and greedy
+    /// PUCT needs concentration at decision points. Eval-only: gather keeps
+    /// Wu's 1.03 flattening so training targets stay exploratory.
+    root_softmax_temp: f32,
 }
 
 impl Evaluator {
@@ -129,12 +137,14 @@ impl Evaluator {
         c_puct: f32,
         reward_saturation_temperature: f32,
         max_action_multiplier: f32,
+        root_softmax_temp: f32,
     ) -> Self {
         Self {
             mcts_steps,
             c_puct,
             reward_saturation_temperature,
             max_action_multiplier,
+            root_softmax_temp,
         }
     }
 
@@ -164,6 +174,7 @@ impl Evaluator {
         client: &dyn InferenceClient<TilersEnv>,
     ) -> (Vec<Action>, Option<f32>, i64, Option<f32>, bool, Option<(usize, usize)>) {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(8);
+        mcts.root_softmax_temp = self.root_softmax_temp;
         let mut tilers_env = TilersEnv::new(env.clone(), LOOKAHEAD);
         tilers_env.inner.set_cultivation_time(10);
 
@@ -467,7 +478,7 @@ mod tests {
 
     #[test]
     fn test_new_stores_params() {
-        let e = Evaluator::new(50, 1.5, 0.4, 1.2);
+        let e = Evaluator::new(50, 1.5, 0.4, 1.2, 1.0);
         assert_eq!(e.mcts_steps, 50);
         assert!((e.c_puct - 1.5).abs() < 1e-6);
         assert!((e.reward_saturation_temperature - 0.4).abs() < 1e-6);
@@ -477,7 +488,7 @@ mod tests {
 
     #[test]
     fn test_solve_with_heuristic_nonnegative() {
-        let e = Evaluator::new(5, 1.4, 1.0, 1.2);
+        let e = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0);
         let env = small_env();
         let depth = e.solve_with_heuristic(&env)
             .expect("small_env should be solvable by the heuristic");
@@ -499,7 +510,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2);
+        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0);
         let client = TrivialTilersIpcClient {};
         evaluator.evaluate_agent_with_client(1, &[holdout], &client, &conn);
 
@@ -517,7 +528,7 @@ mod tests {
         let env = small_env();
         let holdout = make_holdout(42, &env);
 
-        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2);
+        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0);
         let client = TrivialTilersIpcClient {};
         evaluator.evaluate_agent_with_client(99, &[holdout], &client, &conn);
 
@@ -585,6 +596,7 @@ use pyo3::exceptions::PyRuntimeError;
     num_nodes = 1,
     max_action_multiplier = 1.2,
     min_difficulty_bin = None,
+    root_softmax_temp = 1.0,
 ))]
 pub fn run_evaluator(
     agent_id: i64,
@@ -599,12 +611,14 @@ pub fn run_evaluator(
     num_nodes: i64,
     max_action_multiplier: f32,
     min_difficulty_bin: Option<i64>,
+    root_softmax_temp: f32,
 ) -> PyResult<()> {
     let evaluator = Evaluator::new(
         mcts_steps,
         c_puct,
         reward_saturation_temperature,
         max_action_multiplier,
+        root_softmax_temp,
     );
 
     let conn = Connection::open(&db_path)

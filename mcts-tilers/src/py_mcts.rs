@@ -174,9 +174,14 @@ pub struct PyMcts {
 #[pymethods]
 impl PyMcts {
     #[new]
-    #[pyo3(signature = (batch_size = 8))]
-    fn new(batch_size: usize) -> Self {
-        let mcts = MCTS::new(batch_size);
+    #[pyo3(signature = (batch_size = 8, root_softmax_temp = 1.03))]
+    fn new(batch_size: usize, root_softmax_temp: f32) -> Self {
+        let mut mcts = MCTS::new(batch_size);
+        // T < 1 SHARPENS the root prior (P^(1/T), renormalised); T > 1
+        // flattens. Root-only by design: advance_root makes every decision
+        // point the root, so choices are sharpened while in-tree lookahead
+        // keeps honest priors.
+        mcts.root_softmax_temp = root_softmax_temp;
         PyMcts { inner: mcts }
     }
 

@@ -59,6 +59,7 @@ fn main() {
         c_puct,
         reward_saturation_temperature,
         max_action_multiplier,
+        1.0,
     );
 
     evaluator
