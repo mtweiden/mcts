@@ -46,14 +46,25 @@ pub struct HoldoutEnvironment {
 /// cost (max_actions in evaluate_single scales with the solver solution length).
 fn load_holdout_environments(
     conn: &Connection,
+    min_difficulty_bin: Option<i64>,
     max_difficulty_bin: Option<i64>,
     node_idx: i64,
     num_nodes: i64,
 ) -> Result<Vec<HoldoutEnvironment>, rusqlite::Error> {
-    let max_filter = if max_difficulty_bin.is_some() {
-        "WHERE difficulty_bin <= ?"
+    // Optional [min, max] difficulty window: the orchestrator's frontier
+    // window (frontier bin +/- 1) skips both the mastered easy bins (all
+    // draws) and the deep bins (slow episodes, both-fail) for eval speed.
+    let mut clauses: Vec<&str> = Vec::new();
+    if min_difficulty_bin.is_some() {
+        clauses.push("difficulty_bin >= ?");
+    }
+    if max_difficulty_bin.is_some() {
+        clauses.push("difficulty_bin <= ?");
+    }
+    let max_filter = if clauses.is_empty() {
+        String::new()
     } else {
-        ""
+        format!("WHERE {}", clauses.join(" AND "))
     };
     // Slice via ROW_NUMBER so every node gets a balanced mix across the
     // difficulty bins. (rn - 1) % num_nodes = node_idx is the round-robin.
@@ -72,6 +83,9 @@ fn load_holdout_environments(
     );
 
     let mut bound: Vec<i64> = Vec::new();
+    if let Some(m) = min_difficulty_bin {
+        bound.push(m);
+    }
     if let Some(m) = max_difficulty_bin {
         bound.push(m);
     }
@@ -380,6 +394,7 @@ impl Evaluator {
         db_path: &str,
         arena_tag: &str,
         num_handlers: usize,
+        min_difficulty_bin: Option<i64>,
         max_difficulty_bin: Option<i64>,
         node_idx: i64,
         num_nodes: i64,
@@ -389,7 +404,7 @@ impl Evaluator {
             .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
 
         let environments = load_holdout_environments(
-            &conn, max_difficulty_bin, node_idx, num_nodes,
+            &conn, min_difficulty_bin, max_difficulty_bin, node_idx, num_nodes,
         ).map_err(|e| format!("Failed to query environments: {e}"))?;
 
         let arena_name = format!("mcts_{}_{}_{}", arena_tag, NUM_SLOTS, num_handlers);
@@ -569,6 +584,7 @@ use pyo3::exceptions::PyRuntimeError;
     node_idx = 0,
     num_nodes = 1,
     max_action_multiplier = 1.2,
+    min_difficulty_bin = None,
 ))]
 pub fn run_evaluator(
     agent_id: i64,
@@ -582,6 +598,7 @@ pub fn run_evaluator(
     node_idx: i64,
     num_nodes: i64,
     max_action_multiplier: f32,
+    min_difficulty_bin: Option<i64>,
 ) -> PyResult<()> {
     let evaluator = Evaluator::new(
         mcts_steps,
@@ -596,12 +613,14 @@ pub fn run_evaluator(
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to set PRAGMAs: {e}")))?;
 
     let environments = load_holdout_environments(
-        &conn, max_difficulty_bin, node_idx, num_nodes,
+        &conn, min_difficulty_bin, max_difficulty_bin, node_idx, num_nodes,
     ).map_err(|e| PyRuntimeError::new_err(format!("Failed to query environments: {e}")))?;
 
-    let max_filter_msg = match max_difficulty_bin {
-        Some(m) => format!(" (difficulty_bin <= {})", m),
-        None => String::new(),
+    let max_filter_msg = match (min_difficulty_bin, max_difficulty_bin) {
+        (Some(lo), Some(hi)) => format!(" (difficulty_bin in [{}, {}])", lo, hi),
+        (Some(lo), None) => format!(" (difficulty_bin >= {})", lo),
+        (None, Some(hi)) => format!(" (difficulty_bin <= {})", hi),
+        (None, None) => String::new(),
     };
     let slice_msg = if num_nodes > 1 {
         format!(" [node {}/{} round-robin slice]", node_idx, num_nodes)

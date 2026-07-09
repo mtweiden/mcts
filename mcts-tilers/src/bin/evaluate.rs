@@ -64,7 +64,7 @@ fn main() {
     evaluator
         .evaluate_agent(
             agent_id, &db_path, &arena_tag, num_handlers,
-            max_num_objectives, node_idx, num_nodes,
+            None, max_num_objectives, node_idx, num_nodes,
         )
         .expect("evaluation failed");
 }
