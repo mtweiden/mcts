@@ -185,8 +185,7 @@ impl PyMcts {
         PyMcts { inner: mcts }
     }
 
-    #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, forced_playouts = false,
-                        done_reward_band = false, done_reward_tau = 1.0))]
+    #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, forced_playouts = false))]
     fn run(
         &mut self,
         env: &PyEnvironment,
@@ -194,15 +193,11 @@ impl PyMcts {
         num_steps: usize,
         c_puct: f32,
         forced_playouts: bool,
-        done_reward_band: bool,
-        done_reward_tau: f32,
     ) -> PyResult<MctsNode> {
         let inner: TilersEnvInner = env.to_inner();
-        // Terminal evaluator vs the heuristic solver. Default (band off) is
-        // the historical ternary {beat, tie, lose/unfinished} → {1, 0, −1} —
-        // kept bit-identical so existing probe scripts are unaffected. With
-        // done_reward_band, use the shared banded scorer (reward.rs) so
-        // probes can run at gather/eval fidelity under the new currency.
+        // Terminal evaluator vs the heuristic solver: the historical ternary
+        // {beat, tie, lose/unfinished} -> {1, 0, -1}, kept bit-identical so
+        // probe scripts stay comparable across eras.
         let ref_depth = {
             let mut e = inner.clone();
             let solver = TilersSolver::new();
@@ -214,9 +209,7 @@ impl PyMcts {
                 crate::reward::NOT_DONE_SCORE
             } else {
                 let d = e.inner.depth(true, true) as f32;
-                if done_reward_band {
-                    crate::reward::done_score(ref_depth, d, done_reward_tau, true)
-                } else if d < ref_depth { 1.0 }
+                if d < ref_depth { 1.0 }
                 else if d == ref_depth { 0.0 }
                 else { -1.0 }
             }

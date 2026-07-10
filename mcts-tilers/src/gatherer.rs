@@ -162,12 +162,6 @@ pub struct Gatherer {
     /// independent supervision, so random subsampling is legitimate and keeps
     /// coverage of deep states (unlike truncation). 1.0 = keep all.
     demo_subsample: f32,
-    /// Banded done-reward currency (DONE_REWARD_REMAP.md). false = historical
-    /// margin currency (tanh of depth-margin; tie = 0). See
-    /// set_done_reward_band for semantics.
-    done_reward_band: bool,
-    /// Within-band temperature (τ_done). Only used when done_reward_band.
-    done_reward_tau: f32,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -256,23 +250,7 @@ impl Gatherer {
             demo_fraction: 0.0,
             demo_subsample: 1.0,
             demo_min_objectives: 2,
-            // Banded done-reward OFF by default (DONE_REWARD_REMAP.md).
-            done_reward_band: false,
-            done_reward_tau: 1.0,
         }
-    }
-
-    /// Banded done-reward currency (DONE_REWARD_REMAP.md). When enabled, the
-    /// DONE terminal score (search backups AND the recorded training target)
-    /// becomes 0.5 + 0.5*tanh(ratio/tau) so every completion outranks every
-    /// non-completion; `tau` is the WITHIN-BAND temperature (τ_done, steeper
-    /// than reward_saturation_temperature to preserve the depth-margin
-    /// spread). her/cusp/floor scoring is unchanged; records gain a
-    /// "reward_currency":"band" stamp so the dataset can distinguish fresh
-    /// banded records from old margin-currency ones at load time.
-    pub fn set_done_reward_band(&mut self, enabled: bool, tau: f32) {
-        self.done_reward_band = enabled;
-        self.done_reward_tau = if tau > 0.0 { tau } else { 1.0 };
     }
 
     pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize, demo_subsample: f32) {
@@ -800,16 +778,14 @@ impl Gatherer {
         let mut over_solver_trace: Vec<bool> = Vec::new();
         let mut resigned: bool = false;
 
-        // Shared done-scorer (reward.rs): margin currency by default; banded
-        // when done_reward_band is set. tanh(ratio / temperature) replaces the
-        // previous clip-then-normalize — smooth gradient at all input scales;
-        // saturation is governed entirely by the temperature knob.
-        let band = self.done_reward_band;
-        let tau = if band { self.done_reward_tau } else { self.reward_saturation_temperature };
+        // Shared done-scorer (reward.rs). tanh(ratio / temperature) replaces
+        // the previous clip-then-normalize — smooth gradient at all input
+        // scales; saturation is governed entirely by the temperature knob.
+        let tau = self.reward_saturation_temperature;
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() { crate::reward::NOT_DONE_SCORE } else {
                 let d = e.inner.depth(true, true) as f32;
-                crate::reward::done_score(reference_depth, d, tau, band)
+                crate::reward::done_score(reference_depth, d, tau)
             }
         };
 
@@ -962,13 +938,8 @@ impl Gatherer {
                 // Shared done-scorer (reward.rs) — must match the search
                 // terminal_evaluator above so the value head's training
                 // targets agree with the scalars MCTS backed up.
-                let tau = if self.done_reward_band {
-                    self.done_reward_tau
-                } else {
-                    self.reward_saturation_temperature
-                };
                 (
-                    crate::reward::done_score(ref_d, d, tau, self.done_reward_band),
+                    crate::reward::done_score(ref_d, d, self.reward_saturation_temperature),
                     "done",
                     game.num_objectives(),
                 )
@@ -1288,7 +1259,7 @@ impl Gatherer {
             }
             let visits_json = Value::Object(visits_map);
 
-            let mut record = json!({
+            let record = json!({
                 "height": o.height,
                 "width": o.width,
                 "num_ancillas": num_ancillas,
@@ -1300,13 +1271,6 @@ impl Gatherer {
                 "achieved_objectives": o.achieved_objectives,
                 "reverse_curriculum": is_reverse,
             });
-            // Currency stamp: lets the dataset distinguish fresh banded
-            // records from old margin-currency ones (which it remaps at
-            // load time). Absent = margin currency (all pre-flip data).
-            if self.done_reward_band {
-                record["reward_currency"] = Value::from("band");
-            }
-
             writeln!(file, "{}", record).expect("Failed to write record");
         }
         file.flush().expect("Failed to flush file");
@@ -1356,7 +1320,7 @@ impl Gatherer {
                                 }
                                 let visits_json = Value::Object(visits_map);
 
-                                let mut record = json!({
+                                let record = json!({
                                     "height": o.height,
                                     "width": o.width,
                                     "num_ancillas": num_ancillas,
@@ -1369,10 +1333,6 @@ impl Gatherer {
                                     "reverse_curriculum": is_reverse,
                                     "gold": true,
                                 });
-                                if self.done_reward_band {
-                                    record["reward_currency"] = Value::from("band");
-                                }
-
                                 if let Err(e) = writeln!(gold_file, "{}", record) {
                                     eprintln!(
                                         "[Gatherer {}] failed to write gold record: {}",
@@ -1456,8 +1416,6 @@ use pyo3::exceptions::PyRuntimeError;
     demo_fraction = 0.0,
     demo_min_objectives = 2,
     demo_subsample = 1.0,
-    done_reward_band = false,
-    done_reward_tau = 1.0,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1501,8 +1459,6 @@ pub fn run_gatherer(
     demo_fraction: f32,
     demo_min_objectives: usize,
     demo_subsample: f32,
-    done_reward_band: bool,
-    done_reward_tau: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1550,7 +1506,6 @@ pub fn run_gatherer(
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
     gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample);
-    gatherer.set_done_reward_band(done_reward_band, done_reward_tau);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
