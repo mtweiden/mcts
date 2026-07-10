@@ -1,5 +1,6 @@
 pub mod constants;
 pub mod environment;
+pub mod reward;
 pub mod slot;
 pub mod client;
 pub mod evaluator;

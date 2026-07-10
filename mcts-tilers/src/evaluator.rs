@@ -129,6 +129,14 @@ pub struct Evaluator {
     /// PUCT needs concentration at decision points. Eval-only: gather keeps
     /// Wu's 1.03 flattening so training targets stay exploratory.
     root_softmax_temp: f32,
+    /// Banded done-reward for SEARCH terminal backups only
+    /// (DONE_REWARD_REMAP.md). Must match the gatherer's setting so the
+    /// value head's terminal targets agree with the scalars eval-search
+    /// backs up. The RECORDED eval_reward (promotion scalar) is NEVER
+    /// banded — see the amendment-1 note at the recording site.
+    done_reward_band: bool,
+    /// Within-band temperature (τ_done). Only used when done_reward_band.
+    done_reward_tau: f32,
 }
 
 impl Evaluator {
@@ -138,6 +146,8 @@ impl Evaluator {
         reward_saturation_temperature: f32,
         max_action_multiplier: f32,
         root_softmax_temp: f32,
+        done_reward_band: bool,
+        done_reward_tau: f32,
     ) -> Self {
         Self {
             mcts_steps,
@@ -145,6 +155,8 @@ impl Evaluator {
             reward_saturation_temperature,
             max_action_multiplier,
             root_softmax_temp,
+            done_reward_band,
+            done_reward_tau: if done_reward_tau > 0.0 { done_reward_tau } else { 1.0 },
         }
     }
 
@@ -184,17 +196,19 @@ impl Evaluator {
         };
         let temperature = self.reward_saturation_temperature;
 
+        // Shared done-scorer (reward.rs); same formulation and flag as the
+        // Gatherer's terminal evaluator. Eval and gather must agree here so
+        // the value head's terminal targets at training time match the
+        // scalars MCTS sees at eval time. This is the SEARCH-side scalar
+        // only — the recorded eval_reward below stays on margin currency.
+        let band = self.done_reward_band;
+        let search_tau = if band { self.done_reward_tau } else { temperature };
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() {
-                -1.0
+                crate::reward::NOT_DONE_SCORE
             } else {
                 let d = e.inner.depth(true, true) as f32;
-                let ratio = (reference_depth - d) / (reference_depth + 1e-6);
-                // tanh saturation; same formulation as Gatherer's terminal
-                // evaluator. Eval and gather must agree on temperature so
-                // the value-head's terminal targets at training time match
-                // the scalars MCTS sees at eval time.
-                (ratio / temperature).tanh()
+                crate::reward::done_score(reference_depth, d, search_tau, band)
             }
         };
 
@@ -266,6 +280,14 @@ impl Evaluator {
         // dense and magnitude-aware, so a paired z-test over a large holdout
         // detects the small per-iteration gains that binary done()/depth and
         // integer achieved-count comparisons are blind to.
+        // DO NOT band this scalar (DONE_REWARD_REMAP.md amendment 1): the
+        // recorded eval_reward is the promotion-test currency and must stay
+        // on the margin scale even when done_reward_band is enabled for
+        // search/training. Banding it was measured (eval-25 replay) to make
+        // the reward z-test a noisy duplicate of the frontier gate —
+        // reward-path z fell −2.58 → −3.95 — so a quality-led candidate
+        // could promote through NEITHER path. Margin currency here also
+        // keeps eval history comparable across the flip.
         let temperature = self.reward_saturation_temperature;
         let (achieved_objectives, eval_reward, factor_prog): (i64, Option<f32>, Option<(usize, usize)>) = if done {
             let ratio = (reference_depth - agent_depth) / (reference_depth + 1e-6);
@@ -478,7 +500,7 @@ mod tests {
 
     #[test]
     fn test_new_stores_params() {
-        let e = Evaluator::new(50, 1.5, 0.4, 1.2, 1.0);
+        let e = Evaluator::new(50, 1.5, 0.4, 1.2, 1.0, false, 1.0);
         assert_eq!(e.mcts_steps, 50);
         assert!((e.c_puct - 1.5).abs() < 1e-6);
         assert!((e.reward_saturation_temperature - 0.4).abs() < 1e-6);
@@ -488,7 +510,7 @@ mod tests {
 
     #[test]
     fn test_solve_with_heuristic_nonnegative() {
-        let e = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0);
+        let e = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0, false, 1.0);
         let env = small_env();
         let depth = e.solve_with_heuristic(&env)
             .expect("small_env should be solvable by the heuristic");
@@ -510,7 +532,7 @@ mod tests {
             [],
         ).unwrap();
 
-        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0);
+        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0, false, 1.0);
         let client = TrivialTilersIpcClient {};
         evaluator.evaluate_agent_with_client(1, &[holdout], &client, &conn);
 
@@ -528,7 +550,7 @@ mod tests {
         let env = small_env();
         let holdout = make_holdout(42, &env);
 
-        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0);
+        let evaluator = Evaluator::new(5, 1.4, 1.0, 1.2, 1.0, false, 1.0);
         let client = TrivialTilersIpcClient {};
         evaluator.evaluate_agent_with_client(99, &[holdout], &client, &conn);
 
@@ -597,6 +619,8 @@ use pyo3::exceptions::PyRuntimeError;
     max_action_multiplier = 1.2,
     min_difficulty_bin = None,
     root_softmax_temp = 1.0,
+    done_reward_band = false,
+    done_reward_tau = 1.0,
 ))]
 pub fn run_evaluator(
     agent_id: i64,
@@ -612,6 +636,8 @@ pub fn run_evaluator(
     max_action_multiplier: f32,
     min_difficulty_bin: Option<i64>,
     root_softmax_temp: f32,
+    done_reward_band: bool,
+    done_reward_tau: f32,
 ) -> PyResult<()> {
     let evaluator = Evaluator::new(
         mcts_steps,
@@ -619,6 +645,8 @@ pub fn run_evaluator(
         reward_saturation_temperature,
         max_action_multiplier,
         root_softmax_temp,
+        done_reward_band,
+        done_reward_tau,
     );
 
     let conn = Connection::open(&db_path)
