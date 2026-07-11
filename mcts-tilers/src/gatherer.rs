@@ -1416,6 +1416,8 @@ use pyo3::exceptions::PyRuntimeError;
     demo_fraction = 0.0,
     demo_min_objectives = 2,
     demo_subsample = 1.0,
+    gather_min_ref_actions = 0,
+    gather_easy_keep_fraction = 0.15,
 ))]
 pub fn run_gatherer(
     worker_id: u32,
@@ -1459,6 +1461,8 @@ pub fn run_gatherer(
     demo_fraction: f32,
     demo_min_objectives: usize,
     demo_subsample: f32,
+    gather_min_ref_actions: usize,
+    gather_easy_keep_fraction: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
     let num_slots = 2048;
     let lookahead = DEFAULT_LOOKAHEAD;
@@ -1550,6 +1554,22 @@ pub fn run_gatherer(
             || solution
                 .into_iter()
                 .all(|a| matches!(a, tilers::core::enums::Action::AutoExecute))
+        {
+            return Ok(None);
+        }
+        // Frontier floor (2026-07-11): reject envs whose heuristic plan is
+        // shorter than gather_min_ref_actions, so gather concentrates on
+        // frontier-length episodes — their LATE-GAME states cover the easy
+        // band for free (superset argument), while easy episodes teach
+        // nothing new. gather_easy_keep_fraction of episodes bypass the
+        // filter as insurance against easy-band forgetting (the eval window
+        // still tests F-1 and the gate will veto regression). This is a
+        // FLOOR inside the curriculum's cap — not a license to gather
+        // beyond the frontier (the June "harder-envs backfire" regime:
+        // done-rate ~0 = no outcome signal). 0 disables.
+        if gather_min_ref_actions > 0
+            && n < gather_min_ref_actions
+            && rng.random::<f32>() >= gather_easy_keep_fraction
         {
             return Ok(None);
         }
