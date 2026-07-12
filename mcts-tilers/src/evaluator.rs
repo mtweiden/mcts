@@ -134,6 +134,11 @@ pub struct Evaluator {
     /// PyMcts.run hardcodes, so probe-vs-production search currency can be
     /// isolated as a variable. Production construction paths never set this.
     pub ternary_terminal: bool,
+    /// PROBE ONLY (E3 currency sweep): banded terminal 0.5 + 0.5*done_score
+    /// — completion floor +0.5 with the margin gradient kept on top (the
+    /// DONE_REWARD_REMAP shape, KataGo-style WDL+score blend). Search-side
+    /// only; the returned eval_reward stays margin-scale on every arm.
+    pub band_terminal: bool,
 }
 
 impl Evaluator {
@@ -151,6 +156,7 @@ impl Evaluator {
             max_action_multiplier,
             root_softmax_temp,
             ternary_terminal: false,
+            band_terminal: false,
         }
     }
 
@@ -194,7 +200,7 @@ impl Evaluator {
         // terminal evaluator. Eval and gather must agree here so the value
         // head's terminal targets at training time match the scalars MCTS
         // sees at eval time.
-        let ternary = self.ternary_terminal;
+        let (ternary, band) = (self.ternary_terminal, self.band_terminal);
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() {
                 crate::reward::NOT_DONE_SCORE
@@ -205,6 +211,9 @@ impl Evaluator {
                     if d < reference_depth { 1.0 }
                     else if d == reference_depth { 0.0 }
                     else { -1.0 }
+                } else if band {
+                    // probe-only: completion floor + margin gradient
+                    0.5 + 0.5 * crate::reward::done_score(reference_depth, d, temperature)
                 } else {
                     crate::reward::done_score(reference_depth, d, temperature)
                 }
@@ -688,7 +697,7 @@ pub fn run_evaluator(
 #[pyo3(signature = (env_json, agent, mcts_steps = 900, c_puct = 1.4,
                     reward_saturation_temperature = 1.0,
                     max_action_multiplier = 2.0, root_softmax_temp = 0.6,
-                    ternary_terminal = false))]
+                    ternary_terminal = false, band_terminal = false))]
 pub fn evaluate_single_probe(
     env_json: String,
     agent: &crate::py_mcts::MctsAgent,
@@ -698,7 +707,12 @@ pub fn evaluate_single_probe(
     max_action_multiplier: f32,
     root_softmax_temp: f32,
     ternary_terminal: bool,
+    band_terminal: bool,
 ) -> PyResult<(bool, Option<f32>, i64, Option<f32>)> {
+    if ternary_terminal && band_terminal {
+        return Err(pyo3::exceptions::PyValueError::new_err(
+            "ternary_terminal and band_terminal are mutually exclusive"));
+    }
     let env = Environment::from_json(&env_json)
         .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad env json: {e:?}")))?;
     let mut evaluator = Evaluator::new(
@@ -706,6 +720,7 @@ pub fn evaluate_single_probe(
         max_action_multiplier, root_softmax_temp,
     );
     evaluator.ternary_terminal = ternary_terminal;
+    evaluator.band_terminal = band_terminal;
     let (_actions, solution_depth, achieved, eval_reward, _skipped, _fp) =
         evaluator.evaluate_single(&env, agent);
     Ok((solution_depth.is_some(), solution_depth, achieved, eval_reward))
