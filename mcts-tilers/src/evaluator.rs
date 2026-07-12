@@ -129,6 +129,11 @@ pub struct Evaluator {
     /// PUCT needs concentration at decision points. Eval-only: gather keeps
     /// Wu's 1.03 flattening so training targets stay exploratory.
     root_softmax_temp: f32,
+    /// PROBE ONLY (2026-07-12 divergence bisect): swap the margin terminal
+    /// for the historical ternary {beat, tie, else} -> {+1, 0, -1} that
+    /// PyMcts.run hardcodes, so probe-vs-production search currency can be
+    /// isolated as a variable. Production construction paths never set this.
+    pub ternary_terminal: bool,
 }
 
 impl Evaluator {
@@ -145,6 +150,7 @@ impl Evaluator {
             reward_saturation_temperature,
             max_action_multiplier,
             root_softmax_temp,
+            ternary_terminal: false,
         }
     }
 
@@ -188,12 +194,20 @@ impl Evaluator {
         // terminal evaluator. Eval and gather must agree here so the value
         // head's terminal targets at training time match the scalars MCTS
         // sees at eval time.
+        let ternary = self.ternary_terminal;
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() {
                 crate::reward::NOT_DONE_SCORE
             } else {
                 let d = e.inner.depth(true, true) as f32;
-                crate::reward::done_score(reference_depth, d, temperature)
+                if ternary {
+                    // probe-only: PyMcts.run's completion-greedy currency
+                    if d < reference_depth { 1.0 }
+                    else if d == reference_depth { 0.0 }
+                    else { -1.0 }
+                } else {
+                    crate::reward::done_score(reference_depth, d, temperature)
+                }
             }
         };
 
@@ -662,4 +676,37 @@ pub fn run_evaluator(
 
     println!("[Evaluator] Evaluation complete for agent {}.", agent_id);
     Ok(())
+}
+
+/// In-process probe hook (2026-07-12 eval-divergence bisect): run the EXACT
+/// production evaluate_single loop with a direct-inference MctsAgent client
+/// (no arena/handler). If this reproduces the recorded eval failures, the
+/// divergence lives in the loop mechanics; if it completes like the Python
+/// probes, only the arena IPC path remains.
+#[cfg(feature = "python")]
+#[pyfunction]
+#[pyo3(signature = (env_json, agent, mcts_steps = 900, c_puct = 1.4,
+                    reward_saturation_temperature = 1.0,
+                    max_action_multiplier = 2.0, root_softmax_temp = 0.6,
+                    ternary_terminal = false))]
+pub fn evaluate_single_probe(
+    env_json: String,
+    agent: &crate::py_mcts::MctsAgent,
+    mcts_steps: usize,
+    c_puct: f32,
+    reward_saturation_temperature: f32,
+    max_action_multiplier: f32,
+    root_softmax_temp: f32,
+    ternary_terminal: bool,
+) -> PyResult<(bool, Option<f32>, i64, Option<f32>)> {
+    let env = Environment::from_json(&env_json)
+        .map_err(|e| pyo3::exceptions::PyValueError::new_err(format!("bad env json: {e:?}")))?;
+    let mut evaluator = Evaluator::new(
+        mcts_steps, c_puct, reward_saturation_temperature,
+        max_action_multiplier, root_softmax_temp,
+    );
+    evaluator.ternary_terminal = ternary_terminal;
+    let (_actions, solution_depth, achieved, eval_reward, _skipped, _fp) =
+        evaluator.evaluate_single(&env, agent);
+    Ok((solution_depth.is_some(), solution_depth, achieved, eval_reward))
 }

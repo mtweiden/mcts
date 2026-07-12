@@ -185,7 +185,8 @@ impl PyMcts {
         PyMcts { inner: mcts }
     }
 
-    #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, forced_playouts = false))]
+    #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, forced_playouts = false,
+                        margin_terminal = false, reward_saturation_temperature = 1.0))]
     fn run(
         &mut self,
         env: &PyEnvironment,
@@ -193,11 +194,18 @@ impl PyMcts {
         num_steps: usize,
         c_puct: f32,
         forced_playouts: bool,
+        margin_terminal: bool,
+        reward_saturation_temperature: f32,
     ) -> PyResult<MctsNode> {
         let inner: TilersEnvInner = env.to_inner();
-        // Terminal evaluator vs the heuristic solver: the historical ternary
-        // {beat, tie, lose/unfinished} -> {1, 0, -1}, kept bit-identical so
-        // probe scripts stay comparable across eras.
+        // Terminal evaluator vs the heuristic solver. Default: the historical
+        // ternary {beat, tie, lose/unfinished} -> {1, 0, -1}, kept bit-
+        // identical so probe scripts stay comparable across eras. CAUTION
+        // (2026-07-12): production eval/gather search the MARGIN currency
+        // (done_score tanh, bare completion ~ 0) — the ternary is
+        // completion-greedy, so absolute completion rates measured with it
+        // overstate production. Pass margin_terminal=true to search the
+        // production game.
         let ref_depth = {
             let mut e = inner.clone();
             let solver = TilersSolver::new();
@@ -209,7 +217,9 @@ impl PyMcts {
                 crate::reward::NOT_DONE_SCORE
             } else {
                 let d = e.inner.depth(true, true) as f32;
-                if d < ref_depth { 1.0 }
+                if margin_terminal {
+                    crate::reward::done_score(ref_depth, d, reward_saturation_temperature)
+                } else if d < ref_depth { 1.0 }
                 else if d == ref_depth { 0.0 }
                 else { -1.0 }
             }
