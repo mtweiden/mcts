@@ -623,6 +623,7 @@ use pyo3::exceptions::PyRuntimeError;
     max_action_multiplier = 1.2,
     min_difficulty_bin = None,
     root_softmax_temp = 1.0,
+    band_terminal = false,
 ))]
 pub fn run_evaluator(
     agent_id: i64,
@@ -638,14 +639,23 @@ pub fn run_evaluator(
     max_action_multiplier: f32,
     min_difficulty_bin: Option<i64>,
     root_softmax_temp: f32,
+    band_terminal: bool,
 ) -> PyResult<()> {
-    let evaluator = Evaluator::new(
+    let mut evaluator = Evaluator::new(
         mcts_steps,
         c_puct,
         reward_saturation_temperature,
         max_action_multiplier,
         root_softmax_temp,
     );
+    // E3a (2026-07-12, 120 unselected envs, agent 8): banded in-search
+    // terminal (0.5 + 0.5*done_score) + c_puct 2.8 completed 95.0% vs
+    // 69.2% for margin|1.4 (+32/-1 paired; +11/-0 vs margin|2.8). Search-
+    // side only: the recorded eval_reward stays margin-scale (see the
+    // terminal scoring block in evaluate_single), so the promotion z-test
+    // currency is unchanged. Changing this flag mid-lineage breaks row
+    // comparability -> wipe the incumbent's cached solutions rows.
+    evaluator.band_terminal = band_terminal;
 
     let conn = Connection::open(&db_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
