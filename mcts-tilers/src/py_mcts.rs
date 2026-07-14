@@ -186,7 +186,8 @@ impl PyMcts {
     }
 
     #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, forced_playouts = false,
-                        margin_terminal = false, reward_saturation_temperature = 1.0))]
+                        margin_terminal = false, reward_saturation_temperature = 1.0,
+                        band_terminal = false))]
     fn run(
         &mut self,
         env: &PyEnvironment,
@@ -196,6 +197,7 @@ impl PyMcts {
         forced_playouts: bool,
         margin_terminal: bool,
         reward_saturation_temperature: f32,
+        band_terminal: bool,
     ) -> PyResult<MctsNode> {
         let inner: TilersEnvInner = env.to_inner();
         // Terminal evaluator vs the heuristic solver. Default: the historical
@@ -217,7 +219,10 @@ impl PyMcts {
                 crate::reward::NOT_DONE_SCORE
             } else {
                 let d = e.inner.depth(true, true) as f32;
-                if margin_terminal {
+                if band_terminal {
+                    // E3b: completion floor + margin gradient (0.5 + 0.5*margin)
+                    0.5 + 0.5 * crate::reward::done_score(ref_depth, d, reward_saturation_temperature)
+                } else if margin_terminal {
                     crate::reward::done_score(ref_depth, d, reward_saturation_temperature)
                 } else if d < ref_depth { 1.0 }
                 else if d == ref_depth { 0.0 }
