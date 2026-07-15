@@ -437,7 +437,7 @@ impl Evaluator {
         num_nodes: i64,
     ) -> Result<(), String> {
         let conn = Connection::open(db_path).map_err(|e| format!("Failed to open database: {e}"))?;
-        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;")
             .map_err(|e| format!("Failed to set PRAGMAs: {e}"))?;
 
         let environments = load_holdout_environments(
@@ -659,7 +659,7 @@ pub fn run_evaluator(
 
     let conn = Connection::open(&db_path)
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to open database: {e}")))?;
-    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL;")
+    conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 30000;")
         .map_err(|e| PyRuntimeError::new_err(format!("Failed to set PRAGMAs: {e}")))?;
 
     let environments = load_holdout_environments(
