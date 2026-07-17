@@ -1400,6 +1400,7 @@ use pyo3::exceptions::PyRuntimeError;
     resignation_log_dir = None,
     max_action_multiplier = 1.2,
     max_pp_weight = None,
+    max_pp_cost = None,
     floor_keep_fraction = 1.0,
     her_reward_margin = 0.0,
     reverse_curriculum = false,
@@ -1445,6 +1446,7 @@ pub fn run_gatherer(
     resignation_log_dir: Option<String>,
     max_action_multiplier: f32,
     max_pp_weight: Option<usize>,
+    max_pp_cost: Option<usize>,
     floor_keep_fraction: f32,
     her_reward_margin: f32,
     reverse_curriculum: bool,
@@ -1528,9 +1530,11 @@ pub fn run_gatherer(
     if let Some(s) = seed {
         env.set_seed(Some(s as u64));
     }
-    // Cap PauliProduct weight (easy-env curriculum) BEFORE random_start so the
-    // generated objectives respect it. None = unbounded (historical behavior).
+    // Cap PauliProduct weight/cost (easy-env curriculum) BEFORE random_start so
+    // the generated objectives respect it. None = unbounded (historical). When
+    // max_pp_cost is set it takes over as a Y-aware cost budget (X/Z=1, Y=2).
     env.set_max_pp_weight(max_pp_weight);
+    env.set_max_pp_cost(max_pp_cost);
     env.random_start(no, false);
 
     env.shuffle(num_shuffles);
