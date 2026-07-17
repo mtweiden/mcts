@@ -1401,6 +1401,9 @@ use pyo3::exceptions::PyRuntimeError;
     max_action_multiplier = 1.2,
     max_pp_weight = None,
     max_pp_cost = None,
+    clustered_wide_pp_fraction = 0.0,
+    clustered_wide_pp_weight = 15,
+    clustered_wide_pp_block_side = 0,
     floor_keep_fraction = 1.0,
     her_reward_margin = 0.0,
     reverse_curriculum = false,
@@ -1447,6 +1450,9 @@ pub fn run_gatherer(
     max_action_multiplier: f32,
     max_pp_weight: Option<usize>,
     max_pp_cost: Option<usize>,
+    clustered_wide_pp_fraction: f32,
+    clustered_wide_pp_weight: usize,
+    clustered_wide_pp_block_side: usize,
     floor_keep_fraction: f32,
     her_reward_margin: f32,
     reverse_curriculum: bool,
@@ -1535,9 +1541,17 @@ pub fn run_gatherer(
     // max_pp_cost is set it takes over as a Y-aware cost budget (X/Z=1, Y=2).
     env.set_max_pp_weight(max_pp_weight);
     env.set_max_pp_cost(max_pp_cost);
-    env.random_start(no, false);
-
-    env.shuffle(num_shuffles);
+    if clustered_wide_pp_fraction > 0.0
+        && rng.random_range(0.0f32..1.0) < clustered_wide_pp_fraction
+    {
+        // Clustered wide PP: factors + ancillas co-located in a compact block so
+        // the wide merge solves under the action cap. Do NOT re-shuffle after —
+        // that would scatter the cluster and defeat the purpose.
+        env.random_start_clustered_pp(clustered_wide_pp_weight, clustered_wide_pp_block_side);
+    } else {
+        env.random_start(no, false);
+        env.shuffle(num_shuffles);
+    }
 
     // Solve the POST-shuffle env (the one we actually gather on) once: it
     // gates both the max-depth cap and the trivial-env reject. Checking the
