@@ -1404,6 +1404,7 @@ use pyo3::exceptions::PyRuntimeError;
     clustered_wide_pp_fraction = 0.0,
     clustered_wide_pp_weight = 15,
     clustered_wide_pp_block_side = 0,
+    clustered_wide_pp_num_clusters = 1,
     floor_keep_fraction = 1.0,
     her_reward_margin = 0.0,
     reverse_curriculum = false,
@@ -1453,6 +1454,7 @@ pub fn run_gatherer(
     clustered_wide_pp_fraction: f32,
     clustered_wide_pp_weight: usize,
     clustered_wide_pp_block_side: usize,
+    clustered_wide_pp_num_clusters: usize,
     floor_keep_fraction: f32,
     her_reward_margin: f32,
     reverse_curriculum: bool,
@@ -1547,7 +1549,11 @@ pub fn run_gatherer(
         // Clustered wide PP: factors + ancillas co-located in a compact block so
         // the wide merge solves under the action cap. Do NOT re-shuffle after —
         // that would scatter the cluster and defeat the purpose.
-        env.random_start_clustered_pp(clustered_wide_pp_weight, clustered_wide_pp_block_side);
+        env.random_start_clustered_pp(
+            clustered_wide_pp_weight,
+            clustered_wide_pp_block_side,
+            clustered_wide_pp_num_clusters,
+        );
     } else {
         env.random_start(no, false);
         env.shuffle(num_shuffles);
