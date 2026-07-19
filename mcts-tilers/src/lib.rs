@@ -66,6 +66,7 @@ fn mcts_tilers(_py: Python, m: &Bound<'_, PyModule>) -> PyResult<()> {
     // for gathering and evaluating
     m.add_function(wrap_pyfunction!(gatherer::run_gatherer, m)?)?;
     m.add_function(wrap_pyfunction!(evaluator::run_evaluator, m)?)?;
+    m.add_function(wrap_pyfunction!(evaluator::evaluate_single_probe, m)?)?;
 
     Ok(())
 }

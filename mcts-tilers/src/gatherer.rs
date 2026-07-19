@@ -1546,13 +1546,17 @@ pub fn run_gatherer(
     if clustered_wide_pp_fraction > 0.0
         && rng.random_range(0.0f32..1.0) < clustered_wide_pp_fraction
     {
-        // Clustered wide PP: factors + ancillas co-located in a compact block so
-        // the wide merge solves under the action cap. Do NOT re-shuffle after —
-        // that would scatter the cluster and defeat the purpose.
+        // Clustered wide PP: factors co-located in K compact blocks so the wide
+        // merge solves under the action cap. Do NOT re-shuffle after — that would
+        // scatter the cluster and defeat the purpose. Draw K uniformly in
+        // [1, num_clusters] per env so the corpus is a DIFFICULTY MIX: K=1 is the
+        // easy tight blob (bootstrap), higher K adds inter-cluster routing (hard,
+        // more transferable) — ensuring a good amount of hard examples.
+        let k = rng.random_range(1..=clustered_wide_pp_num_clusters.max(1));
         env.random_start_clustered_pp(
             clustered_wide_pp_weight,
             clustered_wide_pp_block_side,
-            clustered_wide_pp_num_clusters,
+            k,
         );
     } else {
         env.random_start(no, false);
