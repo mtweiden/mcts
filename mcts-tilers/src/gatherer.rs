@@ -25,6 +25,30 @@ use crate::environment::TilersEnv;
 use crate::slot::TilersSlot;
 use crate::client::TilersIpcClient;
 
+/// (total, max) PauliProduct weight over an env's objective queue.
+///
+/// `total` is the aggregate merge work in the circuit; `max` is the single
+/// widest merge, which is the measured difficulty axis -- max Pauli factors in
+/// one lattice-surgery merge stays predictive of completion even after
+/// controlling for episode length. Logged per episode so gather difficulty can
+/// be analysed on the merge-weight axis, not just ancillas/objectives.
+fn pp_weights(env: &Environment) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut mx = 0usize;
+    for o in env.objective_queue.objectives_iter() {
+        if let tilers::objective::Objective::PauliProduct(pp) = o {
+            let w = pp.weight();
+            total += w;
+            if w > mx {
+                mx = w;
+            }
+        }
+    }
+    (total, mx)
+}
+
+
+
 /// ----------------------------------------------------------------------------
 /// Gatherer
 /// ----------------------------------------------------------------------------
@@ -723,8 +747,10 @@ impl Gatherer {
         let w = game.width;
         let nb = game.num_ancillas();
         let no = game.num_objectives();
+        let (tw, mw) = pp_weights(&game);
         println!(
-            "[Gatherer {}] Starting Env(h={}, w={}, nb={}, no={})", self.gather_id, h, w, nb, no,
+            "[Gatherer {}] Starting Env(h={}, w={}, nb={}, no={}, tw={}, mw={})",
+            self.gather_id, h, w, nb, no, tw, mw,
         );
 
         // Training data for full-search turns only (written to output_path).
@@ -1035,12 +1061,14 @@ impl Gatherer {
         // the agent's depth vs the heuristic reference and whether it beat it.
         if tilers_env.inner.done() {
             println!(
-                "[Gatherer {}] FINISHED Env(h={}, w={}, nb={}, no={}) | depth={} vs ref={} | score={:.3} (beat_solver={})",
+                "[Gatherer {}] FINISHED Env(h={}, w={}, nb={}, no={}, tw={}, mw={}) | depth={} vs ref={} | score={:.3} (beat_solver={})",
                 self.gather_id,
                 game.height,
                 game.width,
                 game.num_ancillas(),
                 game.num_objectives(),
+                pp_weights(&game).0,
+                pp_weights(&game).1,
                 solution_depth,
                 reference_depth,
                 score,
@@ -1055,12 +1083,14 @@ impl Gatherer {
             // to the actual sub-problem the agent was handed.
             let (fm, ft) = game.factor_progress(&tilers_env.inner);
             println!(
-                "[Gatherer {}] UNFINISHED Env(h={}, w={}, nb={}, no={}) | factors {}/{} ({:.0}%) | score={:.3} kind={}{}",
+                "[Gatherer {}] UNFINISHED Env(h={}, w={}, nb={}, no={}, tw={}, mw={}) | factors {}/{} ({:.0}%) | score={:.3} kind={}{}",
                 self.gather_id,
                 game.height,
                 game.width,
                 game.num_ancillas(),
                 game.num_objectives(),
+                pp_weights(&game).0,
+                pp_weights(&game).1,
                 fm,
                 ft,
                 if ft > 0 { 100.0 * fm as f32 / ft as f32 } else { 0.0 },
