@@ -103,6 +103,18 @@ pub struct Gatherer {
     /// (Q is bounded above by 1).
     resign_value_threshold: f32,
     resign_consecutive_moves: usize,
+    /// Step floor for resignation: no episode may resign before step
+    /// max(20, ceil(mult * reference_depth)). 0.0 disables the floor (legacy:
+    /// resign as early as the streak allows). 2026-07-20 calibration on 118k
+    /// logged episodes (iters 45-53 forced-play counterfactual): NO (threshold,
+    /// streak) setting reaches the AGZ ~5% false-positive target — every cell
+    /// of the 6x7 grid has FP >= 19%, because Q pins near -1 from ~step 5 on
+    /// hard envs whether or not the episode eventually finishes, so the streak
+    /// carries no outcome information. The elapsed-step dimension does:
+    /// mult=1.25 gives FP 8.0% overall / 6.1% on hard singles (vs 31.4% /
+    /// 24.9% bare) and raises hard-single done-records per gather ~34% rel.
+    /// Cost: resignation's step savings drop 49.5% -> 6.1% of episode mass.
+    resign_min_step_ref_mult: f32,
     /// Fraction of episodes in which resignation is *disabled* and the
     /// game is played out to its natural end. These serve as a sanity
     /// check: if too many of the would-have-been-resigned positions
@@ -221,6 +233,7 @@ impl Gatherer {
         max_action_multiplier: Option<f32>,
         resign_value_threshold: Option<f32>,
         resign_consecutive_moves: Option<usize>,
+        resign_min_step_ref_mult: Option<f32>,
         no_resign_rate: Option<f32>,
         resignation_log_dir: Option<String>,
         floor_keep_fraction: Option<f32>,
@@ -250,6 +263,9 @@ impl Gatherer {
             // false-positive sanity check.
             resign_value_threshold: resign_value_threshold.unwrap_or(-0.9),
             resign_consecutive_moves: resign_consecutive_moves.unwrap_or(5),
+            // 0.0 = no step floor (legacy). See the field doc for the
+            // 2026-07-20 calibration behind the recommended 1.25.
+            resign_min_step_ref_mult: resign_min_step_ref_mult.unwrap_or(0.0),
             no_resign_rate: no_resign_rate.unwrap_or(0.1),
             // 1.0 = keep every floor episode (unchanged default).
             floor_keep_fraction: floor_keep_fraction.unwrap_or(1.0),
@@ -872,12 +888,27 @@ impl Gatherer {
                     low_value_streak = 0;
                 }
 
-                if resign_allowed && low_value_streak >= self.resign_consecutive_moves {
+                // Step floor: on hard envs Q is pinned near -1 from the
+                // initial state, so the streak alone fires at ~step 5 with a
+                // 31% false-positive rate (2026-07-20 calibration). Requiring
+                // the episode to first run max(20, mult*ref_depth) steps
+                // restores outcome information (FP 8.0% at mult=1.25).
+                let resign_min_step = if self.resign_min_step_ref_mult > 0.0 {
+                    (self.resign_min_step_ref_mult * reference_depth)
+                        .ceil()
+                        .max(20.0) as usize
+                } else {
+                    0
+                };
+                if resign_allowed
+                    && low_value_streak >= self.resign_consecutive_moves
+                    && step >= resign_min_step
+                {
                     println!(
                         "[Gatherer {}] Resigning at step {}: Q={:.3} \
-                         depth={} ref_depth={} streak={}",
+                         depth={} ref_depth={} streak={} min_step={}",
                         self.gather_id, step, q, current_depth as i32,
-                        reference_depth as i32, low_value_streak,
+                        reference_depth as i32, low_value_streak, resign_min_step,
                     );
                     resigned = true;
                     break;
@@ -1426,6 +1457,7 @@ use pyo3::exceptions::PyRuntimeError;
     seed = None,
     resign_value_threshold = -0.9,
     resign_consecutive_moves = 5,
+    resign_min_step_ref_mult = 0.0,
     no_resign_rate = 0.1,
     resignation_log_dir = None,
     max_action_multiplier = 1.2,
@@ -1435,6 +1467,7 @@ use pyo3::exceptions::PyRuntimeError;
     clustered_wide_pp_weight = 15,
     clustered_wide_pp_block_side = 0,
     clustered_wide_pp_num_clusters = 1,
+    clustered_max_generated_depth = None,
     floor_keep_fraction = 1.0,
     her_reward_margin = 0.0,
     reverse_curriculum = false,
@@ -1476,6 +1509,7 @@ pub fn run_gatherer(
     seed: Option<i32>,
     resign_value_threshold: f32,
     resign_consecutive_moves: usize,
+    resign_min_step_ref_mult: f32,
     no_resign_rate: f32,
     resignation_log_dir: Option<String>,
     max_action_multiplier: f32,
@@ -1485,6 +1519,7 @@ pub fn run_gatherer(
     clustered_wide_pp_weight: usize,
     clustered_wide_pp_block_side: usize,
     clustered_wide_pp_num_clusters: usize,
+    clustered_max_generated_depth: Option<usize>,
     floor_keep_fraction: f32,
     her_reward_margin: f32,
     reverse_curriculum: bool,
@@ -1535,6 +1570,7 @@ pub fn run_gatherer(
         Some(max_action_multiplier),
         Some(resign_value_threshold),
         Some(resign_consecutive_moves),
+        Some(resign_min_step_ref_mult),
         Some(no_resign_rate),
         resignation_log_dir,
         Some(floor_keep_fraction),
@@ -1573,9 +1609,11 @@ pub fn run_gatherer(
     // max_pp_cost is set it takes over as a Y-aware cost budget (X/Z=1, Y=2).
     env.set_max_pp_weight(max_pp_weight);
     env.set_max_pp_cost(max_pp_cost);
+    let mut is_clustered = false;
     if clustered_wide_pp_fraction > 0.0
         && rng.random_range(0.0f32..1.0) < clustered_wide_pp_fraction
     {
+        is_clustered = true;
         // Clustered wide PP: factors co-located in K compact blocks so the wide
         // merge solves under the action cap. Do NOT re-shuffle after — that would
         // scatter the cluster and defeat the purpose. Draw K uniformly in
@@ -1601,7 +1639,19 @@ pub fn run_gatherer(
     let mut temp_env = env.clone();
     if let Ok(solution) = solver.solve(&mut temp_env, false) {
         let n = solution.len();
-        if n > max_generated_depth {
+        // Per-arm cap: the clustered wide-PP arm may carry its own action-count
+        // cap. Rationale (2026-07-20 placement study): with spread anchors the
+        // hard clustered geometry (K>=4 corners/spread) needs 185-225 solver
+        // actions at w19 — the global tier cap of 220 rejects >50% of exactly
+        // those draws (reject-and-regenerate below), silently censoring the
+        // hard tail the arm exists to supply. A clustered cap of ~260-280
+        // admits 80-95% of it without loosening the generic arm's tier gate.
+        let eff_cap = if is_clustered {
+            clustered_max_generated_depth.unwrap_or(max_generated_depth)
+        } else {
+            max_generated_depth
+        };
+        if n > eff_cap {
             return Ok(None);
         }
         // Reject trivial envs — ones the heuristic clears with the global
@@ -1669,6 +1719,7 @@ mod tests {
             None,                 // max_action_multiplier (default 1.2)
             Some(2.0),            // resign_value_threshold (>1.0 disables)
             Some(0),              // resign_consecutive_moves (0 disables)
+            None,                 // resign_min_step_ref_mult (moot: resignation off)
             Some(0.0),            // no_resign_rate
             None,                 // resignation_log_dir
             None,                 // floor_keep_fraction (default 1.0)
@@ -1682,7 +1733,7 @@ mod tests {
     fn test_new_sets_explicit_reward_saturation_temperature() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.1, 0.25, 2, 1,
-            None, Some(0.3), Some(100), None, None, None, None, None, None, None,
+            None, Some(0.3), Some(100), None, None, None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
         assert_eq!(g.mcts_steps, 10);
@@ -1695,7 +1746,7 @@ mod tests {
         // default (reward_ratio_limit = 0.3 → slope 1/0.3); see Gatherer::new.
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
         );
         assert!((g.reward_saturation_temperature - 0.3).abs() < 1e-6);
     }
@@ -1704,7 +1755,7 @@ mod tests {
     fn test_new_defaults_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, None, None, None, None, None, None,
+            None, None, None, None, None, None, None, None, None, None, None,
         );
         assert!((g.resign_value_threshold - (-0.9)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 5);
@@ -1715,7 +1766,7 @@ mod tests {
     fn test_new_sets_explicit_resignation_params() {
         let g = Gatherer::new(
             8, 10, 2, 0.5, "/dev/null".into(), 0.0, 0.0, 2, 0,
-            None, None, None, None, Some(-0.5), Some(8), Some(0.2), None, None, None,
+            None, None, None, None, Some(-0.5), Some(8), None, Some(0.2), None, None, None,
         );
         assert!((g.resign_value_threshold - (-0.5)).abs() < 1e-6);
         assert_eq!(g.resign_consecutive_moves, 8);
@@ -2153,7 +2204,7 @@ mod tests {
             1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0,
             None, Some(1.0), None,
             None,                            // max_action_multiplier (default 1.2)
-            Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
+            Some(2.0), Some(0), None, Some(0.0),  // resignation disabled in this test
             None,                            // resignation_log_dir
             None,                            // floor_keep_fraction
             None,                            // her_reward_margin
@@ -2198,7 +2249,7 @@ mod tests {
             1, 5, 2, 1.0, out.clone(), 0.0, 0.0, 2, 0,
             None, Some(1.0), None,
             None,                            // max_action_multiplier (default 1.2)
-            Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
+            Some(2.0), Some(0), None, Some(0.0),  // resignation disabled in this test
             None,                            // resignation_log_dir
             None,                            // floor_keep_fraction
             None,                            // her_reward_margin

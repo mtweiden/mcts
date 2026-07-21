@@ -131,6 +131,7 @@ fn main() {
         None,                 // max_action_multiplier (default 1.2)
         None,                 // resign_value_threshold (default)
         None,                 // resign_consecutive_moves (default)
+        None,                 // resign_min_step_ref_mult (default: no floor)
         None,                 // no_resign_rate (default)
         None,                 // resignation_log_dir (off in standalone binary)
         None,                 // floor_keep_fraction (default 1.0 — keep all)
