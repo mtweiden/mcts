@@ -115,6 +115,12 @@ pub struct Gatherer {
     /// 24.9% bare) and raises hard-single done-records per gather ~34% rel.
     /// Cost: resignation's step savings drop 49.5% -> 6.1% of episode mass.
     resign_min_step_ref_mult: f32,
+    /// See set_clustered_reverse_prob. Negative sentinel = use the generic prob.
+    clustered_reverse_prob: f32,
+    /// See set_env_meta: generated-env max PP factor weight / cluster count,
+    /// stamped on records for dashboard slicing. 0/0 when unset.
+    env_mw: usize,
+    env_k: usize,
     /// Fraction of episodes in which resignation is *disabled* and the
     /// game is played out to its natural end. These serve as a sanity
     /// check: if too many of the would-have-been-resigned positions
@@ -266,6 +272,11 @@ impl Gatherer {
             // 0.0 = no step floor (legacy). See the field doc for the
             // 2026-07-20 calibration behind the recommended 1.25.
             resign_min_step_ref_mult: resign_min_step_ref_mult.unwrap_or(0.0),
+            // Set via setters, not constructor args (per-env metadata + the
+            // clustered-RC override; sentinel -1.0 = generic prob).
+            clustered_reverse_prob: -1.0,
+            env_mw: 0,
+            env_k: 0,
             no_resign_rate: no_resign_rate.unwrap_or(0.1),
             // 1.0 = keep every floor episode (unchanged default).
             floor_keep_fraction: floor_keep_fraction.unwrap_or(1.0),
@@ -318,6 +329,28 @@ impl Gatherer {
         self.reverse_curriculum_min_len = min_len;
         self.reverse_curriculum_max_probes = max_probes.max(1);
         self.reverse_curriculum_k_start_actions = k_start_actions.max(1);
+    }
+
+    /// Separate reverse-curriculum probability for CLUSTERED wide-PP envs.
+    /// Negative = use the generic `reverse_curriculum_prob` (legacy).
+    ///
+    /// 2026-07-21 trace analysis: wide envs complete at 0.92 under reverse
+    /// curriculum vs 0.43 from scratch, but RC ran on only ~4% of wide
+    /// episodes (no mw/cluster gating existed). A global prob raise would
+    /// flood narrow long-plan envs with endgame-tilted data; this targets
+    /// the arm that needs it. Guarded abort metric: from-scratch wide
+    /// done-rate must not fall (RC stealing opening data).
+    pub fn set_clustered_reverse_prob(&mut self, prob: f32) {
+        self.clustered_reverse_prob = if prob < 0.0 { -1.0 } else { prob.clamp(0.0, 1.0) };
+    }
+
+    /// Per-env generation metadata, stamped onto every record this episode
+    /// writes (env_mw / env_k) so gather-side dashboards can slice done-rate
+    /// by merge weight and cluster count without decoding boards. k=0 means
+    /// the env did not come from the clustered wide-PP arm.
+    pub fn set_env_meta(&mut self, mw: usize, k: usize) {
+        self.env_mw = mw;
+        self.env_k = k;
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
@@ -496,7 +529,14 @@ impl Gatherer {
     ) -> (f32, f32, bool) {
         let mut game = env.clone();
         game.set_cultivation_time(10);
-        if self.reverse_curriculum && rng.random::<f32>() < self.reverse_curriculum_prob {
+        // Clustered wide-PP envs (env_k > 0) may use a separate, higher RC
+        // probability — see set_clustered_reverse_prob.
+        let rc_prob = if self.env_k > 0 && self.clustered_reverse_prob >= 0.0 {
+            self.clustered_reverse_prob
+        } else {
+            self.reverse_curriculum_prob
+        };
+        if self.reverse_curriculum && rng.random::<f32>() < rc_prob {
             let (d_full, plan) = self.heuristic_typed_plan(&game);
             if plan.len() >= self.reverse_curriculum_min_len {
                 return self.gather_reverse_curriculum(&game, d_full, &plan, client, c_puct, rng);
@@ -1331,6 +1371,10 @@ impl Gatherer {
                 "reward_kind": o.reward_kind,
                 "achieved_objectives": o.achieved_objectives,
                 "reverse_curriculum": is_reverse,
+                // Generation metadata for gather-side dashboards (done-rate by
+                // merge weight / cluster count). env_k=0 => non-clustered arm.
+                "env_mw": self.env_mw,
+                "env_k": self.env_k,
             });
             writeln!(file, "{}", record).expect("Failed to write record");
         }
@@ -1467,7 +1511,9 @@ use pyo3::exceptions::PyRuntimeError;
     clustered_wide_pp_weight = 15,
     clustered_wide_pp_block_side = 0,
     clustered_wide_pp_num_clusters = 1,
+    clustered_wide_pp_weight_min = 0,
     clustered_max_generated_depth = None,
+    clustered_reverse_prob = -1.0,
     floor_keep_fraction = 1.0,
     her_reward_margin = 0.0,
     reverse_curriculum = false,
@@ -1519,7 +1565,9 @@ pub fn run_gatherer(
     clustered_wide_pp_weight: usize,
     clustered_wide_pp_block_side: usize,
     clustered_wide_pp_num_clusters: usize,
+    clustered_wide_pp_weight_min: usize,
     clustered_max_generated_depth: Option<usize>,
+    clustered_reverse_prob: f32,
     floor_keep_fraction: f32,
     her_reward_margin: f32,
     reverse_curriculum: bool,
@@ -1621,15 +1669,27 @@ pub fn run_gatherer(
         // easy tight blob (bootstrap), higher K adds inter-cluster routing (hard,
         // more transferable) — ensuring a good amount of hard examples.
         let k = rng.random_range(1..=clustered_wide_pp_num_clusters.max(1));
-        env.random_start_clustered_pp(
-            clustered_wide_pp_weight,
-            clustered_wide_pp_block_side,
-            k,
-        );
+        // Weight mixture (2026-07-21): the advance mechanism pins the generated
+        // weight at the current effective cap, so the corpus is a single-weight
+        // spike (18.3k done records at w19, 1.7k across w13-18) and each
+        // weight's mass ages out of the K=5 replay window as the cap moves.
+        // Drawing w ~ uniform[min, cap] keeps the whole band populated.
+        // weight_min = 0 disables (legacy always-cap).
+        let w = if clustered_wide_pp_weight_min > 0
+            && clustered_wide_pp_weight_min < clustered_wide_pp_weight
+        {
+            rng.random_range(clustered_wide_pp_weight_min..=clustered_wide_pp_weight)
+        } else {
+            clustered_wide_pp_weight
+        };
+        env.random_start_clustered_pp(w, clustered_wide_pp_block_side, k);
+        gatherer.set_env_meta(pp_weights(&env).1, k);
     } else {
         env.random_start(no, false);
         env.shuffle(num_shuffles);
+        gatherer.set_env_meta(pp_weights(&env).1, 0);
     }
+    gatherer.set_clustered_reverse_prob(clustered_reverse_prob);
 
     // Solve the POST-shuffle env (the one we actually gather on) once: it
     // gates both the max-depth cap and the trivial-env reject. Checking the
