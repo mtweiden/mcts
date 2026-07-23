@@ -164,7 +164,11 @@ pub struct Gatherer {
     reverse_curriculum: bool,
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
-    reverse_curriculum_k_start_actions: usize,
+    /// Prefix length (# heuristic actions replayed from the START) for the FIRST
+    /// cusp probe. Prior: the roadblock lives near the opening, so seed the
+    /// binary search close to the full unscaffolded env (~10) rather than near
+    /// the goal. Subsequent probes bisect. See gather_reverse_curriculum.
+    reverse_curriculum_prefix_start: usize,
     /// Fraction of eligible (plan >= min_len) instances that actually run the
     /// reverse-curriculum climb; the rest gather the full env normally (so the
     /// objective-axis cusp reward applies to them). 1.0 = always (old behavior).
@@ -287,7 +291,7 @@ impl Gatherer {
             reverse_curriculum: false,
             reverse_curriculum_min_len: usize::MAX,
             reverse_curriculum_max_probes: 5,
-            reverse_curriculum_k_start_actions: 16,
+            reverse_curriculum_prefix_start: 10,
             reverse_curriculum_prob: 1.0,
             // Gold banking OFF by default (no dir → never writes; the sentinel
             // gold_min_len = usize::MAX means nothing qualifies even if a dir slips in).
@@ -323,12 +327,12 @@ impl Gatherer {
     }
 
     pub fn set_reverse_curriculum(&mut self, enabled: bool, min_len: usize,
-                                  max_probes: usize, k_start_actions: usize, prob: f32) {
+                                  max_probes: usize, prefix_start: usize, prob: f32) {
         self.reverse_curriculum = enabled;
         self.reverse_curriculum_prob = prob.clamp(0.0, 1.0);
         self.reverse_curriculum_min_len = min_len;
         self.reverse_curriculum_max_probes = max_probes.max(1);
-        self.reverse_curriculum_k_start_actions = k_start_actions.max(1);
+        self.reverse_curriculum_prefix_start = prefix_start;
     }
 
     /// Separate reverse-curriculum probability for CLUSTERED wide-PP envs.
@@ -695,31 +699,31 @@ impl Gatherer {
         (merged as f32).min(budget) / budget - 1.0
     }
 
-    /// Next tail length to probe in the reverse-curriculum edge search, given
-    /// the current `k` and bracket [`lo`, `hi`] (lo = largest solved, hi =
-    /// smallest failed, or `len+1` if nothing has failed yet). Phase 1: while no
-    /// failure (`hi > len`), double toward `len` to bracket the frontier fast.
-    /// Phase 2: once bracketed, bisect (lo, hi). Returns `None` when the edge is
-    /// pinned (`hi == lo + 1`) or there is no new candidate. Pure → unit-tested.
-    fn next_probe_k(k: usize, lo: usize, hi: usize, len: usize) -> Option<usize> {
-        let next = if hi > len {
-            (k * 2).min(len)
-        } else if hi - lo > 1 {
-            lo + (hi - lo) / 2
-        } else {
-            return None;
-        };
-        if next == lo { None } else { Some(next) }
+    /// Next scaffold-prefix to probe in the reverse-curriculum cusp search, by
+    /// bisecting the open bracket (`lo`, `hi`) where `lo` = largest prefix that
+    /// FAILED and `hi` = smallest prefix that SOLVED. The minimal solving prefix
+    /// (the cusp) lies in (`lo`, `hi`]. Returns `None` once the edge is pinned
+    /// (`hi <= lo + 1`). The FIRST probe is seeded separately (prefix_start), so
+    /// this only ever bisects. Pure → unit-tested.
+    fn next_prefix_probe(lo: usize, hi: usize) -> Option<usize> {
+        if hi <= lo + 1 { return None; }
+        let mid = lo + (hi - lo) / 2;
+        if mid == lo { None } else { Some(mid) }
     }
 
-    /// Find the agent's per-instance frontier via exponential-bracket then
-    /// binary-search refine, keeping the barely-solvable probe (`best`) and the
-    /// barely-too-hard probe (`failed`) — the sharpest training signal at the
-    /// ability boundary. Bounded by `reverse_curriculum_max_probes` (the
-    /// precision dial). Phase 1: start a small absolute `k` actions from the
-    /// goal and DOUBLE until the first failure (brackets the frontier fast,
-    /// independent of plan length). Phase 2: bisect between the largest solved
-    /// (`lo`) and smallest failed (`hi`) to pin the edge.
+    /// Find the agent's per-instance CUSP — the minimal scaffold prefix `p` (the
+    /// heuristic replays the first `p` actions from the START; the agent solves
+    /// the remaining `len - p` tail) at which the agent still finishes — via
+    /// binary search, keeping the barely-solvable probe (`best`, POSITIVE signal:
+    /// the path that works from the cusp) and the barely-too-hard probe (`failed`,
+    /// NEGATIVE signal) — the sharpest contrastive signal at the ability boundary
+    /// on the SAME env. Bounded by `reverse_curriculum_max_probes` (the precision
+    /// dial). Prior: the roadblock lives near the opening, so the FIRST probe is
+    /// seeded at `reverse_curriculum_prefix_start` (~10, right next to the full
+    /// unscaffolded env) instead of near the goal; subsequent probes bisect.
+    /// Bracket invariant: `lo` = largest prefix that FAILED (0 = the full env),
+    /// `hi` = smallest prefix that SOLVED (`len` = fully scaffolded, trivially at
+    /// the goal); the cusp lies in (`lo`, `hi`].
     fn gather_reverse_curriculum(
         &self,
         game: &Environment,
@@ -730,31 +734,32 @@ impl Gatherer {
         rng: &mut impl Rng,
     ) -> (f32, f32, bool) {
         let len = plan.len();
-        let mut lo = 0usize;          // largest tail SOLVED (0 = none yet)
-        let mut hi = len + 1;         // smallest tail FAILED (len+1 = none yet)
+        let mut lo = 0usize;          // largest prefix FAILED (0 = full env / none yet)
+        let mut hi = len;             // smallest prefix SOLVED (len = fully scaffolded)
         let mut best: Option<EpisodeOutcome> = None;
         let mut failed: Option<EpisodeOutcome> = None;
         let mut ret = (0.0, 0.0, false);
-        let mut k = self.reverse_curriculum_k_start_actions.clamp(1, len);
+        let mut p = self.reverse_curriculum_prefix_start.min(len);  // seed near full env
         for _ in 0..self.reverse_curriculum_max_probes {
-            let sk = self.make_reverse_start(game, plan, len - k);
-            // Reference for S_k = D_full (heuristic finishes S_k via its
-            // remaining actions to the same terminal), with `k` remaining
-            // heuristic actions for the action budget. No S_k re-solve → no
+            let sk = self.make_reverse_start(game, plan, p);
+            // Reference for S_p = D_full (heuristic finishes S_p via its
+            // remaining actions to the same terminal), with `len - p` remaining
+            // heuristic actions for the action budget. No S_p re-solve → no
             // `[stuck] no_ready_pp` panics from the greedy solver on mid-states.
-            let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, k)));
+            let tail = len - p;
+            let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, tail)));
             ret = (o.solution_depth, o.reference_depth, o.done);
             if o.done {
-                lo = k;
+                hi = p;
                 best = Some(o);
-                if k >= len { break; }        // solved the whole problem
+                if p == 0 { break; }          // solves the FULL unscaffolded env
             } else {
-                hi = k;
+                lo = p;
                 failed = Some(o);
             }
-            match Self::next_probe_k(k, lo, hi, len) {
-                Some(next) => k = next,
-                None => break,                // edge pinned / nothing new
+            match Self::next_prefix_probe(lo, hi) {
+                Some(next) => p = next,
+                None => break,                // cusp pinned / nothing new
             }
         }
         if let Some(o) = &best   { self.write_episode(o, true, rng); }
@@ -1519,7 +1524,7 @@ use pyo3::exceptions::PyRuntimeError;
     reverse_curriculum = false,
     reverse_curriculum_min_len = 50,
     reverse_curriculum_max_probes = 5,
-    reverse_curriculum_k_start_actions = 16,
+    reverse_curriculum_prefix_start = 10,
     reverse_curriculum_prob = 1.0,
     gold_shard_dir = None,
     gold_min_len = usize::MAX,
@@ -1573,7 +1578,7 @@ pub fn run_gatherer(
     reverse_curriculum: bool,
     reverse_curriculum_min_len: usize,
     reverse_curriculum_max_probes: usize,
-    reverse_curriculum_k_start_actions: usize,
+    reverse_curriculum_prefix_start: usize,
     reverse_curriculum_prob: f32,
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
@@ -1628,7 +1633,7 @@ pub fn run_gatherer(
         reverse_curriculum,
         reverse_curriculum_min_len,
         reverse_curriculum_max_probes,
-        reverse_curriculum_k_start_actions,
+        reverse_curriculum_prefix_start,
         reverse_curriculum_prob,
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
@@ -2070,31 +2075,32 @@ mod tests {
     }
 
     #[test]
-    fn test_next_probe_k_brackets_and_pins_frontier() {
-        // Simulate the reverse-curriculum edge search against a known frontier F
-        // (the "agent" solves a tail k iff k <= F). Invariants: lo (largest
-        // solved) stays <= F and hi (smallest failed) stays > F throughout, and
-        // with enough budget the edge is pinned (hi - lo == 1).
-        for &(len, f, start, budget, expect_pinned) in &[
-            (1000usize, 40usize, 16usize, 10usize, true),
-            (1000, 3, 16, 10, true),     // frontier BELOW k_start → bisect down
-            (1000, 500, 16, 14, true),   // far frontier
-            (50, 50, 16, 10, false),     // solves everything (edge = len)
-            (1000, 0, 16, 12, true),     // can't solve even k=1
+    fn test_next_prefix_probe_pins_cusp() {
+        // Simulate the reverse-curriculum cusp search against a known cusp P*
+        // (the "agent" solves from scaffold prefix p iff p >= P*). The first
+        // probe is seeded at `seed` (the prior, ~10); the rest bisect. Invariants:
+        // lo (largest failed prefix) stays < P* and hi (smallest solved prefix)
+        // stays >= P*; with enough budget the cusp is pinned (hi == P*).
+        for &(len, pstar, seed, budget, expect_pinned) in &[
+            (203usize, 10usize, 10usize, 8usize, true),  // cusp exactly at the prior
+            (203, 60, 10, 9, true),                       // cusp ABOVE prior → search up
+            (203, 3, 10, 8, true),                        // cusp BELOW prior → bisect down
+            (50, 0, 10, 8, false),                        // solvable fully unscaffolded
+            (203, 203, 10, 9, false),                     // needs full scaffold
         ] {
-            let (mut lo, mut hi) = (0usize, len + 1);
-            let mut k = start.clamp(1, len);
+            let (mut lo, mut hi) = (0usize, len);
+            let mut p = seed.min(len);
             for _ in 0..budget {
-                if k <= f { lo = k; if k >= len { break; } } else { hi = k; }
-                match Gatherer::next_probe_k(k, lo, hi, len) {
-                    Some(n) => k = n,
+                if p >= pstar { hi = p; if p == 0 { break; } } else { lo = p; }
+                match Gatherer::next_prefix_probe(lo, hi) {
+                    Some(n) => p = n,
                     None => break,
                 }
             }
-            assert!(lo <= f, "len={len} F={f}: lo={lo} exceeds frontier");
-            assert!(hi > f, "len={len} F={f}: hi={hi} not above frontier");
+            assert!(pstar == 0 || lo < pstar, "len={len} P*={pstar}: lo={lo} not below cusp");
+            assert!(hi >= pstar, "len={len} P*={pstar}: hi={hi} below cusp");
             if expect_pinned {
-                assert_eq!(hi - lo, 1, "len={len} F={f}: edge not pinned (lo={lo} hi={hi})");
+                assert_eq!(hi, pstar, "len={len} P*={pstar}: cusp not pinned (lo={lo} hi={hi})");
             }
         }
     }
