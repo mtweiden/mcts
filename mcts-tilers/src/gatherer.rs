@@ -740,6 +740,12 @@ impl Gatherer {
         let mut failed: Option<EpisodeOutcome> = None;
         let mut ret = (0.0, 0.0, false);
         let mut p = self.reverse_curriculum_prefix_start.min(len);  // seed near full env
+        // Per-env cusp-search telemetry (env-gated by RC_CUSP_LOG). Records the
+        // seed, the full probe sequence, the pinned cusp prefix, and best/failed
+        // scores so we can confirm the search converges and cusps cluster low.
+        let log_cusp = std::env::var("RC_CUSP_LOG").is_ok();
+        let seed = p;
+        let mut probe_log: Vec<(usize, bool)> = Vec::new();
         for _ in 0..self.reverse_curriculum_max_probes {
             let sk = self.make_reverse_start(game, plan, p);
             // Reference for S_p = D_full (heuristic finishes S_p via its
@@ -749,6 +755,7 @@ impl Gatherer {
             let tail = len - p;
             let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, tail)));
             ret = (o.solution_depth, o.reference_depth, o.done);
+            if log_cusp { probe_log.push((p, o.done)); }
             if o.done {
                 hi = p;
                 best = Some(o);
@@ -761,6 +768,20 @@ impl Gatherer {
                 Some(next) => p = next,
                 None => break,                // cusp pinned / nothing new
             }
+        }
+        if log_cusp {
+            // cusp_prefix = smallest solved prefix (hi) = the pinned cusp; -1 = never solved.
+            // failed_prefix = largest failed prefix (lo); -1 = nothing failed.
+            let cusp_prefix: i64 = if best.is_some() { hi as i64 } else { -1 };
+            let failed_prefix: i64 = if failed.is_some() { lo as i64 } else { -1 };
+            let bscore = best.as_ref().map_or(f32::NAN, |o| o.score);
+            let fscore = failed.as_ref().map_or(f32::NAN, |o| o.score);
+            eprintln!(
+                "[RC_CUSP] mw={} k={} len={} seed={} probes={:?} cusp_prefix={} \
+                 best_score={:.3} failed_prefix={} failed_score={:.3}",
+                self.env_mw, self.env_k, len, seed, probe_log, cusp_prefix,
+                bscore, failed_prefix, fscore
+            );
         }
         if let Some(o) = &best   { self.write_episode(o, true, rng); }
         if let Some(o) = &failed { self.write_episode(o, true, rng); }
