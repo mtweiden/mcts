@@ -740,10 +740,13 @@ impl Gatherer {
         let mut failed: Option<EpisodeOutcome> = None;
         let mut ret = (0.0, 0.0, false);
         let mut p = self.reverse_curriculum_prefix_start.min(len);  // seed near full env
-        // Per-env cusp-search telemetry (env-gated by RC_CUSP_LOG). Records the
-        // seed, the full probe sequence, the pinned cusp prefix, and best/failed
-        // scores so we can confirm the search converges and cusps cluster low.
-        let log_cusp = std::env::var("RC_CUSP_LOG").is_ok();
+        // Per-env cusp-search telemetry. RC_CUSP_LOG holds the target FILE PATH
+        // (unset = off). Records the seed, full probe sequence, pinned cusp prefix,
+        // and best/failed scores so we can confirm the search converges and cusps
+        // cluster low. Written via atomic O_APPEND (below) so concurrent gatherer
+        // workers never interleave — stderr/tee can't be used (they double + garble).
+        let cusp_log_path = std::env::var("RC_CUSP_LOG").ok();
+        let log_cusp = cusp_log_path.is_some();
         let seed = p;
         let mut probe_log: Vec<(usize, bool)> = Vec::new();
         for _ in 0..self.reverse_curriculum_max_probes {
@@ -776,12 +779,24 @@ impl Gatherer {
             let failed_prefix: i64 = if failed.is_some() { lo as i64 } else { -1 };
             let bscore = best.as_ref().map_or(f32::NAN, |o| o.score);
             let fscore = failed.as_ref().map_or(f32::NAN, |o| o.score);
-            eprintln!(
+            let line = format!(
                 "[RC_CUSP] mw={} k={} len={} seed={} probes={:?} cusp_prefix={} \
-                 best_score={:.3} failed_prefix={} failed_score={:.3}",
+                 best_score={:.3} failed_prefix={} failed_score={:.3}\n",
                 self.env_mw, self.env_k, len, seed, probe_log, cusp_prefix,
                 bscore, failed_prefix, fscore
             );
+            // Atomic O_APPEND: a single write < PIPE_BUF is atomic even across the
+            // 40 concurrent gatherer workers, so lines never interleave.
+            if let Some(path) = cusp_log_path.as_deref() {
+                use std::io::Write;
+                if let Ok(mut f) = std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(path)
+                {
+                    let _ = f.write_all(line.as_bytes());
+                }
+            }
         }
         if let Some(o) = &best   { self.write_episode(o, true, rng); }
         if let Some(o) = &failed { self.write_episode(o, true, rng); }
