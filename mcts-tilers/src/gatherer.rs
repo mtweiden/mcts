@@ -674,6 +674,10 @@ impl Gatherer {
                     "achieved_objectives": 0,
                     "reverse_curriculum": false,
                     "is_demo": true,
+                    // env context so demos are sliceable by weight (full-weight
+                    // demos = env_mw >= demo_only_min_weight) for analysis.
+                    "env_mw": self.env_mw,
+                    "env_k": self.env_k,
                 });
                 writeln!(file, "{}", record).expect("Failed to write demo record");
             }
