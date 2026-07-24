@@ -208,6 +208,11 @@ pub struct Gatherer {
     /// independent supervision, so random subsampling is legitimate and keeps
     /// coverage of deep states (unlike truncation). 1.0 = keep all.
     demo_subsample: f32,
+    /// Envs with env_mw >= this are IMITATION-ONLY: write the (subsampled)
+    /// heuristic demo and skip the agent episode + reverse-curriculum entirely.
+    /// Full-weight PPs are far beyond the agent's frontier — playing them only
+    /// flails ~1000+ steps and floods the corpus with failures. 0 = disabled.
+    demo_only_min_weight: usize,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -305,13 +310,16 @@ impl Gatherer {
             demo_fraction: 0.0,
             demo_subsample: 1.0,
             demo_min_objectives: 2,
+            demo_only_min_weight: 0,
         }
     }
 
-    pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize, demo_subsample: f32) {
+    pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize,
+                    demo_subsample: f32, demo_only_min_weight: usize) {
         self.demo_fraction = demo_fraction.clamp(0.0, 1.0);
         self.demo_subsample = demo_subsample.clamp(0.0, 1.0);
         self.demo_min_objectives = demo_min_objectives;
+        self.demo_only_min_weight = demo_only_min_weight;
     }
 
     pub fn set_cusp_reward(&mut self, enabled: bool, frontier: usize, margin: usize) {
@@ -533,6 +541,13 @@ impl Gatherer {
     ) -> (f32, f32, bool) {
         let mut game = env.clone();
         game.set_cultivation_time(10);
+        // IMITATION-ONLY for full-weight envs: env_mw >= demo_only_min_weight are
+        // far past the agent's frontier, so we skip the agent episode AND the
+        // reverse-curriculum and write only the (subsampled) heuristic demo. This
+        // gives full-weight imitation cheaply without flailing / corpus flooding.
+        if self.demo_only_min_weight > 0 && self.env_mw >= self.demo_only_min_weight {
+            return self.write_demo_episode(&game, rng);
+        }
         // Clustered wide-PP envs (env_k > 0) may use a separate, higher RC
         // probability — see set_clustered_reverse_prob.
         let rc_prob = if self.env_k > 0 && self.clustered_reverse_prob >= 0.0 {
@@ -1571,6 +1586,7 @@ use pyo3::exceptions::PyRuntimeError;
     demo_fraction = 0.0,
     demo_min_objectives = 2,
     demo_subsample = 1.0,
+    demo_only_min_weight = 0,
     gather_min_ref_actions = 0,
     gather_easy_keep_fraction = 0.15,
 ))]
@@ -1625,6 +1641,7 @@ pub fn run_gatherer(
     demo_fraction: f32,
     demo_min_objectives: usize,
     demo_subsample: f32,
+    demo_only_min_weight: usize,
     gather_min_ref_actions: usize,
     gather_easy_keep_fraction: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
@@ -1674,7 +1691,7 @@ pub fn run_gatherer(
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
-    gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample);
+    gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample, demo_only_min_weight);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
