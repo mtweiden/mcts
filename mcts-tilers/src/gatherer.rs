@@ -1572,6 +1572,9 @@ use pyo3::exceptions::PyRuntimeError;
     clustered_wide_pp_block_side = 0,
     clustered_wide_pp_num_clusters = 1,
     clustered_wide_pp_weight_min = 0,
+    clustered_learnable_prob = 0.0,
+    clustered_learnable_min = 0,
+    clustered_learnable_max = 0,
     clustered_max_generated_depth = None,
     clustered_reverse_prob = -1.0,
     floor_keep_fraction = 1.0,
@@ -1627,6 +1630,9 @@ pub fn run_gatherer(
     clustered_wide_pp_block_side: usize,
     clustered_wide_pp_num_clusters: usize,
     clustered_wide_pp_weight_min: usize,
+    clustered_learnable_prob: f32,
+    clustered_learnable_min: usize,
+    clustered_learnable_max: usize,
     clustered_max_generated_depth: Option<usize>,
     clustered_reverse_prob: f32,
     floor_keep_fraction: f32,
@@ -1737,12 +1743,22 @@ pub fn run_gatherer(
         // weight's mass ages out of the K=5 replay window as the cap moves.
         // Drawing w ~ uniform[min, cap] keeps the whole band populated.
         // weight_min = 0 disables (legacy always-cap).
-        let w = if clustered_wide_pp_weight_min > 0
-            && clustered_wide_pp_weight_min < clustered_wide_pp_weight
+        // TRUE FULL-WEIGHT: the PP touches ALL non-ancilla qubits, i.e. weight =
+        // (h*w - num_blanks) (num_blanks IS the ancilla budget). A small
+        // clustered_learnable_prob fraction is instead a narrow LEARNABLE
+        // near-frontier band [learnable_min, learnable_max] (agent plays +
+        // reverse-curriculum, to keep climbing its wide-merge frontier); the rest
+        // are full-weight (fraction 1.0), which the demo-only path imitates.
+        let full_w = (height * width).saturating_sub(num_blanks).max(1);
+        let w = if clustered_learnable_prob > 0.0
+            && clustered_learnable_max >= clustered_learnable_min
+            && clustered_learnable_min > 0
+            && rng.random_range(0.0f32..1.0) < clustered_learnable_prob
         {
-            rng.random_range(clustered_wide_pp_weight_min..=clustered_wide_pp_weight)
+            let hi = clustered_learnable_max.min(full_w).max(clustered_learnable_min);
+            rng.random_range(clustered_learnable_min..=hi)
         } else {
-            clustered_wide_pp_weight
+            full_w
         };
         env.random_start_clustered_pp(w, clustered_wide_pp_block_side, k);
         gatherer.set_env_meta(pp_weights(&env).1, k);
