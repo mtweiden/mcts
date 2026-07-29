@@ -213,6 +213,29 @@ pub struct Gatherer {
     /// Full-weight PPs are far beyond the agent's frontier — playing them only
     /// flails ~1000+ steps and floods the corpus with failures. 0 = disabled.
     demo_only_min_weight: usize,
+    /// Probability that a FULL-WEIGHT (demo-only) env ALSO gets an agent
+    /// reverse-curriculum episode instead of just the heuristic demo. Without
+    /// this the agent never ACTS on the target distribution at all — it only
+    /// behavior-clones (the demo-only branch skips play AND RC), so it gets no
+    /// reward signal where we actually want competence. 0 = disabled (old
+    /// behaviour). See full_weight_rc_tail for why the seed must be goal-side.
+    full_weight_rc_prob: f32,
+    /// Agent-played SUFFIX length for full-weight RC episodes: the heuristic
+    /// scaffolds `plan.len() - tail` actions and the agent finishes the last
+    /// `tail`. The normal RC seed (reverse_curriculum_prefix_start = 10) seeds
+    /// near the FULL env, which on a ~1600-action full-weight plan would have
+    /// the agent flail ~1590 steps per probe. Measured 2026-07-29: on full-weight
+    /// envs the agent stalls after ~120-170 productive steps, so the tail is
+    /// sized to what it can actually sustain. Bisection is floored at
+    /// `len - 2*tail` so a probe can never blow up into a full-length flail.
+    full_weight_rc_tail: usize,
+    /// Length-normalized demo subsampling: keep ~this many states per demo
+    /// episode REGARDLESS of plan length (keep-prob = min(1, target/plan_len)),
+    /// so a long high-weight demo (refn ~2600) and a short one (~900) contribute
+    /// EQUAL records. Fixes the weight-mass imbalance a flat demo_subsample
+    /// fraction causes (long demos over-represent high weights, cannibalizing the
+    /// easier regime — measured cand-69 2026-07-27). 0 = disabled (use fraction).
+    demo_target_states: usize,
 }
 
 /// One self-play episode's outcome, decoupled from record-writing so the
@@ -311,15 +334,25 @@ impl Gatherer {
             demo_subsample: 1.0,
             demo_min_objectives: 2,
             demo_only_min_weight: 0,
+            demo_target_states: 0,
+            full_weight_rc_prob: 0.0,
+            full_weight_rc_tail: 0,
         }
     }
 
     pub fn set_demo(&mut self, demo_fraction: f32, demo_min_objectives: usize,
-                    demo_subsample: f32, demo_only_min_weight: usize) {
+                    demo_subsample: f32, demo_only_min_weight: usize,
+                    demo_target_states: usize) {
         self.demo_fraction = demo_fraction.clamp(0.0, 1.0);
         self.demo_subsample = demo_subsample.clamp(0.0, 1.0);
         self.demo_min_objectives = demo_min_objectives;
         self.demo_only_min_weight = demo_only_min_weight;
+        self.demo_target_states = demo_target_states;
+    }
+
+    pub fn set_full_weight_rc(&mut self, prob: f32, tail: usize) {
+        self.full_weight_rc_prob = prob.clamp(0.0, 1.0);
+        self.full_weight_rc_tail = tail;
     }
 
     pub fn set_cusp_reward(&mut self, enabled: bool, frontier: usize, margin: usize) {
@@ -546,6 +579,27 @@ impl Gatherer {
         // reverse-curriculum and write only the (subsampled) heuristic demo. This
         // gives full-weight imitation cheaply without flailing / corpus flooding.
         if self.demo_only_min_weight > 0 && self.env_mw >= self.demo_only_min_weight {
+            // ...UNLESS full-weight RC practice is enabled. Pure imitation gives
+            // the agent no reward signal on the target distribution; a goal-side
+            // reverse-curriculum episode lets it actually FINISH a full-weight
+            // merge (positive reward) from a deep scaffold, and the cusp search
+            // walks the scaffold back as it improves.
+            if self.full_weight_rc_prob > 0.0
+                && self.full_weight_rc_tail > 0
+                && self.reverse_curriculum
+                && rng.random::<f32>() < self.full_weight_rc_prob
+            {
+                let (d_full, plan) = self.heuristic_typed_plan(&game);
+                if plan.len() > self.full_weight_rc_tail {
+                    // Seed GOAL-side (agent plays the last `tail`), and floor the
+                    // bisection so no probe ever exceeds a 2*tail agent suffix.
+                    let seed = plan.len() - self.full_weight_rc_tail;
+                    let floor = plan.len().saturating_sub(2 * self.full_weight_rc_tail);
+                    return self.gather_reverse_curriculum(
+                        &game, d_full, &plan, client, c_puct, rng, Some((seed, floor)),
+                    );
+                }
+            }
             return self.write_demo_episode(&game, rng);
         }
         // Clustered wide-PP envs (env_k > 0) may use a separate, higher RC
@@ -558,7 +612,7 @@ impl Gatherer {
         if self.reverse_curriculum && rng.random::<f32>() < rc_prob {
             let (d_full, plan) = self.heuristic_typed_plan(&game);
             if plan.len() >= self.reverse_curriculum_min_len {
-                return self.gather_reverse_curriculum(&game, d_full, &plan, client, c_puct, rng);
+                return self.gather_reverse_curriculum(&game, d_full, &plan, client, c_puct, rng, None);
             }
         }
         let o = self.run_episode_from(&game, client, c_puct, rng, None);
@@ -650,10 +704,18 @@ impl Gatherer {
                 .map(|&va| rl::encode(&tenv.inner, va).expect("valid_actions ids always encode") as Action)
                 .collect();
 
-            // Subsample: keep each demo state with prob demo_subsample. Every
+            // Subsample: keep each demo state with prob keep_prob. Every
             // state-action pair is independent supervision, so a random subset
             // is unbiased and covers deep states (truncation wouldn't).
-            if valid_actions.contains(&encoded) && rng.random::<f32>() < self.demo_subsample {
+            // Length-normalized when demo_target_states>0: keep-prob scales as
+            // target/plan_len so every demo yields ~target states regardless of
+            // length -> equal record weight across PP weights (no long-demo bias).
+            let keep_prob = if self.demo_target_states > 0 {
+                (self.demo_target_states as f32 / (plan.len().max(1) as f32)).min(1.0)
+            } else {
+                self.demo_subsample
+            };
+            if valid_actions.contains(&encoded) && rng.random::<f32>() < keep_prob {
                 let board_json = Self::serialize_board(&board);
                 let valid_actions_json =
                     Value::Array(valid_actions.iter().map(|&x| Value::from(x)).collect());
@@ -751,14 +813,22 @@ impl Gatherer {
         client: &dyn InferenceClient<TilersEnv>,
         c_puct: f32,
         rng: &mut impl Rng,
+        // (prefix_seed, lo_floor) override. None = normal band behaviour: seed
+        // near the FULL env and bisect over the whole range. Some(..) is used by
+        // the full-weight path to seed GOAL-side and floor the bisection so a
+        // probe can't degenerate into a full-length flail.
+        seed_override: Option<(usize, usize)>,
     ) -> (f32, f32, bool) {
         let len = plan.len();
-        let mut lo = 0usize;          // largest prefix FAILED (0 = full env / none yet)
+        let mut lo = seed_override.map(|(_, f)| f).unwrap_or(0);  // largest prefix FAILED
         let mut hi = len;             // smallest prefix SOLVED (len = fully scaffolded)
         let mut best: Option<EpisodeOutcome> = None;
         let mut failed: Option<EpisodeOutcome> = None;
         let mut ret = (0.0, 0.0, false);
-        let mut p = self.reverse_curriculum_prefix_start.min(len);  // seed near full env
+        let mut p = match seed_override {
+            Some((s, _)) => s.min(len),
+            None => self.reverse_curriculum_prefix_start.min(len),  // seed near full env
+        };
         // Per-env cusp-search telemetry. RC_CUSP_LOG holds the target FILE PATH
         // (unset = off). Records the seed, full probe sequence, pinned cusp prefix,
         // and best/failed scores so we can confirm the search converges and cusps
@@ -1594,6 +1664,9 @@ use pyo3::exceptions::PyRuntimeError;
     demo_min_objectives = 2,
     demo_subsample = 1.0,
     demo_only_min_weight = 0,
+    demo_target_states = 0,
+    full_weight_rc_prob = 0.0,
+    full_weight_rc_tail = 0,
     gather_min_ref_actions = 0,
     gather_easy_keep_fraction = 0.15,
 ))]
@@ -1652,6 +1725,9 @@ pub fn run_gatherer(
     demo_min_objectives: usize,
     demo_subsample: f32,
     demo_only_min_weight: usize,
+    demo_target_states: usize,
+    full_weight_rc_prob: f32,
+    full_weight_rc_tail: usize,
     gather_min_ref_actions: usize,
     gather_easy_keep_fraction: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
@@ -1701,7 +1777,8 @@ pub fn run_gatherer(
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
-    gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample, demo_only_min_weight);
+    gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample, demo_only_min_weight, demo_target_states);
+    gatherer.set_full_weight_rc(full_weight_rc_prob, full_weight_rc_tail);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
