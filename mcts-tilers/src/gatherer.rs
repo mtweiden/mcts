@@ -213,6 +213,23 @@ pub struct Gatherer {
     /// Full-weight PPs are far beyond the agent's frontier — playing them only
     /// flails ~1000+ steps and floods the corpus with failures. 0 = disabled.
     demo_only_min_weight: usize,
+    /// Play temperature used DEEP in an episode (step >= deep_play_after).
+    /// 0 = disabled (keep the legacy decay).
+    ///
+    /// The legacy schedule is `0.1 + 0.9*exp(-0.5*step)`: a 1.4-step half-life,
+    /// so from step ~10 onward the agent samples from visits^10, i.e. argmax.
+    /// On a 900-step full-weight episode that is ~1% exploration, against
+    /// AlphaZero's ~15%-of-game exploration phase -- and it explores at the
+    /// START, where the position is easy, then plays the hard deep states
+    /// greedily. Measured 2026-07-29 on the 20-env full-weight probe (same
+    /// agent, same seeds, only play policy differs): argmax 30.8% vs
+    /// visit-proportional sampling after step 20 at 44.2% (15W/3L), and 27.8%
+    /// vs 63.8% on the subset a T=1.0 arm finished. Under Path B the gap holds
+    /// (81.2% -> 98.4% on the four hardest envs), so the two fixes stack.
+    deep_play_temp: f32,
+    /// Step from which `deep_play_temp` takes over. Keeps the opening greedy so
+    /// only genuinely deep states get the extra diversity.
+    deep_play_after: usize,
     /// Probability that a FULL-WEIGHT (demo-only) env ALSO gets an agent
     /// reverse-curriculum episode instead of just the heuristic demo. Without
     /// this the agent never ACTS on the target distribution at all — it only
@@ -337,6 +354,8 @@ impl Gatherer {
             demo_target_states: 0,
             full_weight_rc_prob: 0.0,
             full_weight_rc_tail: 0,
+            deep_play_temp: 0.0,
+            deep_play_after: 20,
         }
     }
 
@@ -348,6 +367,11 @@ impl Gatherer {
         self.demo_min_objectives = demo_min_objectives;
         self.demo_only_min_weight = demo_only_min_weight;
         self.demo_target_states = demo_target_states;
+    }
+
+    pub fn set_deep_play(&mut self, temp: f32, after: usize) {
+        self.deep_play_temp = temp.max(0.0);
+        self.deep_play_after = after;
     }
 
     pub fn set_full_weight_rc(&mut self, prob: f32, tail: usize) {
@@ -479,8 +503,15 @@ impl Gatherer {
             panic!("No valid actions available");
         }
 
-        // High temperature early (exploration), low temperature later (exploitation)
-        let temperature = 0.1 + 0.9 * (-0.5 * step as f64).exp();
+        // High temperature early (exploration), low temperature later
+        // (exploitation) -- UNLESS deep_play_temp is set, in which case deep
+        // states keep sampling instead of collapsing to argmax. See the
+        // deep_play_temp field docs for the measurement.
+        let temperature = if self.deep_play_temp > 0.0 && step >= self.deep_play_after {
+            self.deep_play_temp as f64
+        } else {
+            0.1 + 0.9 * (-0.5 * step as f64).exp()
+        };
         let noise_strength = self.noise_strength * (-0.5 * step as f64).exp();
 
         let probs = self._action_probabilities(
@@ -1001,7 +1032,35 @@ impl Gatherer {
             }
         };
 
+        // In-episode progress telemetry. The gatherer only ever printed at
+        // "Starting Env" and at termination, which was fine when episodes ran
+        // tens of steps -- but a full-weight episode runs 2400-3900 steps and can
+        // occupy a worker for the better part of an hour, during which the log is
+        // silent and there is no way to tell a slow episode from a hung one or to
+        // know how far along a wave is. Interval is set by GATHER_PROGRESS_EVERY
+        // (unset/0 = off, matching the RC_CUSP_LOG env-gated telemetry pattern).
+        // Self-limiting: an episode shorter than the interval never prints, so
+        // the small-PP band stays quiet and only the long merges report.
+        let progress_every: usize = std::env::var("GATHER_PROGRESS_EVERY")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
         for step in 0..max_actions {
+            if progress_every > 0 && step > 0 && step % progress_every == 0 {
+                let (fm, ft) = game.factor_progress(&tilers_env.inner);
+                println!(
+                    "[Gatherer {}] progress step={}/{} mw={} factors={}/{} ({:.0}%) depth={:.0}",
+                    self.gather_id,
+                    step,
+                    max_actions,
+                    pp_weights(&game).1,
+                    fm,
+                    ft,
+                    if ft > 0 { 100.0 * fm as f32 / ft as f32 } else { 0.0 },
+                    tilers_env.inner.depth(true, true),
+                );
+            }
             // Playout cap randomization [Wu 2020, §3.1]:
             // Full searches are run on a random fraction of turns and recorded
             // for training. Fast searches use a smaller budget and are used
@@ -1196,7 +1255,24 @@ impl Gatherer {
                         achieved, start_objs, self.cusp_frontier, self.cusp_margin);
                     (r, "her", achieved)
                 }
-            } else if self.cusp_reward && game.num_objectives() > self.cusp_frontier {
+            } else if self.cusp_reward
+                && (game.num_objectives() > self.cusp_frontier
+                    // ...OR the env is ONE wide PauliProduct. The gate used to
+                    // count OBJECTIVES only, but full-weight envs are a single
+                    // objective holding up to ~98 factors, so `1 > frontier` was
+                    // false and every full-weight episode fell through to vanilla
+                    // HER -- precisely the pathology the cusp reward exists to
+                    // fix ("relabels a HARD env DOWN to the objectives already
+                    // executed and scores it as an efficient success ... NO
+                    // gradient to complete more"). It also paid a full
+                    // achieved_goal_env + Solver::solve per failed episode for a
+                    // score the outcome-only contract then overwrites with -1.
+                    // Difficulty now lives in FACTORS within one objective, so
+                    // fire whenever the widest merge exceeds the cusp budget
+                    // (frontier + margin) in factor terms. For a single PP the
+                    // budget resolves to `total`, i.e. dense merged/total - 1.
+                    || pp_weights(&game).1 > self.cusp_frontier + self.cusp_margin)
+            {
                 // CUSP reward (Axis A2). Vanilla HER relabels a HARD env DOWN to
                 // exactly the (usually 1-2) objectives the agent already executed
                 // and scores it as an efficient success — so ~95% of effective
@@ -1453,8 +1529,19 @@ impl Gatherer {
         // -1, so we don't write it. We keep the honest heuristic-achieved-depth
         // comparison (the true efficiency signal) — only the saturated examples
         // are filtered. "floor" (genuine zero-progress) and "done" are unaffected.
+        // Saturated HER episodes are the same "uninformative -1" category as
+        // floor, so they obey the same knob instead of being dropped
+        // unconditionally: at floor_keep_fraction 1.0 they are KEPT. The drop
+        // happens before temp_data is written, so it discarded that episode's
+        // full-search states -- the only ones that become policy targets. Cheap
+        // to throw away when episodes were short; at ~0.7M network evaluations
+        // per full-weight episode it is the most expensive data we produce.
         const HER_SATURATION_FLOOR: f32 = -0.999;
-        if o.reward_kind == "her" && o.score <= HER_SATURATION_FLOOR {
+        if o.reward_kind == "her"
+            && o.score <= HER_SATURATION_FLOOR
+            && self.floor_keep_fraction < 1.0
+            && rng.random::<f32>() >= self.floor_keep_fraction
+        {
             return (o.solution_depth, o.reference_depth, o.done);
         }
 
@@ -1667,6 +1754,8 @@ use pyo3::exceptions::PyRuntimeError;
     demo_target_states = 0,
     full_weight_rc_prob = 0.0,
     full_weight_rc_tail = 0,
+    deep_play_temp = 0.0,
+    deep_play_after = 20,
     gather_min_ref_actions = 0,
     gather_easy_keep_fraction = 0.15,
 ))]
@@ -1728,6 +1817,8 @@ pub fn run_gatherer(
     demo_target_states: usize,
     full_weight_rc_prob: f32,
     full_weight_rc_tail: usize,
+    deep_play_temp: f32,
+    deep_play_after: usize,
     gather_min_ref_actions: usize,
     gather_easy_keep_fraction: f32,
 ) -> PyResult<Option<(f32, f32, bool)>> {
@@ -1779,6 +1870,7 @@ pub fn run_gatherer(
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
     gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample, demo_only_min_weight, demo_target_states);
     gatherer.set_full_weight_rc(full_weight_rc_prob, full_weight_rc_tail);
+    gatherer.set_deep_play(deep_play_temp, deep_play_after);
 
     let mut rng = if let Some(s) = seed {
         StdRng::seed_from_u64(s as u64)
