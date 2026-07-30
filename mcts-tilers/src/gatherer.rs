@@ -586,14 +586,27 @@ impl Gatherer {
     /// heuristic actions from `game`, leaving the remaining `len - prefix_len`
     /// objectives for the agent. `prefix_len == 0` yields the true start S0;
     /// `prefix_len == plan.len()` yields the (near-)solved terminal.
-    fn make_reverse_start(&self, game: &Environment, plan: &[PlanAction], prefix_len: usize) -> Environment {
+    /// Returns the scaffolded start AND the depth the scaffold itself consumed.
+    ///
+    /// The prefix is applied with real `step`s, so `S_k`'s depth already includes
+    /// it — and so does the agent's final `solution_depth`. The scoring ratio must
+    /// therefore subtract it from BOTH sides, else the denominator is the full
+    /// reference while the agent only ever controls the suffix (see the call in
+    /// `run_episode_from`).
+    fn make_reverse_start(
+        &self,
+        game: &Environment,
+        plan: &[PlanAction],
+        prefix_len: usize,
+    ) -> (Environment, f32) {
         let mut sk = game.clone();
         sk.set_cultivation_time(10);
         for a in plan.iter().take(prefix_len) {
             let _ = sk.step(a.clone());
             sk.finish_cultivating(None, None);
         }
-        sk
+        let scaffold_depth = sk.depth(true, true) as f32;
+        (sk, scaffold_depth)
     }
 
     pub fn gather(
@@ -870,13 +883,14 @@ impl Gatherer {
         let seed = p;
         let mut probe_log: Vec<(usize, bool)> = Vec::new();
         for _ in 0..self.reverse_curriculum_max_probes {
-            let sk = self.make_reverse_start(game, plan, p);
+            let (sk, scaffold_depth) = self.make_reverse_start(game, plan, p);
             // Reference for S_p = D_full (heuristic finishes S_p via its
             // remaining actions to the same terminal), with `len - p` remaining
             // heuristic actions for the action budget. No S_p re-solve → no
             // `[stuck] no_ready_pp` panics from the greedy solver on mid-states.
             let tail = len - p;
-            let o = self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, tail)));
+            let o =
+                self.run_episode_from(&sk, client, c_puct, rng, Some((d_full, tail, scaffold_depth)));
             ret = (o.solution_depth, o.reference_depth, o.done);
             if log_cusp { probe_log.push((p, o.done)); }
             if o.done {
@@ -933,7 +947,7 @@ impl Gatherer {
         client: &dyn InferenceClient<TilersEnv>,
         c_puct: f32,
         rng: &mut impl Rng,
-        reference_override: Option<(f32, usize)>,
+        reference_override: Option<(f32, usize, f32)>,
     ) -> EpisodeOutcome {
         let mut mcts: MCTS<TilersEnv> = MCTS::new(self.batch_size);
 
@@ -953,7 +967,7 @@ impl Gatherer {
         // `[stuck] no_ready_pp` from arbitrary mid-solution states). None →
         // solve S0 normally.
         let (reference_depth, reference_action_count) = match reference_override {
-            Some((d, n)) => (d, n),
+            Some((d, n, _)) => (d, n),
             None => {
                 let (d, acts) = self.solve_with_heuristic(&game);
                 (d, acts.len())
@@ -1025,10 +1039,22 @@ impl Gatherer {
         // the previous clip-then-normalize — smooth gradient at all input
         // scales; saturation is governed entirely by the temperature knob.
         let tau = self.reward_saturation_temperature;
+        // SCAFFOLD-RELATIVE SCORING. For a reverse-curriculum probe the prefix was
+        // applied with real steps, so it sits in BOTH `reference_depth` (= D_full)
+        // and the episode's depth. Subtracting it from both leaves the numerator
+        // unchanged (heuristic_suffix - agent_suffix) while fixing the denominator,
+        // which was D_full instead of the suffix the agent actually controls.
+        // Without this, RC rewards are scaled by suffix/D_full < 1 -- compressed
+        // toward zero, so a deeply scaffolded episode looks better than an
+        // equally-performing from-scratch one. Measured on iter-72 shards:
+        // rc mean -0.231 vs from-scratch -0.364, a ratio of 0.63 that the
+        // compression alone accounts for.
+        let scaffold = reference_override.map_or(0.0, |(_, _, s)| s);
+        let ref_suffix = (reference_depth - scaffold).max(1.0);
         let terminal_evaluator = |e: &TilersEnv| -> f32 {
             if !e.inner.done() { crate::reward::NOT_DONE_SCORE } else {
-                let d = e.inner.depth(true, true) as f32;
-                crate::reward::done_score(reference_depth, d, tau)
+                let d = (e.inner.depth(true, true) as f32 - scaffold).max(0.0);
+                crate::reward::done_score(ref_suffix, d, tau)
             }
         };
 
@@ -1219,8 +1245,10 @@ impl Gatherer {
         // completed (the HER goal size), for the flywheel metric.
         let (score, reward_kind, achieved_objectives): (f32, &'static str, usize) =
             if tilers_env.inner.done() {
-                let d = solution_depth as f32;
-                let ref_d = reference_depth as f32;
+                // Same scaffold-relative basis as `terminal_evaluator` above, or
+                // the value head's targets disagree with what MCTS backed up.
+                let d = (solution_depth as f32 - scaffold).max(0.0);
+                let ref_d = ref_suffix;
                 // Shared done-scorer (reward.rs) — must match the search
                 // terminal_evaluator above so the value head's training
                 // targets agree with the scalars MCTS backed up.
@@ -2250,7 +2278,7 @@ mod tests {
         assert!(!plan.is_empty(), "heuristic plan should be non-empty");
 
         // prefix_len = 0 reproduces the true start S0 (all objectives remain).
-        let s0 = g.make_reverse_start(&env, &plan, 0);
+        let (s0, _) = g.make_reverse_start(&env, &plan, 0);
         assert_eq!(
             s0.num_objectives(),
             env.num_objectives(),
@@ -2261,7 +2289,7 @@ mod tests {
         // each replayed heuristic action can only complete objectives, never add.
         let mut prev = s0.num_objectives();
         for prefix_len in 1..=plan.len() {
-            let sk = g.make_reverse_start(&env, &plan, prefix_len);
+            let (sk, _) = g.make_reverse_start(&env, &plan, prefix_len);
             let cur = sk.num_objectives();
             assert!(
                 cur <= prev,
@@ -2272,7 +2300,7 @@ mod tests {
 
         // prefix_len = plan.len() replays the entire heuristic solution ⇒
         // done / near-done: no more remaining objectives than the true start.
-        let full = g.make_reverse_start(&env, &plan, plan.len());
+        let (full, _) = g.make_reverse_start(&env, &plan, plan.len());
         assert!(
             full.num_objectives() <= s0.num_objectives(),
             "full replay should not have more objectives than S0",
@@ -2384,7 +2412,7 @@ mod tests {
         // (2) Ask the solver to finish from mid-prefix intermediate states.
         for frac in [0.25f32, 0.5, 0.75] {
             let prefix = ((plan.len() as f32) * frac) as usize;
-            let mut s_k = g.make_reverse_start(&env, &plan, prefix);
+            let (mut s_k, _) = g.make_reverse_start(&env, &plan, prefix);
             let before = s_k.num_objectives();
             match Solver::new().solve(&mut s_k, true) {
                 Ok(p) => eprintln!("  RE-SOLVE prefix={prefix} obj_remaining={before}: OK tail_len={}", p.len()),
@@ -2431,7 +2459,7 @@ mod tests {
                     // re-solve intermediate states
                     for frac in [0.2f32, 0.4, 0.6, 0.8] {
                         let prefix = ((plan.len() as f32) * frac) as usize;
-                        let mut s_k = g.make_reverse_start(&env, &plan, prefix);
+                        let (mut s_k, _) = g.make_reverse_start(&env, &plan, prefix);
                         if let Err(e) = Solver::new().solve(&mut s_k, true) {
                             stuck += 1;
                             if !first_stuck_reported {
@@ -2490,7 +2518,7 @@ mod tests {
                 let (_d, plan) = g.heuristic_typed_plan(&env);
                 if plan.len() < 50 { continue; }
 
-                let s_k = g.make_reverse_start(&env, &plan, plan.len() / 2);
+                let (s_k, _) = g.make_reverse_start(&env, &plan, plan.len() / 2);
                 let pseed = seed * 7 + 1;
                 if let Some(st) = try_her(&s_k, pseed) { sk_n += 1; if st { sk_stuck += 1;
                     if sk_stuck <= 3 { eprintln!("S_k HER STUCK: seed={seed} no={no}"); } } }
