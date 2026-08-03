@@ -120,6 +120,12 @@ pub struct Gatherer {
     /// See set_env_meta: generated-env max PP factor weight / cluster count,
     /// stamped on records for dashboard slicing. 0/0 when unset.
     env_mw: usize,
+    /// Sum of the weights of ALL objectives in the env. This is the difficulty
+    /// metric: `env_mw` (the single widest product) says nothing about how many
+    /// others sit behind it, and `num_ancillas` is actively misleading here
+    /// because full weight is `100 - num_ancillas`, so FEWER ancillas means a
+    /// HARDER env, not an easier one.
+    env_tw: usize,
     env_k: usize,
     /// Fraction of episodes in which resignation is *disabled* and the
     /// game is played out to its natural end. These serve as a sanity
@@ -152,6 +158,17 @@ pub struct Gatherer {
     /// full-trajectory-depth penalty that otherwise makes more-objectives
     /// episodes score *worse* (the observed non-monotonicity in achieved count).
     her_reward_margin: f32,
+    /// Master switch for the vanilla-HER fallback (default true = historical
+    /// behaviour). When false, an episode that reaches neither `done` nor the
+    /// cusp branch scores -1/"floor" instead of being relabelled to the goal it
+    /// happened to achieve. Turning HER off is only sane alongside the
+    /// outcome-only value contract: a non-done record trains toward -1 anyway,
+    /// so the `achieved_goal_env` + `Solver::solve` HER pays per failed episode
+    /// buys a reward the value head discards. It also removes the relabel-down
+    /// ("hard env scored as an efficient success") that the cusp reward exists
+    /// to prevent — which matters most when `cusp_reward` is OFF, since then
+    /// every hard env falls through to this branch.
+    her_reward: bool,
     /// If set, winning trajectories are written here as pretraining data.
     trajectory_dir: Option<String>,
     /// If set, the gatherer writes one JSON line per episode summarising
@@ -325,12 +342,14 @@ impl Gatherer {
             // clustered-RC override; sentinel -1.0 = generic prob).
             clustered_reverse_prob: -1.0,
             env_mw: 0,
+            env_tw: 0,
             env_k: 0,
             no_resign_rate: no_resign_rate.unwrap_or(0.1),
             // 1.0 = keep every floor episode (unchanged default).
             floor_keep_fraction: floor_keep_fraction.unwrap_or(1.0),
             // 0.0 = zero-reward at exactly the heuristic depth (unchanged default).
             her_reward_margin: her_reward_margin.unwrap_or(0.0),
+            her_reward: true,
             trajectory_dir,
             resignation_log_dir,
             reverse_curriculum: false,
@@ -379,6 +398,10 @@ impl Gatherer {
         self.full_weight_rc_tail = tail;
     }
 
+    pub fn set_her_reward(&mut self, enabled: bool) {
+        self.her_reward = enabled;
+    }
+
     pub fn set_cusp_reward(&mut self, enabled: bool, frontier: usize, margin: usize) {
         self.cusp_reward = enabled;
         self.cusp_frontier = frontier;
@@ -420,6 +443,12 @@ impl Gatherer {
     pub fn set_env_meta(&mut self, mw: usize, k: usize) {
         self.env_mw = mw;
         self.env_k = k;
+    }
+
+    /// Total objective weight for this env — the difficulty metric. Separate
+    /// setter so existing `set_env_meta` callers keep working unchanged.
+    pub fn set_env_total_weight(&mut self, tw: usize) {
+        self.env_tw = tw;
     }
 
     /// Solve the environment using a heuristic solver and return the depth of the solution.
@@ -783,6 +812,7 @@ impl Gatherer {
                     // env context so demos are sliceable by weight (full-weight
                     // demos = env_mw >= demo_only_min_weight) for analysis.
                     "env_mw": self.env_mw,
+                    "env_tw": self.env_tw,
                     "env_k": self.env_k,
                 });
                 writeln!(file, "{}", record).expect("Failed to write demo record");
@@ -1332,6 +1362,11 @@ impl Gatherer {
                         merged, total, start_objs, self.cusp_frontier, self.cusp_margin);
                     (r, "cusp", achieved)
                 }
+            } else if !self.her_reward {
+                // HER disabled: no relabel-down, and no achieved_goal_env +
+                // Solver::solve for a reward the outcome-only contract discards.
+                // A non-done episode is simply a loss.
+                (-1.0, "floor", 0)
             } else {
                 match game.achieved_goal_env(&tilers_env.inner) {
                     Ok(mut her_env) => {
@@ -1366,7 +1401,7 @@ impl Gatherer {
         // the agent's depth vs the heuristic reference and whether it beat it.
         if tilers_env.inner.done() {
             println!(
-                "[Gatherer {}] FINISHED Env(h={}, w={}, nb={}, no={}, tw={}, mw={}) | depth={} vs ref={} | score={:.3} (beat_solver={})",
+                "[Gatherer {}] FINISHED Env(h={}, w={}, nb={}, no={}, tw={}, mw={}) | depth={} vs ref={} refacts={} | score={:.3} (beat_solver={})",
                 self.gather_id,
                 game.height,
                 game.width,
@@ -1376,6 +1411,7 @@ impl Gatherer {
                 pp_weights(&game).1,
                 solution_depth,
                 reference_depth,
+                reference_action_count,
                 score,
                 solution_depth < reference_depth,
             );
@@ -1388,7 +1424,15 @@ impl Gatherer {
             // to the actual sub-problem the agent was handed.
             let (fm, ft) = game.factor_progress(&tilers_env.inner);
             println!(
-                "[Gatherer {}] UNFINISHED Env(h={}, w={}, nb={}, no={}, tw={}, mw={}) | factors {}/{} ({:.0}%) | score={:.3} kind={}{}",
+                // ref/refacts added 2026-07-31: the solver's depth and action
+                // count are the DISTANCE-TO-DONE for this env. Previously only
+                // FINISHED lines carried them, i.e. they were available for
+                // exactly the episodes that did not need stratifying. Logging
+                // them here lets every episode be bucketed by how far from
+                // terminal it started, which is what the value-ablation
+                // experiment stratifies on (can the search reach a terminal
+                // inside its budget, or is a constant leaf value blind?).
+                "[Gatherer {}] UNFINISHED Env(h={}, w={}, nb={}, no={}, tw={}, mw={}) | factors {}/{} ({:.0}%) | depth={} vs ref={} refacts={} | score={:.3} kind={}{}",
                 self.gather_id,
                 game.height,
                 game.width,
@@ -1399,6 +1443,9 @@ impl Gatherer {
                 fm,
                 ft,
                 if ft > 0 { 100.0 * fm as f32 / ft as f32 } else { 0.0 },
+                solution_depth,
+                reference_depth,
+                reference_action_count,
                 score,
                 reward_kind,
                 if resigned { " (resigned)" } else { "" },
@@ -1619,6 +1666,7 @@ impl Gatherer {
                 // Generation metadata for gather-side dashboards (done-rate by
                 // merge weight / cluster count). env_k=0 => non-clustered arm.
                 "env_mw": self.env_mw,
+                "env_tw": self.env_tw,
                 "env_k": self.env_k,
             });
             writeln!(file, "{}", record).expect("Failed to write record");
@@ -1772,6 +1820,8 @@ use pyo3::exceptions::PyRuntimeError;
     gold_shard_dir = None,
     gold_min_len = usize::MAX,
     gold_min_reward = 0.0,
+    her_reward = true,
+    require_cnot_bridge = false,
     cusp_reward = false,
     cusp_frontier = 2,
     cusp_margin = 2,
@@ -1835,6 +1885,8 @@ pub fn run_gatherer(
     gold_shard_dir: Option<String>,
     gold_min_len: usize,
     gold_min_reward: f32,
+    her_reward: bool,
+    require_cnot_bridge: bool,
     cusp_reward: bool,
     cusp_frontier: usize,
     cusp_margin: usize,
@@ -1895,6 +1947,7 @@ pub fn run_gatherer(
         reverse_curriculum_prob,
     );
     gatherer.set_gold_banking(gold_shard_dir, gold_min_len, gold_min_reward);
+    gatherer.set_her_reward(her_reward);
     gatherer.set_cusp_reward(cusp_reward, cusp_frontier, cusp_margin);
     gatherer.set_demo(demo_fraction, demo_min_objectives, demo_subsample, demo_only_min_weight, demo_target_states);
     gatherer.set_full_weight_rc(full_weight_rc_prob, full_weight_rc_tail);
@@ -1914,6 +1967,9 @@ pub fn run_gatherer(
     }
 
     let mut env = Environment::new(height, width, num_blanks);
+    // EXPERIMENT: chunked-merge CNOT-bridge rule. Set BEFORE random_start so
+    // env generation and all downstream planning observe the same rule.
+    env.require_cnot_bridge = require_cnot_bridge;
     if let Some(s) = seed {
         env.set_seed(Some(s as u64));
     }
@@ -1958,11 +2014,15 @@ pub fn run_gatherer(
             full_w
         };
         env.random_start_clustered_pp(w, clustered_wide_pp_block_side, k);
-        gatherer.set_env_meta(pp_weights(&env).1, k);
+        let (tw, mw) = pp_weights(&env);
+        gatherer.set_env_meta(mw, k);
+        gatherer.set_env_total_weight(tw);
     } else {
         env.random_start(no, false);
         env.shuffle(num_shuffles);
-        gatherer.set_env_meta(pp_weights(&env).1, 0);
+        let (tw, mw) = pp_weights(&env);
+        gatherer.set_env_meta(mw, 0);
+        gatherer.set_env_total_weight(tw);
     }
     gatherer.set_clustered_reverse_prob(clustered_reverse_prob);
 
@@ -1981,7 +2041,30 @@ pub fn run_gatherer(
         // those draws (reject-and-regenerate below), silently censoring the
         // hard tail the arm exists to supply. A clustered cap of ~260-280
         // admits 80-95% of it without loosening the generic arm's tier gate.
-        let eff_cap = if is_clustered {
+        //
+        // ACTION-BASED GATING (2026-08-02, user). The cap above is applied at
+        // GENERATION, before the demo-only decision is taken at play time
+        // (`demo_only_min_weight`, ~line 654), so a single threshold was gating
+        // two populations with opposite needs:
+        //   - clustered envs the agent PLAYS: these must respect the tier's
+        //     action-count curriculum. Measured over 345 episodes in iter 82,
+        //     heuristic action count is what actually separates a win from a
+        //     floor (+1.02 sd; win median 50 actions, floor median 156), while
+        //     PauliProduct weight barely separates at all (+0.66 sd, and the win
+        //     rate is flat 17-24% across mw 4-12). Left uncapped at 3000 the
+        //     played band ran to 450 actions -- harder along an axis the agent
+        //     does not fail on, and episodes twice as long, halving the number
+        //     of independent episodes per gather.
+        //   - full-weight DEMOS: heuristic reference ~650-2000 actions by
+        //     construction, so the tier cap (135) would reject every one of them
+        //     at generation and the full-weight slice would vanish.
+        // So: played clustered envs take the tier cap, demo-only ones keep the
+        // permissive per-arm cap.
+        let (_, gen_mw) = pp_weights(&env);
+        let is_demo_only = demo_only_min_weight > 0 && gen_mw >= demo_only_min_weight;
+        let eff_cap = if is_clustered && !is_demo_only {
+            max_generated_depth
+        } else if is_clustered {
             clustered_max_generated_depth.unwrap_or(max_generated_depth)
         } else {
             max_generated_depth
