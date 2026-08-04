@@ -123,6 +123,7 @@ def do_work(
     lookahead: int,
     *,
     metrics_path: Path | None = None,
+    const_value: float | None = None,
 ) -> None:
     """Pump the arena: batch ready slots, run ``agent.infer`` over the board,
     write priors/values back.
@@ -183,6 +184,19 @@ def do_work(
                     device=device,
                 )
                 gpu_ms = (time.monotonic() - gpu_start) * 1000.0
+
+                # EXPERIMENT (2026-07-31): replace the value head's output at
+                # every NON-TERMINAL leaf with a constant. Terminal states never
+                # reach this path -- mcts.rs:159 and :195-199 route them to
+                # `terminal_evaluator` -- so this ablates the learned value only,
+                # leaving real outcomes intact. With a constant leaf value, Q is
+                # identical everywhere the search has not reached a terminal, so
+                # PUCT degenerates to prior + visit-count exploration; ALL value
+                # discrimination then comes from terminals found inside the tree.
+                # Motivation: on tw>=80 the head scores R^2 = -0.20, i.e. worse
+                # than the best constant predictor. Priors are untouched.
+                if const_value is not None:
+                    values_np = np.full_like(values_np, const_value, dtype=values_np.dtype)
 
                 # Write back per-slot.
                 idx = 0
@@ -416,6 +430,10 @@ if __name__ == "__main__":
     from tile.agent import Agent
 
     parser = ArgumentParser()
+    parser.add_argument("--const_value", type=float, default=None,
+        help="EXPERIMENT: override the value head at every non-terminal leaf "
+             "with this constant. Terminal states are unaffected (mcts.rs "
+             "routes them to terminal_evaluator). Priors untouched.")
     parser.add_argument("--arena_name", type=str, default="mcts")
     parser.add_argument("--arena_tag", type=str, default="")
     parser.add_argument("--weights", type=str, default=None)
@@ -479,4 +497,8 @@ if __name__ == "__main__":
         atag = args.arena_tag or "default"
         metrics_path = Path(args.metrics_dir) / f"handler_{atag}_{args.handler_id}.jsonl"
 
-    do_work(arena, runner, device, model.lookahead, metrics_path=metrics_path)
+    if args.const_value is not None:
+        print(f"[handler {args.handler_id}] VALUE ABLATION: every non-terminal leaf "
+              f"returns {args.const_value} (terminals unaffected)")
+    do_work(arena, runner, device, model.lookahead, metrics_path=metrics_path,
+            const_value=args.const_value)
