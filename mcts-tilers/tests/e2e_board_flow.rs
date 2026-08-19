@@ -30,8 +30,8 @@ fn e2e_observation_is_a_well_formed_board() {
     for layer in &obs.board {
         assert_eq!(layer.len(), obs.height * obs.width, "h*w cells per layer");
     }
-    // BoardCell is a 10-channel record.
-    assert_eq!(CELL_FIELDS, 10);
+    // BoardCell is an 11-channel record (pp_needs_t appended 2026-08-07).
+    assert_eq!(CELL_FIELDS, 11);
     eprintln!(
         "[e2e] obs: {}x{} na={} layers={} cells/layer={} mask_len={}",
         obs.height,
@@ -85,7 +85,7 @@ fn e2e_gather_full_game_writes_board_records() {
     let board = rec["board"].as_array().expect("board is an array of layers");
     let layer0 = board[0].as_array().expect("layer is an array of cells");
     let cell0 = layer0[0].as_array().expect("cell is an array of channels");
-    assert_eq!(cell0.len(), CELL_FIELDS, "each cell has 10 channels");
+    assert_eq!(cell0.len(), CELL_FIELDS, "each cell has 11 channels");
 
     // Action ids in the record are within the 1 + 6N action space.
     for va in rec["valid_actions"].as_array().unwrap() {

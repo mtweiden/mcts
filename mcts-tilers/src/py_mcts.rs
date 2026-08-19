@@ -42,6 +42,7 @@ fn obs_to_pydict<'py>(py: Python<'py>, obs: &TilersObs) -> PyResult<Bound<'py, P
                         c.weight_in_pp,
                         c.is_hub_for_pp,
                         c.is_y_ready,
+                        c.pp_needs_t,
                     ]
                 })
                 .collect()

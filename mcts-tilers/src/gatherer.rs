@@ -591,6 +591,7 @@ impl Gatherer {
                                     c.weight_in_pp,
                                     c.is_hub_for_pp,
                                     c.is_y_ready,
+                                    c.pp_needs_t,
                                 ])
                             })
                             .collect::<Vec<Value>>(),
@@ -1821,7 +1822,6 @@ use pyo3::exceptions::PyRuntimeError;
     gold_min_len = usize::MAX,
     gold_min_reward = 0.0,
     her_reward = true,
-    require_cnot_bridge = false,
     cusp_reward = false,
     cusp_frontier = 2,
     cusp_margin = 2,
@@ -1886,7 +1886,6 @@ pub fn run_gatherer(
     gold_min_len: usize,
     gold_min_reward: f32,
     her_reward: bool,
-    require_cnot_bridge: bool,
     cusp_reward: bool,
     cusp_frontier: usize,
     cusp_margin: usize,
@@ -1967,9 +1966,6 @@ pub fn run_gatherer(
     }
 
     let mut env = Environment::new(height, width, num_blanks);
-    // EXPERIMENT: chunked-merge CNOT-bridge rule. Set BEFORE random_start so
-    // env generation and all downstream planning observe the same rule.
-    env.require_cnot_bridge = require_cnot_bridge;
     if let Some(s) = seed {
         env.set_seed(Some(s as u64));
     }

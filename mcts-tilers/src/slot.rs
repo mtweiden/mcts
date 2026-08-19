@@ -101,6 +101,7 @@ fn cell_to_array(c: &BoardCell) -> [i16; CELL_FIELDS] {
         c.weight_in_pp,
         c.is_hub_for_pp,
         c.is_y_ready,
+        c.pp_needs_t,
     ]
 }
 
@@ -117,6 +118,7 @@ fn cell_from_slice(s: &[i16]) -> BoardCell {
         weight_in_pp: s[7],
         is_hub_for_pp: s[8],
         is_y_ready: s[9],
+        pp_needs_t: s[10],
     }
 }
 

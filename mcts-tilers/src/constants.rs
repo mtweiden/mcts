@@ -21,16 +21,16 @@ pub const DEFAULT_LOOKAHEAD: usize = 1;
 /// Maximum batch size for inference requests
 pub const MAX_BATCH: usize = 8;
 
-// --- Observation board packing (10-channel `tilers::rl::board::BoardCell`) ---
+// --- Observation board packing (11-channel `tilers::rl::board::BoardCell`) ---
 // These are literals (not expressions) so the maturin cffi header step
 // emits plain-integer `#define`s; the const asserts keep them honest.
 /// Channels per cell (i16 each) — must equal `tilers::rl::board::CELL_FIELDS`.
-pub const CELL_FIELDS: usize = 10;
+pub const CELL_FIELDS: usize = 11;
 /// i16 values for one board layer = `GRID_MAX * CELL_FIELDS`.
-pub const BOARD_LAYER_MAX: usize = 4000;
+pub const BOARD_LAYER_MAX: usize = 4400;
 const _: () = assert!(BOARD_LAYER_MAX == GRID_MAX * CELL_FIELDS);
 /// i16 values for the full board per observation = `LOOKAHEAD_MAX * BOARD_LAYER_MAX`.
-pub const BOARD_MAX: usize = 12000;
+pub const BOARD_MAX: usize = 13200;
 const _: () = assert!(BOARD_MAX == LOOKAHEAD_MAX * BOARD_LAYER_MAX);
 
 /// Actions are represented as dense u16 values
