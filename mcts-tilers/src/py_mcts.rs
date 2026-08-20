@@ -188,7 +188,7 @@ impl PyMcts {
 
     #[pyo3(signature = (env, agent, num_steps = 1000, c_puct = 1.4, forced_playouts = false,
                         margin_terminal = false, reward_saturation_temperature = 1.0,
-                        band_terminal = false))]
+                        band_terminal = false, reference_depth = None))]
     fn run(
         &mut self,
         env: &PyEnvironment,
@@ -199,6 +199,7 @@ impl PyMcts {
         margin_terminal: bool,
         reward_saturation_temperature: f32,
         band_terminal: bool,
+        reference_depth: Option<f32>,
     ) -> PyResult<MctsNode> {
         let inner: TilersEnvInner = env.to_inner();
         // Terminal evaluator vs the heuristic solver. Default: the historical
@@ -209,11 +210,25 @@ impl PyMcts {
         // completion-greedy, so absolute completion rates measured with it
         // overstate production. Pass margin_terminal=true to search the
         // production game.
-        let ref_depth = {
-            let mut e = inner.clone();
-            let solver = TilersSolver::new();
-            let _ = solver.solve(&mut e, true);
-            e.depth(true, true) as f32
+        // `reference_depth`: the caller-supplied S0 reference. PRODUCTION
+        // SEMANTICS — the gatherer solves ONCE at episode start and reuses that
+        // number for every step (gatherer.rs, `reference_override`), precisely
+        // because the greedy solver cannot resume an arbitrary mid-solution
+        // state ("[stuck] no_ready_pp", and the assign_orientation_lazy panic).
+        // Re-solving here per call, as this binding did unconditionally until
+        // 2026-08-20, corrupts the terminal reward mid-episode: a python driver
+        // stepping an env saw monotonically WORSE play with MORE search
+        // (measured: narrow_single depth 14 @200 sims -> 23 @600 -> 96 @2500
+        // step-budget). Pass the S0 reference to reproduce production; None
+        // keeps the legacy re-solve for single-shot probes on fresh envs.
+        let ref_depth = match reference_depth {
+            Some(d) => d,
+            None => {
+                let mut e = inner.clone();
+                let solver = TilersSolver::new();
+                let _ = solver.solve(&mut e, true);
+                e.depth(true, true) as f32
+            }
         };
         let terminal_evaluator = move |e: &TilersEnv| -> f32 {
             if !e.inner.done() {
@@ -240,5 +255,95 @@ impl PyMcts {
     fn advance_root(&mut self, action: Action) -> PyResult<()> {
         self.inner.advance_root(action);
         Ok(())
+    }
+
+    /// Per-edge search statistics at `node`, for debugging what the search
+    /// actually believed — visits and priors alone cannot distinguish "search
+    /// explored this and liked it" from "search explored this and rejected it".
+    ///
+    /// Returns a list of dicts, highest-visit first, each with:
+    ///   action, prior (P), visits (N), q (backed-up child value, the same
+    ///   quantity PUCT selects on — falls back to the node's own value when the
+    ///   child is unexpanded, matching the FPU rule), expanded, terminal.
+    /// `top_k = 0` returns every valid action.
+    ///
+    /// Q must be resolved through the MCTS transposition table, which is why
+    /// this lives on PyMcts rather than MctsNode.
+    #[pyo3(signature = (node, top_k = 12))]
+    fn edge_stats<'py>(
+        &self,
+        py: Python<'py>,
+        node: &MctsNode,
+        top_k: usize,
+    ) -> PyResult<Vec<Bound<'py, PyDict>>> {
+        use mcts_core::environment::Act;
+        let n = &node.inner;
+        let mut rows: Vec<(Action, f32, usize, f32, bool, bool)> =
+            Vec::with_capacity(n.valid_actions.len());
+        for &a in &n.valid_actions {
+            let idx = a.to_action_index();
+            let child = n.children.get(idx).and_then(|c| *c);
+            let (q, expanded, terminal) = match child {
+                Some(cid) => match self.inner.get_node_immut(cid) {
+                    Some(c) => (c.value, true, c.terminal_state),
+                    None => (n.value, false, false),
+                },
+                None => (n.value, false, false),
+            };
+            rows.push((a, n.prior_probs[idx], n.edge_visits[idx], q, expanded, terminal));
+        }
+        rows.sort_by(|x, y| y.2.cmp(&x.2));
+        if top_k > 0 {
+            rows.truncate(top_k);
+        }
+        rows.into_iter()
+            .map(|(a, p, v, q, ex, term)| {
+                let d = PyDict::new(py);
+                d.set_item("action", a)?;
+                d.set_item("prior", p)?;
+                d.set_item("visits", v)?;
+                d.set_item("q", q)?;
+                d.set_item("expanded", ex)?;
+                d.set_item("terminal", term)?;
+                Ok(d)
+            })
+            .collect()
+    }
+
+    /// The principal variation from `node`: repeatedly follow the highest-visit
+    /// edge through the transposition table, up to `max_depth` plies. Returns
+    /// the action ids the search would play if it kept its current judgment.
+    #[pyo3(signature = (node, max_depth = 8))]
+    fn principal_variation(&self, node: &MctsNode, max_depth: usize) -> PyResult<Vec<Action>> {
+        use mcts_core::environment::Act;
+        let mut pv = Vec::new();
+        let mut cur = &node.inner;
+        for _ in 0..max_depth {
+            let mut best: Option<(Action, usize)> = None;
+            for &a in &cur.valid_actions {
+                let v = cur.edge_visits[a.to_action_index()];
+                if v == 0 {
+                    continue;
+                }
+                if best.map_or(true, |(_, bv)| v > bv) {
+                    best = Some((a, v));
+                }
+            }
+            let (a, _) = match best {
+                Some(b) => b,
+                None => break,
+            };
+            pv.push(a);
+            match cur
+                .children
+                .get(a.to_action_index())
+                .and_then(|c| *c)
+                .and_then(|cid| self.inner.get_node_immut(cid))
+            {
+                Some(child) if !child.terminal_state => cur = child,
+                _ => break,
+            }
+        }
+        Ok(pv)
     }
 }
