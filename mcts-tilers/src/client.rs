@@ -46,7 +46,17 @@ impl InferenceClient<TilersEnv> for TilersIpcClient {
             sm.slot.b = b as u32;
             sm.slot.owner_id = self.inner.owner_id;
             sm.slot.req_id = req_id;
-            sm.slot.pack_observations(observations)?;
+            // Release the slot before propagating: `pack_observations` gained a
+            // real error path (layer count past LOOKAHEAD_MAX), and bailing with
+            // `?` here would strand an acquired slot — never returned to
+            // free_q, never marked READY. Leak one per inference and the pool
+            // drains until `acquire_slot` blocks forever, deadlocking the
+            // gather with no error message.
+            if let Err(e) = sm.slot.pack_observations(observations) {
+                drop(sm);
+                arena.release_slot(slot_idx);
+                return Err(e);
+            }
             sm.slot.state.store(SLOT_READY, Ordering::Release);
         }
         // eprintln!("[rust client {}] slot {} marked READY, submitting to handler...", self.inner.owner_id, slot_idx);

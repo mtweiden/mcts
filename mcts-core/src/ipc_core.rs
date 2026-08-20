@@ -174,7 +174,10 @@ impl RingQueue {
 /// The maximum number of handlers supported. Raised to 16 to allow multiple handlers per GPU.
 pub const MAX_HANDLERS: usize = 16;
 const ARENA_MAGIC: u64 = 0x4D_43_54_53_49_50_43; // "MCTSIPC"ish
-const ARENA_VERSION: u32 = 2;
+// 2 -> 3 (2026-08-20): `slot_size` added to the header. Bumping the version
+// forces every existing arena file to re-initialize, so no stale file survives
+// with a header that lacks the field.
+const ARENA_VERSION: u32 = 3;
 
 #[repr(C)]
 pub struct ArenaHeader {
@@ -182,6 +185,16 @@ pub struct ArenaHeader {
     version: u32,
     num_slots: u32,
     num_handlers: u32,
+    /// `size_of::<Slot>()` of the process that initialized this arena.
+    ///
+    /// Without it, two binaries built against DIFFERENT slot layouts attach to
+    /// the same file, pass every other check (magic/version/num_slots all
+    /// match, because the header layout itself is unchanged), and then read and
+    /// write at different strides — exchanging garbage boards and priors with
+    /// no error anywhere. The mapping length cannot catch it either: it is
+    /// computed from the LOCAL `size_of`, and `set_len` resizes the file to
+    /// whatever the attaching process believes.
+    slot_size: u32,
     free_q: RingQueue,
     ready_q: RingQueue, // was [RingQueue; MAX_HANDLERS]
     init_lock: AtomicU32, // 0 unlocked, 1 locked
@@ -279,6 +292,7 @@ impl<S: SlotInit> Arena<S> {
                     (*hdr).version = ARENA_VERSION;
                     (*hdr).num_slots = num_slots as u32;
                     (*hdr).num_handlers = num_handlers as u32;
+                    (*hdr).slot_size = std::mem::size_of::<S>() as u32;
 
                     (*hdr).free_q.init();
                     (*hdr).ready_q.init();
@@ -324,6 +338,18 @@ impl<S: SlotInit> Arena<S> {
                     "arena exists with num_handlers={}, requested {}",
                     (*hdr).num_handlers,
                     num_handlers
+                ));
+            }
+            let local_slot_size = std::mem::size_of::<S>() as u32;
+            if (*hdr).slot_size != local_slot_size {
+                return Err(anyhow!(
+                    "arena slot-layout mismatch: file was created with \
+                     slot_size={} but this binary has {} — a process built \
+                     against a different board/channel layout is attached to \
+                     the same arena. Rebuild+reinstall every component, and \
+                     remove the stale arena file.",
+                    (*hdr).slot_size,
+                    local_slot_size
                 ));
             }
         }

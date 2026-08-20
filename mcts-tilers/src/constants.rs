@@ -29,6 +29,11 @@ pub const CELL_FIELDS: usize = 13;
 /// i16 values for one board layer = `GRID_MAX * CELL_FIELDS`.
 pub const BOARD_LAYER_MAX: usize = 5200;
 const _: () = assert!(BOARD_LAYER_MAX == GRID_MAX * CELL_FIELDS);
+// Tie this crate's channel count to tilers' at COMPILE TIME. The two are also
+// coupled implicitly (slot.rs builds a `[i16; CELL_FIELDS]` from a 13-field
+// literal), but that coupling is easy to break silently by appending a field
+// tilers-side and not here; this assert names the invariant.
+const _: () = assert!(CELL_FIELDS == tilers::rl::board::CELL_FIELDS);
 /// i16 values for the full board per observation = `LOOKAHEAD_MAX * BOARD_LAYER_MAX`.
 pub const BOARD_MAX: usize = 15600;
 const _: () = assert!(BOARD_MAX == LOOKAHEAD_MAX * BOARD_LAYER_MAX);
