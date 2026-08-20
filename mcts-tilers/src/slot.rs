@@ -139,7 +139,19 @@ impl TilersSlot {
             self.w[i] = obs.width as u8;
             self.num_ancillas[i] = obs.num_ancillas as u8;
 
-            let nl = obs.board.len().min(LOOKAHEAD_MAX);
+            // Loud, not silent: quietly dropping layers past LOOKAHEAD_MAX
+            // would hand the model a board missing the deepest objectives it
+            // was configured to see, with nothing in any log to say so.
+            if obs.board.len() > LOOKAHEAD_MAX {
+                return Err(anyhow!(
+                    "observation has {} board layers but LOOKAHEAD_MAX is {} — \
+                     raise LOOKAHEAD_MAX (and BOARD_MAX with it) or lower the \
+                     configured lookahead; refusing to truncate silently",
+                    obs.board.len(),
+                    LOOKAHEAD_MAX
+                ));
+            }
+            let nl = obs.board.len();
             self.num_layers[i] = nl as u8;
 
             self.board[i].fill(0);

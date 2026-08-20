@@ -52,6 +52,27 @@ def latest_checkpoint() -> str | None:
 # reshape and slice to the agent's expected
 # `(batch, lookahead + 1, GRID_MAX, CELL_FIELDS)`.
 # ------------------------------------------------------------------------------
+_LAYER_MISMATCH_WARNED = False
+
+
+def _warn_layer_mismatch(packed: int, expected: int) -> None:
+    """Loud once: the producer and the model disagree on the layer count.
+
+    Silent degradation is the failure mode this guards — the network would be
+    fed zero-filled slot padding as a real future-objective layer.
+    """
+    global _LAYER_MISMATCH_WARNED
+    if not _LAYER_MISMATCH_WARNED:
+        _LAYER_MISMATCH_WARNED = True
+        logging.warning(
+            "[handler] board layer-count mismatch: slot packed %d layer(s) but "
+            "the model expects %d (--lookahead %d). Using the packed count. "
+            "The producer's count comes from Rust DEFAULT_LOOKAHEAD; align it "
+            "with --lookahead.",
+            packed, expected, expected - 1,
+        )
+
+
 def build_board_batch(slot_views, lookahead: int):
     """Collect every valid slot view's board + metadata into one batch.
 
@@ -82,7 +103,18 @@ def build_board_batch(slot_views, lookahead: int):
         # PAD (zeros); we trim to the batch's max h*w below.
         raw = np.asarray(sv.board()[:b_i], copy=True)
         board = raw.reshape(b_i, LOOKAHEAD_MAX, GRID_MAX, CELL_FIELDS)
-        raw_boards.append(board[:, :num_layers].astype(np.int32, copy=False))
+        # Slice to what the PACKER actually wrote, not to what the model
+        # expects. The producer's layer count comes from Rust's
+        # DEFAULT_LOOKAHEAD while the model's comes from --lookahead; they
+        # agree today only because both are 1. When the model expects MORE,
+        # slicing by the model's count hands the network zero-filled slot
+        # padding as a genuine future-objective layer. No agent weight depends
+        # on the layer count, so honouring the slot is always safe.
+        slot_nl = np.asarray(sv.num_layers()[:b_i], copy=True)
+        packed_nl = int(slot_nl.min()) if slot_nl.size else num_layers
+        if packed_nl != num_layers:
+            _warn_layer_mismatch(packed_nl, num_layers)
+        raw_boards.append(board[:, :packed_nl].astype(np.int32, copy=False))
 
         mask_list.append(np.asarray(sv.action_mask()[:b_i], copy=True))
         h_list.append(np.asarray(sv.h()[:b_i], copy=True))
