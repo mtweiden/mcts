@@ -30,8 +30,8 @@ fn e2e_observation_is_a_well_formed_board() {
     for layer in &obs.board {
         assert_eq!(layer.len(), obs.height * obs.width, "h*w cells per layer");
     }
-    // BoardCell is an 11-channel record (pp_needs_t appended 2026-08-07).
-    assert_eq!(CELL_FIELDS, 11);
+    // BoardCell is a 13-channel record (hub deltas appended 2026-08-20).
+    assert_eq!(CELL_FIELDS, 13);
     eprintln!(
         "[e2e] obs: {}x{} na={} layers={} cells/layer={} mask_len={}",
         obs.height,
@@ -55,17 +55,27 @@ fn e2e_gather_full_game_writes_board_records() {
     let _ = std::fs::remove_file(&tmp);
     let out = tmp.to_str().unwrap().to_string();
 
-    // batch_size, mcts_steps, fast_steps, p_full_search, output, noise,
-    // dirichlet, lookahead, gather_id, traj_dir, reward_saturation_temperature,
-    // max_actions, resign_value_threshold, resign_consecutive_moves,
-    // no_resign_rate, resignation_log_dir
     let gatherer = Gatherer::new(
-        1, 16, 8, 1.0, out.clone(), 0.0, 0.0, 1, 0,
-        None, Some(1.0), None,
-        Some(2.0), Some(0), Some(0.0),  // resignation disabled in this test
-        None,
-        None,  // floor_keep_fraction
-        None,  // her_reward_margin
+        1,            // batch_size
+        16,           // mcts_steps
+        8,            // fast_steps
+        1.0,          // p_full_search
+        out.clone(),  // output_path
+        0.0,          // noise_strength
+        0.0,          // dirichlet_epsilon
+        1,            // lookahead
+        0,            // gather_id
+        None,         // trajectory_dir
+        Some(1.0),    // reward_saturation_temperature
+        None,         // max_actions
+        Some(2.0),    // max_action_multiplier
+        None,         // resign_value_threshold  — resignation off in this test
+        None,         // resign_consecutive_moves
+        None,         // resign_min_step_ref_mult
+        Some(0.0),    // no_resign_rate
+        None,         // resignation_log_dir
+        None,         // floor_keep_fraction
+        None,         // her_reward_margin
     );
     let client = TrivialTilersIpcClient {};
     let mut rng = StdRng::seed_from_u64(0);
@@ -85,7 +95,7 @@ fn e2e_gather_full_game_writes_board_records() {
     let board = rec["board"].as_array().expect("board is an array of layers");
     let layer0 = board[0].as_array().expect("layer is an array of cells");
     let cell0 = layer0[0].as_array().expect("cell is an array of channels");
-    assert_eq!(cell0.len(), CELL_FIELDS, "each cell has 11 channels");
+    assert_eq!(cell0.len(), CELL_FIELDS, "each cell has 13 channels");
 
     // Action ids in the record are within the 1 + 6N action space.
     for va in rec["valid_actions"].as_array().unwrap() {

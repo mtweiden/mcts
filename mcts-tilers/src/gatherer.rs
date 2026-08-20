@@ -592,6 +592,8 @@ impl Gatherer {
                                     c.is_hub_for_pp,
                                     c.is_y_ready,
                                     c.pp_needs_t,
+                                    c.hub_drow,
+                                    c.hub_dcol,
                                 ])
                             })
                             .collect::<Vec<Value>>(),
